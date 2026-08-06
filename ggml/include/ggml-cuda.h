@@ -8,14 +8,26 @@ extern "C" {
 #endif
 
 #ifdef GGML_USE_HIP
+#ifndef GGML_CUDA_NAME
 #define GGML_CUDA_NAME "ROCm"
+#endif
+#ifndef GGML_CUBLAS_NAME
 #define GGML_CUBLAS_NAME "hipBLAS"
+#endif
 #elif defined(GGML_USE_MUSA)
+#ifndef GGML_CUDA_NAME
 #define GGML_CUDA_NAME "MUSA"
+#endif
+#ifndef GGML_CUBLAS_NAME
 #define GGML_CUBLAS_NAME "muBLAS"
+#endif
 #else
+#ifndef GGML_CUDA_NAME
 #define GGML_CUDA_NAME "CUDA"
+#endif
+#ifndef GGML_CUBLAS_NAME
 #define GGML_CUBLAS_NAME "cuBLAS"
+#endif
 #endif
 #define GGML_CUDA_MAX_DEVICES       16
 

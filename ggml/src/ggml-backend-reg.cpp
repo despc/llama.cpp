@@ -573,6 +573,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("blas", silent, dir_path);
     ggml_backend_load_best("zendnn", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
+    ggml_backend_load_best("v100-cuda", silent, dir_path);
     ggml_backend_load_best("cuda", silent, dir_path);
     ggml_backend_load_best("hip", silent, dir_path);
     ggml_backend_load_best("metal", silent, dir_path);
