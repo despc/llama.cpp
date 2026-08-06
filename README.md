@@ -1,3 +1,43 @@
+> ## About this fork / О форке
+>
+> **EN.** This fork adds a `V100_CUDA` backend, so a Tesla V100 can serve a model
+> together with consumer GPUs inside a single `llama-server` process.
+>
+> The V100 needs the proprietary NVIDIA driver, while the RTX 5080 / 5070 Ti need
+> the open one. Two kernel modules already coexist; the problem is user space.
+> Both drivers ship a `libcuda` with the same SONAME, so the dynamic loader keeps
+> only one copy and whichever loads first ends up serving every GPU. This fork
+> copies the V100 driver stack under distinct `libcv*` names, builds a second CUDA
+> backend against it, and keeps its symbols private. A small `LD_PRELOAD` shim
+> sends that stack's device opens to `/dev/nvidia-v100-*`.
+>
+> The result is a normal local device, `V100_CUDA0`, usable with `--device` and
+> `--tensor-split` next to `CUDA0` / `CUDA1`. It replaces the older workaround of
+> running the V100 behind an RPC server in a separate process.
+>
+> Everything lives in [`ggml/src/ggml-v100-cuda/`](ggml/src/ggml-v100-cuda/) - see
+> its README for build and run instructions. Changes to shared llama.cpp code are
+> deliberately kept to a handful of additive lines.
+>
+> **RU.** Форк добавляет бэкенд `V100_CUDA`: Tesla V100 работает над моделью
+> вместе с потребительскими картами в одном процессе `llama-server`.
+>
+> V100 требует проприетарный драйвер NVIDIA, а RTX 5080 / 5070 Ti - открытый. Два
+> модуля ядра уживаются и так, сложность в пользовательском пространстве. У обоих
+> драйверов `libcuda` с одинаковым SONAME, поэтому загрузчик оставляет только одну
+> копию, и первый загрузившийся драйвер обслуживает все карты. Форк копирует
+> драйверный стек V100 под именами `libcv*`, собирает против него второй CUDA
+> бэкенд и прячет его символы. Небольшая `LD_PRELOAD` библиотека направляет
+> обращения этого стека к `/dev/nvidia-v100-*`.
+>
+> В итоге получается обычное локальное устройство `V100_CUDA0`, доступное в
+> `--device` и `--tensor-split` наравне с `CUDA0` / `CUDA1`. Это заменяет прежний
+> обходной путь, когда V100 работала через RPC-сервер в отдельном процессе.
+>
+> Всё лежит в [`ggml/src/ggml-v100-cuda/`](ggml/src/ggml-v100-cuda/), там же README
+> со сборкой и запуском. Правки в общем коде llama.cpp намеренно сведены к
+> нескольким добавленным строкам.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
