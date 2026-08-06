@@ -166,10 +166,12 @@ the V100 first, since `ggml_backend_load_all_from_path` loads `v100-cuda` before
 
 ## Known limits
 
-- `FLASH_ATTN_EXT` with `hsk=320,hsv=256` aborts on the V100: the MMA kernel asks
-  for more dynamic shared memory than `sm_70` allows (96 KB vs 164 KB on Ampere),
-  and the supported-op check does not catch it. Head sizes 64/80/128 are fine, so
-  ordinary models are not affected. This is an upstream `fattn-mma-f16.cuh` gap,
-  not an isolation problem.
+- Flash attention with head sizes above 256 does not run on the V100. The MMA
+  kernels for 320/256 and for the 576/512 used by MLA ask for more shared memory
+  than `sm_70` has (96 KB against 164 KB on Ampere), so the launch reports zero
+  active blocks. Upstream asserts there; `ggml_cuda_get_best_fattn_kernel` in this
+  fork reports the op unsupported on Volta instead, and the scheduler moves those
+  nodes to another backend. Ordinary head sizes (64/80/128) are unaffected and
+  still use the V100.
 - The consumer GPUs and the V100 cannot do peer-to-peer copies - they are on
   different drivers. Cross-device tensor traffic goes through host memory.

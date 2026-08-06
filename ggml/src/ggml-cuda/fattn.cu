@@ -489,6 +489,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // Volta has 96 KB of shared memory per SM against 164 KB on Ampere. The MMA kernels for the
+        // large head sizes (320/256 and the 576/512 used by MLA) ask for more than that, so
+        // cudaOccupancyMaxActiveBlocksPerMultiprocessor reports 0 blocks and the launch aborts.
+        // Report the op as unsupported instead, which lets the scheduler pick another backend.
+        if (Q->ne[0] > 256) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
