@@ -4,10 +4,13 @@ Runs a Tesla V100 next to the consumer GPUs in one `llama-server` process, with 
 separate NVIDIA driver stack for each.
 
 The V100 needs the proprietary driver; the RTX 5080 / 5070 Ti need the open one.
-Two kernel modules already coexist on this host (`nvidia.ko` and a renamed
-`nvidia_v100.ko`). The hard part is user space: both drivers ship a `libcuda`
-with the same SONAME, so `ld.so` keeps only one copy, and whichever loads first
-serves every GPU.
+Getting two kernel modules to coexist is a prerequisite, done once - see
+"Prerequisites: the two kernel drivers" below. The hard part is user space: both
+drivers ship a `libcuda` with the same SONAME, so `ld.so` keeps only one copy,
+and whichever loads first serves every GPU.
+
+Read the sections in order - prerequisites, build, run - to reproduce the whole
+setup from a machine that only has the open driver installed.
 
 ## How the isolation works
 
@@ -29,6 +32,96 @@ An earlier attempt used `dlmopen(LM_ID_NEWLM)` instead. It works until a thread
 exits: the second namespace gets its own `libc`, so `_dl_deallocate_tls` frees the
 thread TLS block with a different allocator and the heap breaks. Do not go back
 to it.
+
+## Prerequisites: the two kernel drivers
+
+This backend assumes the host already runs two NVIDIA kernel modules. That setup
+is done once, before any of the build steps below.
+
+**Why it is possible at all.** The open 580 `nvidia.ko` has no GSP firmware for
+Volta, so it rejects the V100 in `nv_pci_probe` and the kernel releases the PCI
+device for another driver to claim. `NVreg_ExcludedGpus` is *not* the mechanism
+and must not be used here - it marks a GPU excluded by UUID but keeps it bound.
+
+### 1. Extract the proprietary driver, do not install it
+
+```sh
+mkdir -p ~/nvidia-v100-build && cd ~/nvidia-v100-build
+wget https://download.nvidia.com/XFree86/Linux-x86_64/580.159.03/NVIDIA-Linux-x86_64-580.159.03.run
+chmod +x NVIDIA-Linux-x86_64-580.159.03.run
+./NVIDIA-Linux-x86_64-580.159.03.run --extract-only --target-dir NVIDIA-Linux-x86_64-580.159.03
+```
+
+Installing it would replace the open driver the consumer GPUs need. Only the
+kernel module sources and a few user space libraries are taken from the archive.
+
+### 2. Build renamed kernel modules
+
+Both modules are rebuilt from `kernel/` (the proprietary tree, not `kernel-open/`)
+into a working copy, with every name that would collide against the open driver
+changed:
+
+| Category | From | To |
+|---|---|---|
+| module / obj-m | `nvidia.o` | `nvidia_v100.o` |
+| `MODULE_BASE_NAME` | `nvidia` | `nvidia_v100` |
+| `NV_MAJOR_DEVICE_NUMBER` | 195 | 196 |
+| pci_driver name, chrdevs | `nvidia`, `nvidiactl` | `nvidia_v100`, `nvidia_v100_ctl` |
+| procfs trees | `driver/nvidia*` | `driver/nvidia_v100`, `driver/nvidia-v100-*` |
+| exported symbols (17) | `nvidia_*` | `nvidia_v100_*` |
+| exported symbols (76) | `nvUvmInterface*` | `nvUvmInterfaceV100*` |
+
+Renamed headers (`nv-linux.h`, `nv-chardev-numbers.h`, `nv_uvm_interface.h`) are
+kept as local copies inside the renamed source dir, and its include path must come
+*before* `common/inc` so the local copies win.
+
+```sh
+cd ~/nvidia-v100-build/NVIDIA-Linux-x86_64-580.159.03/kernel_v100_work
+make module SYSSRC=/lib/modules/$(uname -r)/build \
+     NV_KERNEL_MODULES="nvidia_v100 nvidia-uvm-v100" -j$(nproc)
+modinfo nvidia-uvm-v100.ko | grep -E '^name:|^depends:'   # nvidia_uvm_v100, depends nvidia_v100
+```
+
+The UVM module is not optional. CUDA opens `/dev/nvidia-uvm` during init, and
+without a private UVM module the V100 fails with `initialization error`.
+
+### 3. Load the modules and create the device nodes
+
+`nvidia_v100.ko` first, then `nvidia-uvm-v100.ko`. Majors are not fixed, so the
+nodes are made by reading `/proc/devices`:
+
+```sh
+MAJOR=$(grep -m1 '^.* nvidia_v100$' /proc/devices | awk '{print $1}')
+mknod -m 666 /dev/nvidia-v100-0   c "$MAJOR" 0
+mknod -m 666 /dev/nvidia-v100-ctl c "$MAJOR" 255
+UVM_MAJOR=$(grep -m1 'nvidia-v100-uvm' /proc/devices | awk '{print $1}')
+mknod -m 666 /dev/nvidia-v100-uvm       c "$UVM_MAJOR" 0
+mknod -m 666 /dev/nvidia-v100-uvm-tools c "$UVM_MAJOR" 1
+```
+
+All four nodes are required. A systemd unit does the two `insmod`s and runs this
+script at boot, otherwise nothing comes back after a reboot.
+
+Check the split with `lspci -d 10de: -k`: the V100 must show
+`Kernel driver in use: nvidia_v100`, the consumer GPUs `nvidia`.
+
+### 4. Copy the V100 user space libraries
+
+```sh
+sudo mkdir -p /opt/nvidia-v100/lib
+cd ~/nvidia-v100-build/NVIDIA-Linux-x86_64-580.159.03
+sudo cp libcuda.so.580.159.03 libnvidia-ml.so.580.159.03 /opt/nvidia-v100/lib/
+sudo cp nvidia-smi /opt/nvidia-v100/
+```
+
+`libcuda.so.580.159.03` is the input for the SONAME renaming in the next section.
+`libnvidia-ml` and `nvidia-smi` are only needed to inspect the V100, and they need
+their own `LD_PRELOAD` shim because libnvidia-ml hardcodes `/dev/nvidiactl`.
+
+Note there are two separate shims, and they are not interchangeable:
+`nvidia_v100_redirect.so` redirects unconditionally and suits a dedicated process
+such as `nvidia-smi` or an RPC server; `loader/v100_redirect.c` in this directory
+filters by caller and is the one this backend needs.
 
 ## Build
 
