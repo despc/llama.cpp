@@ -8,6 +8,8 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cmath>
+#include <functional>
+#include <vector>
 
 llama_expert_heatmap::llama_expert_heatmap(
         int n_layers, int n_experts,
@@ -95,6 +97,52 @@ void llama_expert_heatmap::log() const {
                 LLAMA_LOG("%s%d", i > 0 ? "," : "{", top[i]);
             }
             LLAMA_LOG("}\n");
+        }
+    }
+
+    // Share of routed activations captured by the S hottest experts, averaged
+    // over layers. Under uniform routing this just tracks S/n_experts, and a
+    // hot store of S slots can then do no better than static expert placement.
+    // Anything above the uniform column is what an expert cache has to work
+    // with.
+    const int probes[] = { 32, 64, 96, 128, 256 };
+    const int n_probes = (int) (sizeof(probes) / sizeof(probes[0]));
+
+    std::vector<double> captured(n_probes, 0.0);
+    std::vector<float>  sorted;
+    int n_live = 0;
+
+    for (int l = 0; l < n_layers; l++) {
+        const float * layer_heat = heat.data() + l * n_experts;
+
+        double total = 0.0;
+        for (int e = 0; e < n_experts; e++) {
+            total += layer_heat[e];
+        }
+        if (total <= 0.0) {
+            continue;
+        }
+
+        sorted.assign(layer_heat, layer_heat + n_experts);
+        std::sort(sorted.begin(), sorted.end(), std::greater<float>());
+        n_live++;
+
+        for (int p = 0; p < n_probes; p++) {
+            const int s = std::min(probes[p], n_experts);
+            double acc = 0.0;
+            for (int i = 0; i < s; i++) {
+                acc += sorted[i];
+            }
+            captured[p] += acc / total;
+        }
+    }
+
+    if (n_live > 0) {
+        LLAMA_LOG("  concentration over %d layers, %d experts:\n", n_live, n_experts);
+        for (int p = 0; p < n_probes; p++) {
+            const int s = std::min(probes[p], n_experts);
+            LLAMA_LOG("    top-%-4d captures %5.1f%%   uniform would be %5.1f%%\n",
+                s, 100.0 * captured[p] / n_live, 100.0 * s / n_experts);
         }
     }
 }
