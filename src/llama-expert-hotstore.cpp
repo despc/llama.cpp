@@ -83,6 +83,14 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
         if (entries_by_layer[il].empty()) {
             continue;
         }
+        // Only a layer whose experts sit in host memory has anything to gain.
+        // A layer already resident on a GPU is read at VRAM bandwidth, so
+        // caching it would add the dual hot/cold path - and its per-layer cost
+        // - for no saving at all.
+        const ggml_tensor * probe = entries_by_layer[il][0]->src;
+        if (probe->buffer == nullptr || !ggml_backend_buffer_is_host(probe->buffer)) {
+            continue;
+        }
         ggml_backend_dev_t dev = model->dev_layer(il);
         if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             continue;

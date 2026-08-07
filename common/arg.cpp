@@ -886,19 +886,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     // manual hot store slots need all MoE weights in the CPU (host pointers);
-    // auto-activate -cmoe unless the user already did (or wants autofit slots)
-    if (params.expert_hot_s > 0) {
-        bool has_cmoe = false;
-        for (const auto & o : params.tensor_buft_overrides) {
-            if (o.pattern != nullptr && strcmp(o.pattern, LLM_FFN_EXPS_REGEX) == 0) {
-                has_cmoe = true;
-                break;
-            }
-        }
-        if (!has_cmoe) {
-            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
-            LOG_WRN("manually selecting --expert-hot-s slots activates --cmoe (all MoE weights kept in the CPU)\n");
-        }
+    // auto-activate -cmoe unless the user already placed the experts himself.
+    // Any existing override (-cmoe or -ncmoe) means a deliberate layout: the
+    // hot store then covers only the layers that layout left on the CPU, and
+    // the GPU-resident layers keep the plain single-path graph.
+    if (params.expert_hot_s > 0 && params.tensor_buft_overrides.empty()) {
+        params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        LOG_WRN("manually selecting --expert-hot-s slots activates --cmoe (all MoE weights kept in the CPU)\n");
     }
 
     // pad tensor_buft_overrides for llama_params_fit:
