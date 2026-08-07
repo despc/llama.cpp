@@ -49,9 +49,16 @@ struct llama_expert_hotstore {
     // compares to its own cached counter to know whether H2D is needed.
     int64_t luts_version = 0;
 
-    // keeps the GPU buffer (and its no_alloc context) alive
-    ggml_context_ptr        ctx;
-    ggml_backend_buffer_ptr buf;
+    // The store is split per device: a layer's slots live on the device that
+    // holds the rest of that layer, so the hot path adds no cross-device
+    // traffic. One context and one buffer per participating device.
+    std::vector<ggml_context_ptr>        ctxs;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+
+    // layer_cached[il] is false for a layer whose device cannot host a hot
+    // store (CPU, or a non-CUDA backend without --ecf). Those layers keep
+    // every expert cold and fall back to the stock mul_mat_id path.
+    std::vector<bool> layer_cached;
 
     // true once the first copy of the top-S experts landed (once per session)
     bool is_filled = false;
@@ -74,9 +81,11 @@ llama_expert_hotstore(const llama_model * model, int n_layers,
 
     ~llama_expert_hotstore();
 
-    // allocate the GPU hot store for `hot_s` slots. returns false (and
-    // leaves the store disabled) on failure or shortage of VRAM.
-    bool allocate(ggml_backend_buffer_type_t gpu_buft);
+    // allocate the hot store across the devices that hold the model layers.
+    // hot_s is reduced to what the tightest device can take rather than
+    // failing outright. `force` accepts non-CUDA devices (--ecf).
+    // returns false (and leaves the store disabled) if nothing could be placed.
+    bool allocate(const llama_model * model, bool force);
 
     // copy the top-S expert slices for every layer into the GPU hot store,
     // using the given heatmap for the ranking. one-shot (guarded by is_filled).
