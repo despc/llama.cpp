@@ -19,6 +19,16 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,               hparams.expert_gating_func);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,             hparams.n_layer_nextn, false);
 
+    // Ling 3.0 trains a SwiGLU clamp on the last few layers. Optional: the
+    // first GGUF revisions shipped without these arrays, and a missing limit
+    // leaves the clamp off rather than clamping to zero.
+    // The arrays are written per GGUF block, so they span the MTP block too:
+    // n_layer_all, not n_layer().
+    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,   hparams.swiglu_clamp_exp,   hparams.n_layer_all, false);
+    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer_all, false)) {
+        hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
+    }
+
     if (hparams.n_ff_shexp == 0) {
         hparams.n_ff_shexp = hparams.n_ff_exp * std::max(1u, hparams.n_expert_shared);
     }
