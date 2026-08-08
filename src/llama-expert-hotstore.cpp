@@ -254,6 +254,14 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
             n_cached_here, slots_of(dev_layers[id][0]));
     }
 
+    // Mark every expert cold before the first fill. The LUT buffers are zeroed
+    // above, and zero means "hot, slot 0" - which routes every expert to an
+    // empty slot and tells the CPU path to skip it, so the routed experts
+    // contribute nothing until the first copy_top_s lands. That window used to
+    // be a single token; it is as long as fill_delay now, and it degrades the
+    // output either way.
+    update_luts();
+
     return true;
 }
 
