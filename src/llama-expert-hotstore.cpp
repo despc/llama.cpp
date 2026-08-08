@@ -537,7 +537,7 @@ void llama_expert_hotstore::log_hit_rate(const std::vector<std::pair<int, ggml_t
 }
 
 void llama_expert_hotstore::log() const {
-    LLAMA_LOG("=== Expert hotstore sizing (S=%d) ===\n", hot_s);
+    LLAMA_LOG("=== Expert hotstore sizing (%d slots requested) ===\n", hot_s);
     size_t total = 0;
     for (int il = 0; il < n_layers; il++) {
         total += bytes_per_slot[il];
@@ -553,11 +553,26 @@ void llama_expert_hotstore::log() const {
                 allocated += ggml_backend_buffer_get_size(b.get());
             }
         }
+        // report the slots actually handed out, not the number asked for: with
+        // per-device sizing those differ, and per layer they may differ too
+        int slots_min = 0, slots_max = 0, experts_held = 0;
         for (int il = 0; il < n_layers; il++) {
-            n_cached += layer_cached[il] ? 1 : 0;
+            if (!layer_cached[il]) {
+                continue;
+            }
+            const int s = slots_of(il);
+            slots_min = n_cached == 0 ? s : std::min(slots_min, s);
+            slots_max = std::max(slots_max, s);
+            experts_held += s;
+            n_cached++;
         }
-        LLAMA_LOG("  GPU hot store allocated: %zu MiB over %zu device(s), %d layers cached, %d+1 slots\n",
-            allocated / (1024 * 1024), bufs.size(), n_cached, hot_s);
+        if (slots_min == slots_max) {
+            LLAMA_LOG("  GPU hot store allocated: %zu MiB over %zu device(s), %d layers x %d slots = %d of %d experts\n",
+                allocated / (1024 * 1024), bufs.size(), n_cached, slots_max, experts_held, n_cached * n_experts);
+        } else {
+            LLAMA_LOG("  GPU hot store allocated: %zu MiB over %zu device(s), %d layers, %d-%d slots = %d of %d experts\n",
+                allocated / (1024 * 1024), bufs.size(), n_cached, slots_min, slots_max, experts_held, n_cached * n_experts);
+        }
     } else if (hot_s > 0) {
         LLAMA_LOG("  hot store DISABLED (%d slots requested)\n", hot_s);
     }
