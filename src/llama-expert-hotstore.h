@@ -15,7 +15,19 @@ struct llama_expert_heatmap;
 struct llama_expert_hotstore {
     int n_layers;
     int n_experts;
+
+    // slots requested on the command line (-ehs). Only used to seed the
+    // per-device fit; the real counts live in hot_s_layer.
     int hot_s;
+
+    // Slots actually given to each layer. A device sizes its own layers from
+    // its own free VRAM, so a card with room is no longer held back by the
+    // tightest one. 0 means the layer is not cached.
+    std::vector<int> hot_s_layer;
+
+    int slots_of(int il) const {
+        return (il >= 0 && il < (int) hot_s_layer.size()) ? hot_s_layer[il] : 0;
+    }
 
     // bytes of a single expert slot per layer, summed over that layer's
     // expert weight tensors (gate/up/down, incl. chexps variants)
@@ -82,7 +94,7 @@ llama_expert_hotstore(const llama_model * model, int n_layers,
     ~llama_expert_hotstore();
 
     // allocate the hot store across the devices that hold the model layers.
-    // hot_s is reduced to what the tightest device can take rather than
+    // Each device sizes its own layers from its own free VRAM rather than
     // failing outright. `force` accepts non-CUDA devices (--ecf).
     // returns false (and leaves the store disabled) if nothing could be placed.
     bool allocate(const llama_model * model, bool force);

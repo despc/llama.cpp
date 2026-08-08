@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cinttypes>
 #include <cstring>
 #include <regex>
 
@@ -49,25 +50,32 @@ llama_expert_hotstore::llama_expert_hotstore(
         entries_by_layer[e.layer_idx].push_back(&e);
     }
 
-    if (hot_s > 0) {
-        slot_to_expert.assign(n_layers, std::vector<int>(hot_s, -1));
-        dwell_count.assign(n_layers, std::vector<int>(hot_s, 0));
-    }
+    // per-layer slot counts are decided in allocate(), once the devices and
+    // their free VRAM are known
+    hot_s_layer.assign(n_layers, 0);
+    slot_to_expert.assign(n_layers, {});
+    dwell_count.assign(n_layers, {});
 }
 
 // VRAM left untouched on every participating device, so sizing the store does
 // not eat the headroom the compute buffers still need. 512 MiB was not enough:
 // the graph reserve that runs after this allocation then faulted inside the
 // driver rather than reporting a clean allocation failure.
-static const size_t HOTSTORE_DEV_MARGIN = 2048ull * 1024 * 1024;
+static size_t hotstore_dev_margin() {
+    return 2048ull * 1024 * 1024;
+}
 
 bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
     if (hot_s <= 0 || entries.empty() || model == nullptr) {
         return false;
     }
     if (hot_s > n_experts) {
-        throw std::runtime_error(format("%s: hot store S=%d exceeds n_experts=%d",
-            __func__, hot_s, n_experts));
+        // asking for more slots than the model has experts is a request to
+        // cache all of them, not an error - the same command line then works
+        // across models with different expert counts
+        LLAMA_LOG_INFO("%s: hot store: %d slots requested, model has %d experts, using %d\n",
+            __func__, hot_s, n_experts, n_experts);
+        hot_s = n_experts;
     }
 
     layer_cached.assign(n_layers, false);
@@ -118,13 +126,14 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
         return false;
     }
 
-    // The store is sized by the tightest device. A slot costs the sum of
-    // bytes_per_slot over that device's layers, so a device holding fewer
-    // layers can afford proportionally more slots - but slot indices are
-    // global, so the smallest per-device fit wins.
+    // Each device sizes its own layers from its own free VRAM. Slot indices are
+    // per layer, so a card with room is not held back by the tightest one - a
+    // 32 GiB V100 holding few layers can cache far more of each than a full
+    // 16 GiB card next to it.
     const size_t lut_bytes = (size_t) n_experts * (sizeof(int32_t) + sizeof(float));
+    const size_t margin    = hotstore_dev_margin();
 
-    int fit_s = hot_s;
+    bool any = false;
     for (size_t id = 0; id < devs.size(); id++) {
         size_t per_slot = 0;
         for (int il : dev_layers[id]) {
@@ -136,27 +145,32 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
         size_t free_mem = 0, total_mem = 0;
         ggml_backend_dev_memory(devs[id], &free_mem, &total_mem);
 
-        const size_t overhead = lut_bytes * dev_layers[id].size() + HOTSTORE_DEV_MARGIN;
+        const size_t overhead = lut_bytes * dev_layers[id].size() + margin;
         const size_t usable   = free_mem > overhead ? free_mem - overhead : 0;
-        // one sentinel slot per layer is always allocated on top of hot_s
+        // one sentinel slot per layer is always allocated on top of the count
         const size_t n_slot   = usable / per_slot;
-        const int    dev_s    = n_slot > 1 ? (int) (n_slot - 1) : 0;
+        int dev_s = n_slot > 1 ? (int) (n_slot - 1) : 0;
 
-        if (dev_s < fit_s) {
-            fit_s = dev_s;
+        dev_s = std::min(dev_s, hot_s);
+        dev_s = std::min(dev_s, n_experts);
+
+        if (dev_s <= 0) {
+            LLAMA_LOG_WARN("%s: hot store: no room on %s, its %zu layers stay cold\n",
+                __func__, ggml_backend_dev_name(devs[id]), dev_layers[id].size());
+            continue;
         }
+
+        for (int il : dev_layers[id]) {
+            hot_s_layer[il]    = dev_s;
+            slot_to_expert[il] = std::vector<int>(dev_s, -1);
+            dwell_count[il]    = std::vector<int>(dev_s, 0);
+        }
+        any = true;
     }
 
-    if (fit_s <= 0) {
+    if (!any) {
         LLAMA_LOG_WARN("%s: hot store: not enough free VRAM for even one slot\n", __func__);
         return false;
-    }
-    if (fit_s < hot_s) {
-        LLAMA_LOG_WARN("%s: hot store: reducing %d slots to %d to fit the tightest device\n",
-            __func__, hot_s, fit_s);
-        hot_s = fit_s;
-        slot_to_expert.assign(n_layers, std::vector<int>(hot_s, -1));
-        dwell_count.assign(n_layers, std::vector<int>(hot_s, 0));
     }
 
     luts.assign(n_layers, layer_lut{});
@@ -184,13 +198,16 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
             return false;
         }
 
-        // one hot tensor per model expert tensor, with hot_s expert slots plus
-        // 1 sentinel slot (index hot_s) that stays zero so cold selections read
-        // zeros via a valid in-range index (sentinel trick, oldtricks Trick 2).
+        // one hot tensor per model expert tensor, with the layer's slot count
+        // plus 1 sentinel slot (index slots_of(il)) that stays zero so cold
+        // selections read zeros via a valid in-range index (oldtricks Trick 2).
         for (int il : dev_layers[id]) {
+            if (slots_of(il) <= 0) {
+                continue;
+            }
             for (entry * e : entries_by_layer[il]) {
                 e->dst = ggml_new_tensor_3d(ctxs[id].get(), e->src->type,
-                    e->src->ne[0], e->src->ne[1], hot_s + 1);
+                    e->src->ne[0], e->src->ne[1], slots_of(il) + 1);
             }
             // per-layer LUT and mask for in-graph routing (oldtricks Trick 4)
             luts[il].hot_lut   = ggml_new_tensor_1d(ctxs[id].get(), GGML_TYPE_I32, n_experts);
@@ -207,8 +224,8 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
 
         ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(ctxs[id].get(), buft);
         if (b == nullptr) {
-            throw std::runtime_error(format("%s: unable to allocate hot store of %d slots on %s (%zu MiB)",
-                __func__, hot_s, ggml_backend_dev_name(devs[id]), need / (1024 * 1024)));
+            throw std::runtime_error(format("%s: unable to allocate hot store on %s (%zu MiB)",
+                __func__, ggml_backend_dev_name(devs[id]), need / (1024 * 1024)));
         }
         bufs[id] = ggml_backend_buffer_ptr(b);
         ggml_backend_buffer_set_usage(bufs[id].get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -220,16 +237,21 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
 
         // register the expert weight tensors with the tier hook so
         // build_lora_mm_id can find the hot tensor and the per-layer LUTs.
+        int n_cached_here = 0;
         for (int il : dev_layers[id]) {
+            if (slots_of(il) <= 0) {
+                continue;
+            }
             for (const entry * e : entries_by_layer[il]) {
                 llama_expert_tier_register(e->src, e->dst, luts[il].hot_lut, luts[il].cold_mask);
             }
             layer_cached[il] = true;
+            n_cached_here++;
         }
 
-        LLAMA_LOG("  hot store on %s: %zu MiB for %d layers, %d+1 slots\n",
+        LLAMA_LOG("  hot store on %s: %zu MiB for %d layers, %d+1 slots each\n",
             ggml_backend_dev_name(devs[id]), need / (1024 * 1024),
-            (int) dev_layers[id].size(), hot_s);
+            n_cached_here, slots_of(dev_layers[id][0]));
     }
 
     return true;
@@ -240,7 +262,7 @@ llama_expert_hotstore::~llama_expert_hotstore() {
 }
 
 void llama_expert_hotstore::copy_top_s(const llama_expert_heatmap & heatmap) {
-    if (is_filled || hot_s <= 0 || entries.empty() || bufs.empty()) {
+    if (is_filled || entries.empty() || bufs.empty()) {
         return;
     }
 
@@ -248,10 +270,11 @@ void llama_expert_hotstore::copy_top_s(const llama_expert_heatmap & heatmap) {
         if (!layer_cached[il]) {
             continue;
         }
-        const std::vector<int> top = heatmap.get_top_s(il, hot_s);
+        const int S = slots_of(il);
+        const std::vector<int> top = heatmap.get_top_s(il, S);
         auto & ste = slot_to_expert[il];
         auto & dc  = dwell_count[il];
-        for (int p = 0; p < (int) top.size() && p < hot_s; p++) {
+        for (int p = 0; p < (int) top.size() && p < S; p++) {
             ste[p] = top[p];
             dc[p]  = dwell; // initial fill is eligible to be corrected next sync
         }
@@ -262,7 +285,7 @@ void llama_expert_hotstore::copy_top_s(const llama_expert_heatmap & heatmap) {
             if (!src) {
                 continue;
             }
-            for (int p = 0; p < hot_s; p++) {
+            for (int p = 0; p < S; p++) {
                 const int ex = ste[p];
                 if (ex < 0) {
                     continue;
@@ -279,24 +302,25 @@ void llama_expert_hotstore::copy_top_s(const llama_expert_heatmap & heatmap) {
 }
 
 void llama_expert_hotstore::plant_static() {
-    if (is_filled || hot_s <= 0 || entries.empty() || bufs.empty()) {
+    if (is_filled || entries.empty() || bufs.empty()) {
         return;
     }
 
-    // plant experts 0..hot_s-1 into slots 0..hot_s-1, one shot, no heatmap
+    // plant experts 0..S-1 into slots 0..S-1, one shot, no heatmap
     for (int il = 0; il < n_layers; il++) {
         if (!layer_cached[il]) {
             continue;
         }
+        const int S = slots_of(il);
         auto & ste = slot_to_expert[il];
-        for (int p = 0; p < hot_s && p < n_experts; p++) {
+        for (int p = 0; p < S && p < n_experts; p++) {
             ste[p] = p;
         }
         for (entry * e : entries_by_layer[il]) {
             const size_t slot = ggml_nbytes(e->src) / (size_t) e->src->ne[2];
             const char * src = e->src->data ? (const char *) ggml_get_data(e->src) : nullptr;
             if (!src) continue;
-            for (int p = 0; p < hot_s && p < n_experts; p++) {
+            for (int p = 0; p < S && p < n_experts; p++) {
                 ggml_backend_tensor_set(e->dst, src + (size_t) p * slot, (size_t) p * slot, slot);
             }
         }
@@ -304,11 +328,11 @@ void llama_expert_hotstore::plant_static() {
 
     is_filled = true;
     update_luts();
-    LLAMA_LOG("=== Expert hot store: STATIC plant of %d experts per layer ===\n", hot_s);
+    LLAMA_LOG("=== Expert hot store: STATIC plant done ===\n");
 }
 
 void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
-    if (!is_filled || hot_s <= 0 || bufs.empty()) {
+    if (!is_filled || bufs.empty()) {
         return;
     }
 
@@ -319,7 +343,8 @@ void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
         if (!layer_cached[il]) {
             continue;
         }
-        const std::vector<int> top = heatmap.get_top_s(il, hot_s);
+        const int S = slots_of(il);
+        const std::vector<int> top = heatmap.get_top_s(il, S);
         auto & ste = slot_to_expert[il];
         auto & dc  = dwell_count[il];
 
@@ -327,7 +352,7 @@ void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
         // clear the hysteresis gate, unless the gate is off)
         auto find_slot = [&](int e_cold) -> int {
             // fill empty slots first (no gate on fill)
-            for (int p = 0; p < hot_s; p++) {
+            for (int p = 0; p < S; p++) {
                 if (ste[p] < 0) {
                     return p;
                 }
@@ -335,7 +360,7 @@ void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
             if (hyst <= 0.0f) {
                 // gate off: displace the weakest resident
                 int p_worst = -1;
-                for (int p = 0; p < hot_s; p++) {
+                for (int p = 0; p < S; p++) {
                     if (ste[p] >= 0 && (p_worst < 0 ||
                         heatmap.get_score(il, ste[p]) < heatmap.get_score(il, ste[p_worst]))) {
                         p_worst = p;
@@ -348,7 +373,7 @@ void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
             const float s_cold = heatmap.get_score(il, e_cold);
             int p_worst = -1;
             float worst_score = 1e9f;
-            for (int p = 0; p < hot_s; p++) {
+            for (int p = 0; p < S; p++) {
                 if (ste[p] < 0) {
                     continue;
                 }
@@ -368,7 +393,7 @@ void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
 
         // resident experts -> candidate cold experts, most significant first
         std::vector<char> resident_set(n_experts, 0);
-        for (int p = 0; p < hot_s; p++) {
+        for (int p = 0; p < S; p++) {
             if (ste[p] >= 0) {
                 resident_set[ste[p]] = 1;
             }
@@ -394,7 +419,7 @@ void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
             swapped++;
         }
 
-        for (int p = 0; p < hot_s; p++) {
+        for (int p = 0; p < S; p++) {
             if (ste[p] >= 0) {
                 dc[p] += (int) std::max<int64_t>(elapsed, 0);
             }
@@ -421,11 +446,12 @@ void llama_expert_hotstore::maybe_resync(const llama_expert_heatmap & heatmap, b
 }
 
 int llama_expert_hotstore::slot_of(int layer_idx, int expert_id) const {
-    if (layer_idx < 0 || layer_idx >= n_layers || hot_s <= 0) {
+    const int S = slots_of(layer_idx);
+    if (layer_idx < 0 || layer_idx >= n_layers || S <= 0) {
         return -1;
     }
     const auto & ste = slot_to_expert[layer_idx];
-    for (int p = 0; p < hot_s; p++) {
+    for (int p = 0; p < S; p++) {
         if (ste[p] == expert_id) {
             return p;
         }
@@ -434,7 +460,7 @@ int llama_expert_hotstore::slot_of(int layer_idx, int expert_id) const {
 }
 
 void llama_expert_hotstore::update_luts() {
-    if (hot_s <= 0 || luts.empty() || bufs.empty()) {
+    if (luts.empty() || bufs.empty()) {
         return;
     }
 
@@ -445,16 +471,17 @@ void llama_expert_hotstore::update_luts() {
         if (!layer_cached[il] || luts[il].hot_lut == nullptr) {
             continue;
         }
+        const int S = slots_of(il);
         const auto & ste = slot_to_expert[il];
 
         // defaults: everyone cold
         for (int e = 0; e < n_experts; e++) {
-            hot_lut_h[e]   = hot_s;     // sentinel slot (zero)
+            hot_lut_h[e]   = S;         // sentinel slot (zero)
             cold_mask_h[e] = 1.0f;
         }
 
         // residents override
-        for (int p = 0; p < hot_s; p++) {
+        for (int p = 0; p < S; p++) {
             const int e = ste[p];
             if (e < 0) {
                 continue;
