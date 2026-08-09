@@ -8,7 +8,11 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,           hparams.n_lora_kv);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,                  hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,                     hparams.n_embd_head_kda);
-    ml.get_key(LLM_KV_KDA_SAFE_GATE,                    hparams.kda_safe_gate);
+    // Optional: GGUFs converted before this key existed simply do not carry it,
+    // and the safe form is the only KDA decay this code implements anyway - see
+    // the assert below. Default to it instead of refusing to load.
+    hparams.kda_safe_gate = true;
+    ml.get_key(LLM_KV_KDA_SAFE_GATE,                    hparams.kda_safe_gate, false);
     ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,             hparams.kda_gate_lower_bound);
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,       hparams.n_ff_exp);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -18,6 +22,18 @@ void llama_model_bailingmoe3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,              hparams.expert_weights_norm, false);
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,               hparams.expert_gating_func);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,             hparams.n_layer_nextn, false);
+
+    // Some conversions carry nextn_predict_layers over from the source config
+    // but ship no MTP block, leaving the last real layer to be mistaken for one
+    // and dropped from the graph. Trust the tensors, not the claim.
+    if (hparams.n_layer_nextn > 0) {
+        const std::string probe = format("blk.%d.nextn.eh_proj.weight", hparams.n_layer_all - 1);
+        if (ml.get_tensor_meta(probe.c_str()) == nullptr) {
+            LLAMA_LOG_INFO("%s: no MTP block in this GGUF despite nextn_predict_layers=%u, ignoring it\n",
+                __func__, hparams.n_layer_nextn);
+            hparams.n_layer_nextn = 0;
+        }
+    }
 
     // Ling 3.0 trains a SwiGLU clamp on the last few layers. Optional: the
     // first GGUF revisions shipped without these arrays, and a missing limit
@@ -76,11 +92,19 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", il), { d_conv, 1, d_inner, 1 }, 0);
 
             create_tensor_qkv(layer, il, n_embd, d_inner, d_inner, d_inner, 0);
-            layer.ssm_f_a = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", il), { n_embd, d_inner }, 0);
+            // Converters before the rename wrote these two as ssm_f / ssm_g; the
+            // shapes and types are identical, so accept either spelling.
+            layer.ssm_f_a = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", il), { n_embd, d_inner }, TENSOR_NOT_REQUIRED);
+            if (layer.ssm_f_a == nullptr) {
+                layer.ssm_f_a = create_tensor(tn(LLM_TENSOR_SSM_F, "weight", il), { n_embd, d_inner }, 0);
+            }
             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", il), { n_embd, n_head }, 0);
             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, il), { 1, n_head }, 0);
             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", il), { d_inner }, 0);
-            layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", il), { n_embd, d_inner }, 0);
+            layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", il), { n_embd, d_inner }, TENSOR_NOT_REQUIRED);
+            if (layer.ssm_g_a == nullptr) {
+                layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G, "weight", il), { n_embd, d_inner }, 0);
+            }
             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", il), { head_dim }, 0);
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { d_inner, n_embd }, 0);
         } else {

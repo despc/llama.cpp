@@ -481,6 +481,8 @@ enum llm_tensor {
     LLM_TENSOR_SSM_CONV1D_Q,        // kimi: Q conv1d weight
     LLM_TENSOR_SSM_CONV1D_K,        // kimi: K conv1d weight
     LLM_TENSOR_SSM_CONV1D_V,        // kimi: V conv1d weight
+    LLM_TENSOR_SSM_F,               // bailingmoe3: forget gate, pre-rename spelling
+    LLM_TENSOR_SSM_G,               // bailingmoe3: output gate, pre-rename spelling
     LLM_TENSOR_SSM_F_A,             // kimi: forget gate projection A
     LLM_TENSOR_SSM_F_B,             // kimi: forget gate projection B
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
