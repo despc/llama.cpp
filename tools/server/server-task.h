@@ -123,6 +123,13 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
+    // output_index of each open item, -1 until the item starts
+    // items get an index in the order they start, which is also their position in the final output array
+    int oai_resp_n_items         = 0;
+    int oai_resp_reasoning_index = -1;
+    int oai_resp_message_index   = -1;
+    int oai_resp_fc_index        = -1;
+
     task_result_state(const common_chat_parser_params & chat_parser_params);
 
     // parse partial tool calls and update the internal state
@@ -446,6 +453,10 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
     std::string oai_resp_fc_id;
+    int oai_resp_n_items         = 0;
+    int oai_resp_reasoning_index = -1;
+    int oai_resp_message_index   = -1;
+    int oai_resp_fc_index        = -1;
 
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;
