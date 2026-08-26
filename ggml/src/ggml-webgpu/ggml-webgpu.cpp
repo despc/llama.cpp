@@ -2714,6 +2714,7 @@ static webgpu_encoded_op ggml_webgpu_rope(webgpu_context & ctx,
     const int n_dims     = ((int32_t *) dst->op_params)[1];
     const int mode       = ((int32_t *) dst->op_params)[2];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+    const int n_offs     = ((int32_t *) dst->op_params)[15];
 
     float freq_base;
     float freq_scale;
@@ -2762,7 +2763,8 @@ static webgpu_encoded_op ggml_webgpu_rope(webgpu_context & ctx,
         (uint32_t) sections[0],
         (uint32_t) sections[1],
         (uint32_t) sections[2],
-        (uint32_t) sections[3]
+        (uint32_t) sections[3],
+        (uint32_t) n_offs
     };
 
     std::vector<wgpu::BindGroupEntry> entries     = { ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, src0),
