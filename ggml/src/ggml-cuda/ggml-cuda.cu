@@ -706,6 +706,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    for (int i = 0; i < STAGE_SLOTS; ++i) {
+        if (stage_event[i] != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(stage_event[i]));
+        }
+        if (stage_buf[i] != nullptr) {
+            CUDA_CHECK(cudaFreeHost(stage_buf[i]));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2465,15 +2473,64 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// Copy from a backend that is not ours, e.g. a CUDA stack isolated on its own driver.
+// No peer copy is possible, so the data goes through a pinned staging slot. The read is
+// blocking in the source runtime, but the write stays on our stream, so we never have to
+// drain it. Without this the generic path in ggml_backend_tensor_copy_async synchronizes
+// both backends and copies through malloc'd pageable memory, which costs far more than
+// the transfer itself for the small tensors an AllReduce moves.
+static bool ggml_backend_cuda_cpy_tensor_foreign(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+
+    const size_t nbytes = ggml_nbytes(dst);
+
+    ggml_cuda_set_device(cuda_ctx_dst->device);
+
+    const int slot = cuda_ctx_dst->stage_next;
+    cuda_ctx_dst->stage_next = (slot + 1) % ggml_backend_cuda_context::STAGE_SLOTS;
+
+    if (cuda_ctx_dst->stage_event[slot] == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_dst->stage_event[slot], cudaEventDisableTiming));
+    } else {
+        // the slot may still be feeding an earlier H2D
+        CUDA_CHECK(cudaEventSynchronize(cuda_ctx_dst->stage_event[slot]));
+    }
+
+    if (cuda_ctx_dst->stage_size[slot] < nbytes) {
+        if (cuda_ctx_dst->stage_buf[slot] != nullptr) {
+            CUDA_CHECK(cudaFreeHost(cuda_ctx_dst->stage_buf[slot]));
+        }
+        CUDA_CHECK(cudaMallocHost(&cuda_ctx_dst->stage_buf[slot], nbytes));
+        cuda_ctx_dst->stage_size[slot] = nbytes;
+    }
+
+    // the source must finish computing before we read it
+    ggml_backend_synchronize(backend_src);
+    ggml_backend_tensor_get(src, cuda_ctx_dst->stage_buf[slot], 0, nbytes);
+
+    CUDA_CHECK(cudaMemcpyAsync(dst->data, cuda_ctx_dst->stage_buf[slot], nbytes,
+                               cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+    CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->stage_event[slot], cuda_ctx_dst->stream()));
+
+    return true;
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
-    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+    if (!ggml_backend_is_cuda(backend_dst) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
     }
 
-    if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+    if (!ggml_backend_is_cuda(backend_src)) {
+        if (ggml_backend_buffer_is_host(buf_src) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+            return false;
+        }
+        return ggml_backend_cuda_cpy_tensor_foreign(backend_src, backend_dst, src, dst);
+    }
+
+    if (!ggml_backend_buffer_is_cuda(buf_src)) {
         return false;
     }
 

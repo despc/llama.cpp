@@ -1417,6 +1417,16 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Staging ring for copies from a backend we cannot peer with, such as a second CUDA
+    // stack on its own driver. Those must pass through host memory. We pin the buffers and
+    // keep the H2D on our stream, so the copy is ordered after our queued work instead of
+    // draining it. One event per slot tells us when a slot is free to overwrite.
+    static const int STAGE_SLOTS = 4;
+    void *      stage_buf  [STAGE_SLOTS] = { nullptr };
+    size_t      stage_size [STAGE_SLOTS] = { 0 };
+    cudaEvent_t stage_event[STAGE_SLOTS] = { nullptr };
+    int         stage_next = 0;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
