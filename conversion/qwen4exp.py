@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+from pathlib import Path
 from typing import Iterable
 
 import torch
@@ -9,7 +9,7 @@ from torch import Tensor
 import gguf
 import numpy as np
 
-from .base import ModelBase, MmprojModel
+from .base import ModelBase
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
@@ -37,8 +37,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_shard_rows: dict[int, int] = {}
         self._ple_row_dim: int | None = None
         self._ple_rows_per_shard: int | None = None
-        self._ple_map = None
-        self._ple_path = None
+        self._ple_map: np.memmap | None = None
+        self._ple_path: Path | None = None
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -82,9 +82,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_ple_heads_per_ngram(hp["heads_per_ngram"])
         self.gguf_writer.add_ple_conv_kernel(hp["ple_conv_kernel_size"])
         self.gguf_writer.add_ple_eos_token_id(self._eos_token_id())
-        # The PLE hash runs over token ids, but a multimodal batch arrives as embeddings
-        # with the placeholder consumed. Carry it so those positions hash what the
-        # reference sees in input_ids instead of being undefined.
+        # an image is decoded as an embeddings-only batch, so the graph has no placeholder
+        # ids to hash; carry the id and let it stand in for those positions
         _img = self._image_token_id()
         if _img is not None:
             self.gguf_writer.add_ple_image_token_id(int(_img))
@@ -99,16 +98,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._read_hash_constants("ple_embedding.ngram_heads_vocab_sizes"))
 
     def _image_token_id(self) -> int | None:
-        # image_token_id is top-level in config.json, not in self.hparams once that is
-        # narrowed to text_config, and the text model has no global_config; read the file
+        # base.py merges text_config into the root of hparams, where image_token_id already is
         img = self.hparams.get("image_token_id")
-        if img is not None:
-            return int(img)
-        try:
-            with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
-                img = json.load(f).get("image_token_id")
-        except Exception:
-            return None
         return None if img is None else int(img)
 
     def _eos_token_id(self) -> int:
@@ -116,6 +107,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if isinstance(eos, list):
             # the PLE hash resets n-grams on the primary EOS
             return int(eos[-1])
+        if eos is None:
+            raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -155,16 +148,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     # -- the PLE table ----------------------------------------------------
     #
-    # 128 shards concatenate into one enormous tensor. Holding them all and then
-    # torch.cat-ing peaks near 300 GB of RSS, which most machines that can
-    # otherwise convert this model do not have. Each shard is instead written
-    # straight into a memory-mapped file at its final row offset and dropped, so
-    # the peak is one shard and the rest is the page cache's problem. The trade
-    # is a temporary file beside the output, removed when the write finishes.
-    #
-    # The file holds float32 because that is what base.py has already cast the
-    # shards to by the time modify_tensors sees them, and what it calls .numpy()
-    # on afterwards.
+    # The 128 shards concatenate into one enormous tensor, which peaks near 300 GB of RSS.
+    # Each shard is written straight into a memory-mapped file at its final row offset and
+    # then dropped, so only one shard is resident. The file is removed after the write.
+    # It holds float32 because base.py has already cast the shards to it.
 
     def _place_ple_shard(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
 
@@ -177,8 +164,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
         if self._ple_map is None:
             if idx == n_parts - 1 and n_parts > 1:
-                # the last shard may be short, so it cannot set the stride. This
-                # only happens if the checkpoint yields shards out of order
+                # the last shard can be short, so it cannot set the stride
+                # this happens only if the checkpoint yields the shards out of order
                 self._ple_pending[idx] = data_torch
                 return []
             self._ple_rows_per_shard = rows
@@ -202,6 +189,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return [(gguf_name + ".weight", table)]
 
     def _write_ple_shard(self, idx: int, shard: Tensor) -> None:
+        # the caller opens the map and fixes the stride before the first write
+        assert self._ple_map is not None and self._ple_rows_per_shard is not None
 
         rows = int(shard.shape[0])
         if idx != self.hparams["split_ngram_parts"] - 1 and rows != self._ple_rows_per_shard:
@@ -211,8 +200,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             )
 
         start = idx * self._ple_rows_per_shard
-        # the shard is still lazy here; force it, since the point of this path
-        # is that exactly one shard is resident at a time
+        # the shard is still lazy here; force it, so exactly one shard is resident
         from .base import LazyTorchTensor
 
         eager = LazyTorchTensor.to_eager(shard).to(torch.float32).contiguous()
@@ -220,6 +208,9 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         del eager
 
     def _finish_ple_table(self, total_rows: int):
+        # only reached once every shard has been written, so the map is open
+        assert self._ple_map is not None and self._ple_path is not None
+        assert self._ple_row_dim is not None
 
         self._ple_map.flush()
         del self._ple_map
