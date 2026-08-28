@@ -610,6 +610,10 @@ struct llama_model {
 
     std::string name = "n/a";
 
+    // file path the model was loaded from (empty if loaded from memory/file
+    // pointer). used by the expert cache sidecar to derive a .tier path.
+    std::string path;
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
@@ -716,6 +720,11 @@ struct llama_model {
     std::string type_name() const;
 
     std::string desc() const;
+
+    // true when model weights are backed by an mmap mapping (file-backed host
+    // pointers). the expert cache uses this to gate madvise(DONTNEED), which is
+    // only safe on file-backed pages.
+    bool uses_mmap() const;
 
     llama_ftype ftype() const;
 

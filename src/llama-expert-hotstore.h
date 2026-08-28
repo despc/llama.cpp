@@ -87,6 +87,12 @@ struct llama_expert_hotstore {
     // dwell_count[il][p] = syncs since slot p last changed (0 = fresh/empty)
     std::vector<std::vector<int>> dwell_count;
 
+    // drop the mmap'd source pages of an expert once it is GPU-resident, so
+    // the file-backed pages free VmRSS until the expert goes cold again. opt-in
+    // via LLAMA_EXPERT_MADVISE, and only when the model is mmap-backed: DONTNEED
+    // on a malloc'd (anonymous) buffer would zero the weights.
+    bool madvise_enabled = false;
+
 llama_expert_hotstore(const llama_model * model, int n_layers,
                       int n_experts, int hot_s, int sync_period = 0,
                       float hyst = 0.0f, int dwell = 0);

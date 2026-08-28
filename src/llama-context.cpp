@@ -470,6 +470,9 @@ llama_context::llama_context(
                 params.expert_heat_decay,
                 params.expert_heat_log_period,
                 params.expert_hot_s);
+            // warm-start the heatmap from <model>.tier when --expert-sidecar is
+            // set, so a restart begins with the converged heat set.
+            expert_heatmap->init_sidecar(model, params.expert_sidecar);
         }
 
         if (hparams.n_expert > 0 && !cparams.warmup && params.expert_hot_s != 0) {
@@ -3607,6 +3610,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_hyst                 =*/ 1.3f,
         /*.expert_dwell                =*/ 0,
         /*.expert_cache_force         =*/ false,
+        /*.expert_sidecar             =*/ false,
         /*.ctx_other                   =*/ nullptr,
     };
 

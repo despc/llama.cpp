@@ -411,6 +411,7 @@ extern "C" {
         float expert_hyst;            // hysteresis ratio for slot swaps
         int   expert_dwell;           // min updates a resident slot keeps before swap
         bool  expert_cache_force;      // bypass the CUDA-only hot store guard
+        bool  expert_sidecar;          // persist the heat set to <model>.tier on exit, warm-start on next run
 
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts

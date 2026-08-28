@@ -341,6 +341,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->hparams.vocab_only = params.vocab_only;
         model->hparams.no_alloc   = params.no_alloc;
 
+        // remember the on-disk path so the expert cache sidecar can derive a
+        // .tier file next to the model. empty for metadata/file-pointer loads.
+        model->path = fname;
+
         try {
             model->load_hparams(ml);
         } catch(const std::exception & e) {

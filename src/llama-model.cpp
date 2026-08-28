@@ -1829,6 +1829,10 @@ std::string llama_model::desc() const {
     return pimpl->desc_str;
 }
 
+bool llama_model::uses_mmap() const {
+    return pimpl && !pimpl->mappings.empty();
+}
+
 llama_ftype llama_model::ftype() const {
     return pimpl->ftype;
 }

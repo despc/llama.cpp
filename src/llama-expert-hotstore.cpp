@@ -8,14 +8,41 @@
 #include "ggml-backend.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <regex>
+
+#if !defined(_WIN32)
+#    include <sys/mman.h>
+#    include <unistd.h>
+#endif
 
 // matches the weight tensor of an expert tensor, e.g.:
 //   blk.0.ffn_gate_exps.weight
 //   blk.3.ffn_down_chexps.weight
 // follows the same convention as LLM_FFN_EXPS_REGEX in common.h
 static const std::regex g_re_exps_weight("blk\\.(\\d+)\\.ffn_(up|down|gate|gate_up)_(ch|)exps\\.weight");
+
+// drop the file-backed source pages of an expert slice now that it is
+// GPU-resident. page-aligned, no-op on windows and on non-mmap builds.
+static void tier_madvise_dontneed(const void * p, size_t len) {
+#if !defined(_WIN32)
+    if (p == nullptr || len == 0) {
+        return;
+    }
+    static const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return;
+    }
+    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) (page - 1);
+    const uintptr_t b = ((uintptr_t) p + len + page - 1) & ~(uintptr_t) (page - 1);
+    if (b > a) {
+        madvise((void *) a, b - a, MADV_DONTNEED);
+    }
+#else
+    (void) p; (void) len;
+#endif
+}
 
 llama_expert_hotstore::llama_expert_hotstore(
         const llama_model * model, int n_layers, int n_experts, int hot_s, int sync_period,
@@ -76,6 +103,16 @@ bool llama_expert_hotstore::allocate(const llama_model * model, bool force) {
         LLAMA_LOG_INFO("%s: hot store: %d slots requested, model has %d experts, using %d\n",
             __func__, hot_s, n_experts, n_experts);
         hot_s = n_experts;
+    }
+
+    // madvise(DONTNEED) on a source slice is only safe on file-backed (mmap)
+    // pages: on a malloc'd buffer it would zero the weights. gate on the model
+    // being mmap-backed AND the env opt-in.
+    madvise_enabled = false;
+    if (model->uses_mmap()) {
+        if (const char * e = getenv("LLAMA_EXPERT_MADVISE")) {
+            madvise_enabled = atoi(e) != 0;
+        }
     }
 
     layer_cached.assign(n_layers, false);
@@ -299,6 +336,9 @@ void llama_expert_hotstore::copy_top_s(const llama_expert_heatmap & heatmap) {
                     continue;
                 }
                 ggml_backend_tensor_set(e->dst, src + (size_t) ex * slot, (size_t) p * slot, slot);
+                if (madvise_enabled) {
+                    tier_madvise_dontneed(src + (size_t) ex * slot, slot);
+                }
             }
         }
     }
@@ -330,6 +370,9 @@ void llama_expert_hotstore::plant_static() {
             if (!src) continue;
             for (int p = 0; p < S && p < n_experts; p++) {
                 ggml_backend_tensor_set(e->dst, src + (size_t) p * slot, (size_t) p * slot, slot);
+                if (madvise_enabled) {
+                    tier_madvise_dontneed(src + (size_t) p * slot, slot);
+                }
             }
         }
     }
@@ -421,6 +464,9 @@ void llama_expert_hotstore::resync_top_s(const llama_expert_heatmap & heatmap) {
                     continue;
                 }
                 ggml_backend_tensor_set(ent->dst, src + (size_t) e_cold * slot, (size_t) p * slot, slot);
+                if (madvise_enabled) {
+                    tier_madvise_dontneed(src + (size_t) e_cold * slot, slot);
+                }
             }
             ste[p] = e_cold;
             dc[p]  = -elapsed; // fresh dwell: aging below brings it to 0

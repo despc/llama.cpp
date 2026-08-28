@@ -1,5 +1,6 @@
 #include "llama-expert-heatmap.h"
 #include "llama-impl.h"
+#include "llama-model.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -8,6 +9,8 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
+#include <fstream>
 #include <functional>
 #include <vector>
 
@@ -57,6 +60,9 @@ void llama_expert_heatmap::update_from_graph(const std::vector<std::pair<int, gg
     }
 
     tokens_total += n_tokens;
+    if (n_tokens > 0) {
+        sidecar_dirty = true;
+    }
     if (log_period > 0 && tokens_total / log_period > (tokens_total - n_tokens) / log_period) {
         log();
     }
@@ -175,4 +181,105 @@ std::vector<int> llama_expert_heatmap::get_top_s(int layer_idx, int s) const {
 
     result.assign(indices.begin(), indices.begin() + k);
     return result;
+}
+
+// FNV-1a 64-bit, same seed/prime as the wackMall sidecar. Used to fingerprint
+// the model so a stale .tier file (different arch, tensor count or shapes)
+// is ignored instead of seeding the heatmap with wrong data.
+static uint64_t sidecar_fnv1a(const void * data, size_t len, uint64_t h = 14695981039346656037ULL) {
+    const uint8_t * p = (const uint8_t *) data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t) p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t sidecar_fnv1a_str(const char * s, uint64_t h = 14695981039346656037ULL) {
+    return sidecar_fnv1a(s, strlen(s), h);
+}
+
+static uint64_t sidecar_fnv1a_u64(uint64_t v, uint64_t h = 14695981039346656037ULL) {
+    return sidecar_fnv1a(&v, sizeof(v), h);
+}
+
+static uint64_t sidecar_fingerprint(const llama_model & model) {
+    uint64_t h = 14695981039346656037ULL;
+    h = sidecar_fnv1a_str(model.arch_name().c_str(), h);
+    h = sidecar_fnv1a_u64((uint64_t) model.size(), h);
+    h = sidecar_fnv1a_u64((uint64_t) model.n_tensors(), h);
+    for (const auto & kv : model.tensors_by_name) {
+        h = sidecar_fnv1a_str(kv.first.c_str(), h);
+        const ggml_tensor * t = kv.second;
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            h = sidecar_fnv1a_u64((uint64_t) t->ne[i], h);
+        }
+    }
+    return h;
+}
+
+void llama_expert_heatmap::init_sidecar(const llama_model & model, bool enable) {
+    if (!enable || model.path.empty()) {
+        return;
+    }
+
+    sidecar_path = model.path + ".tier";
+    sidecar_fp   = sidecar_fingerprint(model);
+
+    std::ifstream in(sidecar_path, std::ios::binary);
+    if (!in) {
+        return;
+    }
+
+    uint32_t version = 0;
+    uint64_t fp = 0;
+    in.read((char *) &version, sizeof(version));
+    in.read((char *) &fp, sizeof(fp));
+    if (!in || version != 1 || fp != sidecar_fp) {
+        LLAMA_LOG("expert sidecar: ignoring %s (version or fingerprint mismatch)\n", sidecar_path.c_str());
+        return;
+    }
+
+    const size_t want = (size_t) n_layers * (size_t) n_experts;
+    std::vector<float> loaded(want);
+    in.read((char *) loaded.data(), want * sizeof(float));
+    if (!in || (size_t) in.gcount() != want * sizeof(float)) {
+        LLAMA_LOG("expert sidecar: ignoring %s (truncated)\n", sidecar_path.c_str());
+        return;
+    }
+
+    heat = std::move(loaded);
+    sidecar_dirty = false;
+    LLAMA_LOG("expert sidecar: loaded %s (%zu layers x %d experts)\n",
+        sidecar_path.c_str(), (size_t) n_layers, n_experts);
+}
+
+void llama_expert_heatmap::save_sidecar() const noexcept {
+    if (sidecar_path.empty() || !sidecar_dirty || sidecar_fp == 0) {
+        return;
+    }
+
+    const std::string tmp = sidecar_path + ".tmp";
+    std::ofstream out(tmp, std::ios::binary);
+    if (!out) {
+        return;
+    }
+
+    const uint32_t version = 1;
+    out.write((const char *) &version, sizeof(version));
+    out.write((const char *) &sidecar_fp, sizeof(sidecar_fp));
+    out.write((const char *) heat.data(), heat.size() * sizeof(float));
+    out.close();
+
+    if (!out || std::rename(tmp.c_str(), sidecar_path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return;
+    }
+
+    LLAMA_LOG("expert sidecar: saved %s (%zu layers x %d experts)\n",
+        sidecar_path.c_str(), (size_t) n_layers, n_experts);
+}
+
+llama_expert_heatmap::~llama_expert_heatmap() {
+    save_sidecar();
 }
