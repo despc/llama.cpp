@@ -4,6 +4,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <cinttypes>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -12,28 +13,30 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
 
-
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
     ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
     ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+    GGML_ASSERT(hparams.ssm_d_conv  > 0 && hparams.ssm_d_inner > 0 && hparams.ssm_d_state > 0 &&
+                hparams.ssm_dt_rank > 0 && hparams.ssm_n_group > 0);
 
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
-    GGML_ASSERT(hparams.dsv4_hc_mult > 0 && "qwen4exp needs a hyper-connection count");
-    GGML_ASSERT(hparams.hc_low_rank  > 0 && "qwen4exp needs a hyper-connection low rank");
+    GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
-
 
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+    GGML_ASSERT(hparams.indexer_n_head > 0
+             && hparams.indexer_head_size > 0
+             && hparams.indexer_top_k > 0);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
-    std::fill(hparams.is_ple_impl.begin(), hparams.is_ple_impl.end(), 0);
+    hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
 
     uint32_t n_ple = 0;
@@ -41,9 +44,12 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     if (n_ple > 0) {
         std::vector<uint32_t> ple_layers;
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
+        GGML_ASSERT(n_ple == 1 && "qwen4exp supports only one PLE layer");
         for (uint32_t il : ple_layers) {
-            GGML_ASSERT(il < hparams.n_layer_all);
-            hparams.is_ple_impl[il] = 1;
+            if (il >= hparams.n_layer_all) {
+                throw std::runtime_error(format("PLE layer %u is out of range", il));
+            }
+            hparams.is_ple_impl.set(il);
         }
 
         ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
@@ -53,21 +59,41 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         // optional: files written before this key fall back to the EOS token
         ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
         ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+        GGML_ASSERT(hparams.ple_conv_kernel > 0 && hparams.n_embd_per_layer > 0);
 
         hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
         hparams.ple_head_dim = hparams.n_embd_per_layer;
-        GGML_ASSERT(hparams.ple_ngram_size >= 2 && hparams.ple_ngram_size <= LLAMA_MAX_PLE_NGRAM);
-        GGML_ASSERT(hparams.ple_n_heads > 0 && hparams.ple_n_heads <= LLAMA_MAX_PLE_HEADS);
+        if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
+            throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
+        }
+        if (hparams.ple_n_heads == 0 || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
+            throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
+        }
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
-        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_head_offsets);
-        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_head_vocab_sizes);
+
+        // the file stores the head ranges as uint64, so read at that width and narrow to the int32 the gather uses
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
+        std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
+        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
+        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            if (head_vocab_sizes[h] == 0 ||
+                head_offsets[h]     > INT32_MAX ||
+                head_vocab_sizes[h] > INT32_MAX ||
+                head_offsets[h] + head_vocab_sizes[h] > INT32_MAX) {
+                throw std::runtime_error(format("PLE head %u range does not fit the int32 row index", h));
+            }
+            hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
+            hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
+        }
     }
 
     // linear attention everywhere except every full_attention_interval-th layer
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+        GGML_ASSERT(full_attn_interval > 0);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
         }
@@ -101,11 +127,17 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto * ple_w = ml.get_weight(ple_name.c_str());
-        GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
-        const int64_t ple_rows = ple_w->tensor->ne[1];
+        const auto & ple_w = ml.require_weight(ple_name.c_str());
+        const int64_t ple_rows = ple_w.tensor->ne[1];
+
+        // sanity check
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            if ((int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h] > ple_rows) {
+                throw std::runtime_error(format("PLE head %u range exceeds the %" PRId64 " table rows", h, ple_rows));
+            }
+        }
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, 0);
+                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
     }
 
     for (int il = 0; il < n_layer; ++il) {
@@ -139,7 +171,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, 0);
             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, 0);
-
 
             const int64_t idx_dim = hparams.indexer_head_size;
             layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, 0);
@@ -310,6 +341,16 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
+        if (il == n_layer - 1 && inp_out_ids) {
+            // everything below is per token, so drop the rows that produce no output
+            cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+            inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+
+            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+        }
+
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
         cur = build_hc_mix(res_hc,
@@ -332,10 +373,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * cur = build_hc_mix(res_hc,
             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
             nullptr, nullptr, -1);
-
-    if (inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
@@ -375,17 +412,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
     return ggml_mul(ctx0, normalized, gated);
 }
 
-// QSA attends to a budget of whole blocks of compress_ratio tokens, each scored by one
-// mean-pooled indexer key, plus the incomplete tail. set_input resolves the cache layout.
-class llm_graph_input_qsa : public llm_graph_input_i {
+// QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
+// one mean-pooled indexer key scores each block; set_input resolves the cache layout
+class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio) :
-        mctx(mctx), ratio(ratio) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        const auto * idx = mctx->get_idx();
+        if (idx == nullptr) {
+            return false;
+        }
+
+        const int64_t n_kv     = idx->get_n_kv();
+        const int64_t n_stream = mctx->get_n_stream();
+        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+
+        bool res = true;
+
+        res &= params.ubatch.n_tokens % n_stream == 0;
+
+        res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+        res &= cell_blk->ne[0]  == n_kv;
+        res &= cell_blk->ne[1]  == n_stream;
+        res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
+        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+
+        return res;
     }
 
     // per stream: a cell index names a different token in each stream
@@ -393,16 +457,20 @@ public:
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
-    ggml_tensor * bias      = nullptr;   // F32 [n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
+
+    // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
+    const bool blk_bias;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
+        ggml_tensor *                           kq_mask,
         int *                                   sections,
         int                                     il) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
@@ -421,21 +489,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(n_tokens % n_stream == 0);
     const int64_t n_tps = n_tokens/n_stream;
 
-    auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r);
+    // only the "which block is visible" half of the bias varies per block
+    // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
+    // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
+    // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
+    const bool blk_bias = kq_mask != nullptr &&
+        kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
+        cparams.causal_attn && !hparams.use_alibi;
 
-    qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-    qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-    qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-    qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-    qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tps, n_stream);
+    // nothing above depends on the layer, so the layers sharing a ratio share one input set
+    llm_graph_input_qsa * inp = nullptr;
 
-    ggml_set_input(qsa->cell_blk);
-    ggml_set_input(qsa->blk_cells);
-    ggml_set_input(qsa->blk_pos);
-    ggml_set_input(qsa->bias);
+    const auto it = qsa_inps.find((uint32_t) r);
+    if (it != qsa_inps.end()) {
+        inp = it->second;
+    } else {
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
-    llm_graph_input_qsa * inp = qsa.get();
-    res->add_input(std::move(qsa));
+        qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+        qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+
+        ggml_set_input(qsa->cell_blk);
+        ggml_set_input(qsa->blk_cells);
+        ggml_set_input(qsa->blk_pos);
+        ggml_set_input(qsa->bias);
+
+        inp = qsa.get();
+        res->add_input(std::move(qsa));
+        qsa_inps.emplace((uint32_t) r, inp);
+    }
 
     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
@@ -491,12 +576,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
     cb(score, "indexer_score", il);
 
-    // give every token of a block the block score; the budget is a whole number of
-    // blocks, so the top-k cut still lands on a block boundary
+    // one value per block, so it is cheaper to bias here than after the cells are expanded
+    if (blk_bias) {
+        score = ggml_add(ctx0, score, inp->bias);
+    }
+
+    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     ggml_tensor * expanded = ggml_get_rows(ctx0,
             ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3)), inp->cell_blk);
     expanded = ggml_cont(ctx0, ggml_permute(ctx0, expanded, 1, 0, 2, 3));
-    expanded = ggml_add(ctx0, expanded, inp->bias);
+
+    if (blk_bias) {
+        // flash attention keeps the mask in f16; the scores are f32
+        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        expanded = ggml_add(ctx0, expanded, ggml_reshape_3d(ctx0, mask, n_kv, n_tps, n_stream));
+    } else {
+        expanded = ggml_add(ctx0, expanded, inp->bias);
+    }
     cb(expanded, "indexer_score_tokens", il);
 
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
@@ -606,7 +702,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     // indexer reads the same block input as q/k/v; no cache or no ratio means dense
     const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, sections, il) : nullptr;
+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
@@ -690,12 +786,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t head_k_dim   = hparams.ssm_d_state;
     const int64_t num_k_heads  = hparams.ssm_n_group;
     const int64_t num_v_heads  = hparams.ssm_dt_rank;
-    const int64_t head_v_dim   = d_inner / num_v_heads;
+    const int64_t head_v_dim   = hparams.ssm_d_state;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     GGML_ASSERT(n_seqs != 0);
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+    GGML_ASSERT(head_v_dim * num_v_heads == d_inner);
 
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
@@ -730,9 +827,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    // offset 0: delta-net history first, PLE history (if any) after it
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, 0, il);
+            conv_kernel_size - 1, conv_channels, il);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -746,8 +842,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
-    int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
-    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, conv_channels);
 
     // Extract the convolved Q, K, V from conv_output
     ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
@@ -776,8 +871,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
-
-
 
     // repeat to match shapes when head keys != value keys; unneeded with the fused GDN
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
@@ -846,7 +939,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
 
-
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
@@ -866,26 +958,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
-                        const llama_memory_hybrid_idx_context * mctx) : pmodel(pmodel), mctx(mctx) {}
+                        const llama_kv_cache_context * mctx) : pmodel(pmodel), mctx(mctx) {}
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+    }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
 
     const llama_model_qwen4exp & pmodel;
 
-    // the token history lives on the memory, so it is per context and part of the state blob
-    const llama_memory_hybrid_idx_context * mctx;
+    // the predecessor tokens live in the attention KV cells (ext.tok)
+    const llama_kv_cache_context * mctx;
+
+    // scratch, reused across set_input() calls
+    std::vector<llama_token> prev;
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
-    // An image is decoded as an embeddings-only batch, so ubatch->token is null and the
-    // placeholder ids are not available. The hash must still give every position a row,
-    // because this input feeds ggml_get_rows. Stand in the configured image token id, as
-    // the reference hashes the placeholder, or EOS if the file has no such key.
+    // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
+    // stand in the image token id that the reference hashes, or EOS if the file has no such key
     // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
     const llama_token img_tok = hp.ple_image_token_id != 0
         ? (llama_token) hp.ple_image_token_id
@@ -899,66 +997,32 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t n_heads  = hp.ple_n_heads;
     const int64_t per_gram = hp.ple_heads_per_ngram;
     const int64_t eos      = hp.ple_eos_token_id;
+    const int64_t n_prev   = n_gram - 1;
 
     std::vector<int32_t> idx(n_heads * n_tokens);
 
-    // missing predecessors come from the per-sequence history, but only when it is
-    // contiguous with the incoming position; otherwise the window is EOS-padded
     GGML_ASSERT(mctx != nullptr);
 
-    // snapshot the history first, so a token cannot read an earlier token of this same ubatch
-    // the snapshot is always n_gram - 1 long and EOS-padded at the front: prev() puts the most recent token last
-    std::unordered_map<llama_seq_id, std::vector<llama_token>> snap;
     for (int64_t i = 0; i < n_tokens; ++i) {
-        const llama_seq_id seq = ubatch->seq_id[i][0];
-        if (snap.count(seq)) {
-            continue;
-        }
-        auto & h = mctx->get_ple_hist(seq);
-        if (h.next_pos != ubatch->pos[i]) {
-            h.next_pos = ubatch->pos[i];
-            h.toks.clear();
-        }
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
-        }
-
-        std::vector<llama_token> padded(n_gram - 1, (llama_token) eos);
-        std::copy(h.toks.begin(), h.toks.end(), padded.end() - (int64_t) h.toks.size());
-        snap[seq] = std::move(padded);
+        // the preceding tokens would be ambiguous, see get_prev_tokens()
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
+    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+    mctx->get_prev_tokens(*ubatch, n_prev, prev);
+
     for (int64_t i = 0; i < n_tokens; ++i) {
-        const llama_seq_id seq = ubatch->seq_id[i][0];
-        const llama_pos    pos = ubatch->pos[i];
-
-        const auto & hist = snap[seq];
-
-        // predecessor s (1-based) of this token, EOS past a segment boundary
-        auto prev = [&](int64_t s) -> int64_t {
-            const int64_t j = i - s;
-            if (j >= 0 && ubatch->seq_id[j][0] == seq && ubatch->pos[j] == pos - s) {
-                return tok_of(j);
-            }
-            // s - i positions before this ubatch started, most recent last
-            const int64_t back = s - i;
-            const int64_t k    = (int64_t) hist.size() - back;
-            if (back > 0 && k >= 0 && k < (int64_t) hist.size() && pos - s >= 0) {
-                return hist[k];
-            }
-            return eos;
-        };
-
         // an EOS in the window resets everything at or before it
+        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
         // the EOS of the token itself does not cut its own context, as in the reference
         std::vector<int64_t> ctx(n_gram);
         ctx[0] = tok_of(i);
         bool cut = false;
         for (int64_t s = 1; s < n_gram; ++s) {
-            ctx[s] = cut ? eos : prev(s);
-            if (ctx[s] == eos) {
-                cut = true;
-            }
+            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
+            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
+            cut = cut || t < 0 || t == eos;
+            ctx[s] = cut ? eos : t;
         }
 
         for (int64_t n = 2; n <= n_gram; ++n) {
@@ -973,48 +1037,37 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
             }
         }
-
-        auto & h = mctx->get_ple_hist(seq);
-        h.toks.push_back(tok_of(i));
-        if ((int64_t) h.toks.size() > n_gram - 1) {
-            h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
-        }
-        h.next_pos = pos + 1;
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
-// Read one conv history from the recurrent row at row_offset and write the new tail back.
-// The shared build_conv_state cannot do this: the row holds the delta-net history and the PLE one.
+// Read a conv history out of its own recurrent row and write the new tail back.
+// The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.
 ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int64_t              row_offset,
         int                  il) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
 
     const int64_t n_seqs    = ubatch.n_seqs;
-    const int64_t row_total = hparams.n_embd_r();
+    const int64_t row_total = conv_states_all->ne[0];
 
-    // the gather needs the whole row, then this convolution takes its slice
-    auto it = rs_rows.find(il);
+    // the row is exactly this convolution's state, so the gather is reused as a whole
+    GGML_ASSERT(state_cols * channels == row_total);
+
+    auto it = rs_rows.find(conv_states_all);
     if (it == rs_rows.end()) {
-        it = rs_rows.emplace(il, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
+        it = rs_rows.emplace(conv_states_all, build_rs(inp, conv_states_all, row_total, n_seqs)).first;
     }
     ggml_tensor * rows = it->second;
 
-    const size_t esz = ggml_element_size(rows);
-
-    ggml_tensor * state = ggml_cont(ctx0,
-            ggml_view_2d(ctx0, rows, state_cols * channels, n_seqs,
-                    rows->nb[1], row_offset * esz));
-    state = ggml_reshape_3d(ctx0, state, state_cols, channels, n_seqs);
+    ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
@@ -1030,7 +1083,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
             state_cols * channels, n_seqs,
             conv_states_all->nb[1],
-            kv_head * row_size + row_offset * ggml_element_size(conv_states_all));
+            kv_head * row_size);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
 
@@ -1042,14 +1095,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *        hidden,
         int                  il) {
-    GGML_UNUSED(inp);
-
     const int64_t hc      = hparams.dsv4_hc_mult;
     const int64_t hc_dim  = hc * n_embd;
     const int64_t n_heads = hparams.ple_n_heads;
 
+    // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb);
+            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
@@ -1096,7 +1148,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             model.layers[il].ple_norm_conv);
     normalized = ggml_reshape_2d(ctx0, normalized, hc_dim, n_tokens);
 
-    // Depthwise causal conv dilated by the n-gram size, as a sum of shifted copies, because
+    // depthwise causal conv, dilated by the n-gram size, as a sum of shifted copies
     // ggml_conv_1d_dw is documented as unreliable:
     //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
     // The history of the earlier ubatches is prepended, so a chunked prefill matches a single-shot one.
@@ -1109,10 +1161,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     // [hist + n_seq_tokens, hc_dim, n_seqs], tokens on ne[0]
-    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_r_l(il),
+    ggml_tensor * padded = build_conv_state_at(inp, inp->mctx->get_p_l(il),
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
-            hist, hc_dim,
-            hparams.n_embd_r() - hparams.ple_conv_state(), il);
+            hist, hc_dim, il);
 
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
