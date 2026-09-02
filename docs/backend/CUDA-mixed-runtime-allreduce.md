@@ -742,6 +742,41 @@ default, and choosing it is a precision decision, not a performance one.
 A deterministic 5000-token prompt with 16 generated tokens produced the same
 text on the two-stage path as on the default one.
 
+### Generation: what else was tried (2026-09-02)
+
+With the two-stage small path in place, generation in the production shape runs
+at 57.5-58.3 tokens/s. The remaining levers were measured and none of them
+moved it:
+
+| Attempt | Result |
+| --- | --- |
+| CUDA graphs disabled (`GGML_CUDA_DISABLE_GRAPHS=1`) | 57.4-58.2 tokens/s, no change. Launch overhead is not the constraint; the devices are 94 percent busy. |
+| `--no-mmproj` to free VRAM for a larger ubatch | Still fails a 2592 MiB compute buffer at ubatch 4096. The projector was not what blocked it. |
+| `--spec-draft-n-max` 3 and 4 | 53.1 and 49.1 tokens/s against 54.9 at 2. Acceptance falls from 60.0 to 47.1 and 38.0 percent. |
+| `--spec-draft-p-min` 0.1 / 0.3 / 0.6 | 57.4-57.9 / 53.2-53.9 / 43.5-44.0 tokens/s. Acceptance rises to 61.9, 65.7, 81.1 percent, but fewer drafted tokens more than cancel it. Zero stays optimal. |
+| Volta mmvq table re-tuning | Within measurement spread; see above. |
+
+Speculation already halves the collectives per output token: with MTP the run
+issues 61 collectives per output token against 131 without it, because one
+forward pass verifies three tokens and about 1.6 are accepted. What it cannot
+change is the pass itself, and the pass is what the V100 gates: waiting is
+still 91 percent of the AllReduce time with MTP on.
+
+The V100's own ceiling was measured directly with llama-bench on the card
+alone, `-sm none`:
+
+| Model | Size | Generation | Effective bandwidth |
+| --- | ---: | ---: | ---: |
+| Qwen3.8-27B Q8_K_L | 26.11 GiB | 24.72 tokens/s | 645 GB/s |
+| Qwen3.8-27B Q4_K_XL | 16.34 GiB | 34.75 tokens/s | 568 GB/s |
+
+Q8_0 reaches a higher effective bandwidth than Q4_K, so the quantization's
+unpacking is not the limit -- memory is. Against roughly 900 GB/s of peak HBM2
+the kernel sits at 72 percent, and a well-behaved streaming kernel can reach
+about 85 percent. That remaining 15 to 20 percent, worth 3 to 4 ms per forward
+pass, is the only untapped generation lever left, and it requires a better
+Volta mat-vec kernel rather than any configuration change.
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token
