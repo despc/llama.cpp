@@ -62,6 +62,11 @@ The process prints totals by rank and wire size during context destruction. This
 
 `GGML_CUDA_MIXED_AR_CPU_PROFILE=1` measures existing `prepare` and `enqueue` calls with `steady_clock`. It does not introduce CUDA synchronization and has negligible measured overhead. It identifies CPU blocking caused by slot reuse.
 
+`GGML_CUDA_MIXED_AR_FUSED_STREAM=1` switches the fused kernel to chunked
+progress publication, and `GGML_CUDA_MIXED_AR_STREAM_CHUNK` sets the qblocks
+per progress step (default 20). Both require `GGML_CUDA_MIXED_AR_FUSED_INT8=1`
+and are default-off; see the streamed publication experiment below.
+
 `GGML_CUDA_MIXED_AR_DEVICE_SLOTS=0` restores the original CPU event wait for
 the two-slot ring. The default is `1`: kernels publish a per-rank departure
 token after consuming a slot, and a future writer waits for that token on the
@@ -387,6 +392,82 @@ quality or perplexity evaluation, a multi-seed rank-equivalence test, or a
 decode regression test. Keep `GGML_CUDA_MIXED_AR_FUSED_INT8=0` for production
 until those checks pass.
 
+### Local arrival ring sizing fix
+
+The two-device local pipeline sizes its arrival ring with
+`GGML_CUDA_AR_KERNEL_BLOCKS`, which is 8. The fused kernel reuses that same
+ring but launches `GGML_CUDA_MIXED_AR_BLOCKS` blocks, which is 32, so blocks
+8 to 31 wrote their arrival token onto another (slot, rank) line. All ranks
+publish the same token value in a call, so the aliasing did not show up as a
+hang; it could let a block observe a peer arrival before that peer had
+finished writing its stripe, which is a silent correctness hazard for every
+fused measurement taken before this fix. The ring is now sized with
+`GGML_CUDA_AR_ARRIVAL_BLOCKS`, the larger of the two launch widths.
+
+The fix does not change the stable cross-runtime INT8 production path, which
+drives the ring with 8 blocks. Its warmed exact 5000-token prompt after the
+fix was 4613.174, 4614.447, and 4614.600 ms, or about 1083.5 tokens/s.
+
+### Streamed publication experiment
+
+`GGML_CUDA_MIXED_AR_FUSED_STREAM=1`, together with the fused mode, replaces
+the fused kernel's stripe-level barrier with a chunked progress protocol.
+Every block publishes a 64-bit word holding the current token in the high half
+and the number of published qblocks in the low half, at offset 8 of the same
+64-byte signal line the coarse token uses. A single aligned 8-byte store
+crosses PCIe as one transaction, so a reader sees either the previous call's
+word or a complete new one. `GGML_CUDA_MIXED_AR_STREAM_CHUNK` sets how many
+qblocks one progress step covers; the default is 20.
+
+The three phases stay separate. Interleaving publication and consumption per
+qblock, which was the first implementation, breaks the pipelining of the
+publication loop's PCIe writes and measured clearly slower.
+
+Warmed exact 5000-token prompts, same host state, speculative decoding off:
+
+| Mode | Prompt runs | Prompt speed |
+| --- | ---: | ---: |
+| Stable cross-only INT8 | 4613.2-4614.6 ms | 1083.5 tokens/s |
+| Fused, coarse barrier | 4575.4-4581.1 ms | 1091.4-1092.8 tokens/s |
+| Streamed, chunk 1 | 4733.7-4738.7 ms | 1055.1-1056.3 tokens/s |
+| Streamed, chunk 8 | 4616.9-4618.7 ms | 1082.6-1083.0 tokens/s |
+| Streamed, chunk 16 | 4581.2-4584.6 ms | 1090.6-1091.4 tokens/s |
+| Streamed, chunk 20 | 4567.9-4571.7 ms | 1093.7-1094.6 tokens/s |
+| Streamed, chunk 40 | 4571.9-4577.3 ms | 1092.4-1093.7 tokens/s |
+| Streamed, chunk 80 | 4577.8-4578.0 ms | 1092.2 tokens/s |
+
+Chunk 80 covers a whole stripe for the 20 MiB wire, so it is the control that
+isolates the protocol's own overhead: it lands on the coarse kernel's result.
+The best streamed setting is worth about 8 ms, or 0.2 percent, over the coarse
+fused kernel.
+
+The profiled run explains why the win is that small. Per prompt, with the
+streamed accounting where publish covers all productive work and wait covers
+both peer waits:
+
+| Rank | Publish | Wait |
+| --- | ---: | ---: |
+| 0, RTX 5080 | 1265.9 ms | 1491.6 ms |
+| 1, RTX 5070 Ti | 1147.1 ms | 1501.3 ms |
+| 2, V100 | 1912.2 ms | 100.5 ms |
+
+The profiled critical AllReduce path fell from 3085.967 ms for the coarse
+fused kernel to 2759.097 ms, an 11 percent reduction, but end-to-end prompt
+time barely moved. The V100 spends 1912 ms per prompt publishing and only
+100 ms waiting: it is never blocked by the Blackwell side. The 1491 ms the
+Blackwell ranks wait is the V100's mapped-host write time itself, measured
+earlier at approximately 2.81 GiB/s for publication and 3.00 GiB/s for peer
+reads. Finer publication granularity reschedules that transfer, it does not
+shorten it, so the exposed wait is transport-bound rather than
+synchronization-bound.
+
+A deterministic 5000-token prompt with 16 generated tokens produced exactly
+the same text on the stable cross-only path, the coarse fused kernel, and the
+streamed kernel at chunk 20. This is a smoke test, not a quality evaluation.
+
+Both experimental modes remain default-off. The production script still
+enables only `GGML_CUDA_MIXED_AR_INT8`.
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token
@@ -400,19 +481,26 @@ These failures are configuration-level VRAM limits, not AllReduce failures.
 
 ## Optimization order
 
-1. Run a broader quality or perplexity evaluation for the fused and local INT8
-   stages before treating them as lossless.
-2. Add a multi-seed rank-equivalence test and a decode regression test for the
-   fused kernel.
-3. Reduce or overlap the V100 publication dependency exposed by the faster
-   local path. Direct CUDA P2P between the Blackwell devices is unavailable on
-   this host, so further local transport work must account for the PHB
-   mapped-host path.
-4. Investigate finer-grained publication or more parallel block scheduling;
-   the fused profile now spends 1201.922 ms publishing and 1471.693 ms waiting.
-5. Reduce the number of cross-runtime reductions per layer. Reaching 1500
+Finer-grained publication, which was the previous first item, has been tried
+and measured: see the streamed publication experiment above. It cuts the
+profiled critical path by 11 percent and end-to-end time by 0.2 percent,
+because the exposed wait is the V100's mapped-host transfer time and not a
+synchronization artifact. The remaining levers therefore have to move bytes
+or calls, not signals.
+
+1. Reduce the bytes the V100 pushes and pulls. It writes 1912 ms per prompt at
+   approximately 2.81 GiB/s while the Blackwell ranks wait 1491 ms for exactly
+   that traffic. A narrower wire in the V100 direction, for example packed
+   INT6 or INT4 with the existing per-4096 scales, or dropping the V100's
+   tensor share once context allows it, attacks the measured bottleneck
+   directly.
+2. Reduce the number of cross-runtime reductions per layer. Reaching 1500
    tokens/s requires a total prompt time near 3.33 seconds, so transport
    compression alone is not sufficient.
+3. Run a broader quality or perplexity evaluation for the fused, streamed, and
+   local INT8 stages before treating them as lossless.
+4. Add a multi-seed rank-equivalence test and a decode regression test for the
+   fused and streamed kernels.
 6. Re-run the same exact 5000-token prompt after every change. Also test token
    generation because the small flat path has different latency requirements.
 
