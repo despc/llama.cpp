@@ -811,6 +811,50 @@ The edge is sharp and every neighbouring setting moves it, so the split has to
 be re-checked after any change to context length, the draft model, or the
 projector.
 
+### Quality against speed, measured (2026-09-02)
+
+Every approximation in the current configuration was measured against the same
+corpus and the same reference prompt, so the cost of each one is on the record.
+
+Perplexity was run with `llama-perplexity` over 306 KB of English prose from
+this repository's own documentation, 120 chunks of 512 tokens, tensor split
+`1.2,1.2,1.6`. The absolute value is not comparable to published wikitext
+numbers, but every configuration sees the identical chunks in the identical
+order, so the differences are meaningful well below the quoted standard error.
+
+| Cross-runtime wire | Perplexity | Delta | Prefill | Generation |
+| --- | ---: | ---: | ---: | ---: |
+| BF16, everything experimental off | 4.0647 | reference | 734.1 tok/s | 61.82 tok/s |
+| Vectorised INT8 | 4.0876 | +0.0229, +0.56% | 1037.0 tok/s | 61.83 tok/s |
+| INT8, fused and streamed | 4.0948 | +0.0301, +0.74% | 1153.8 tok/s | 61.66 tok/s |
+| The above plus the two-stage small path | 4.0948 | +0.0301, +0.74% | 1154.8 tok/s | 63.80 tok/s |
+
+The INT8 wire buys 41 percent of prefill for 0.56 percent of perplexity. The
+fused streamed kernel adds another 11 percent of prefill for 0.18 percent more.
+Neither touches generation, because decode's collectives are far below the
+1 MiB threshold where the striped INT8 path takes over -- they run on the flat
+BF16 path throughout.
+
+The two-stage small path therefore does not appear in the table above at all:
+the perplexity run exercises only large collectives. It was measured separately
+by shrinking the ubatch to 64 tokens, which puts every collective on the flat
+path, over 60 chunks:
+
+| Flat path | Perplexity |
+| --- | ---: |
+| Stock | 3.7176 +/- 0.06507 |
+| Two-stage | 3.7172 +/- 0.06505 |
+
+The two-stage kernel comes out 0.0004 lower, which is to say the extra rounding
+of the pair sum is lost in floating-point reordering noise. It is worth 3.5
+percent of generation, and 2.1 tokens/s in the table above, at no measurable
+quality cost.
+
+Read together: the whole optimisation stack costs 0.74 percent of perplexity,
+all of it from the INT8 wire family on the prefill path, and returns 57 percent
+of prefill and 3 percent of generation. The remaining generation gain came from
+the tensor split and speculation, which do not approximate anything.
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token
