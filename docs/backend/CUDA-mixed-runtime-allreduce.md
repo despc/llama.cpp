@@ -229,11 +229,11 @@ The rank totals were 3359.099 ms for rank 0, 3364.879 ms for rank 1, and
 runtime and 2.625 ms for the V100 runtime. The local Blackwell reduction is
 therefore the largest isolated phase in this baseline.
 
-The deployed DSOs under `/home/despc/llama.cpp/fork_v100` contain the stable
-cross-runtime INT8 path and the separately tested local INT8 implementation.
-They do not contain the newest fused INT8 experiment described below. The
-production launch script enables only `GGML_CUDA_MIXED_AR_INT8`; both new
-experimental modes remain disabled.
+The deployed DSOs under `/home/despc/llama.cpp/fork_v100` now contain the
+stable cross-runtime INT8 path, the separately tested local INT8
+implementation, and the fused experiment. The production launch script
+enables only `GGML_CUDA_MIXED_AR_INT8`; both new experimental modes remain
+disabled.
 
 ### Topology and current transport limit
 
@@ -332,12 +332,45 @@ The code builds successfully for both CUDA backends with:
 cmake --build build-v100 --target ggml-cuda ggml-v100-cuda -j8
 ```
 
-At this checkpoint the fused kernel has not been copied into the deployed
-runtime directory, launched, benchmarked, or checked for numerical
-correctness. It must be treated as build-only experimental code. In
-particular, do not enable `GGML_CUDA_MIXED_AR_FUSED_INT8` in the production
-script until deadlock, rank-equivalence, output-quality, warm-prefill, and
-decode tests have passed.
+The fused DSO was deployed to the separate runtime directory and passed a
+short smoke test without a deadlock. A deterministic 962-token prompt with
+eight generated tokens produced exactly the same text as cross-only INT8:
+`<think>\nThe user is asking me to`. This is only a text smoke test and does not
+prove numerical equivalence or model quality.
+
+On a reproducible prompt whose round-trip tokenization is exactly 5000 tokens,
+with speculative decoding disabled, the warmed normal runs were:
+
+| Wire mode | Prompt runs | Prompt speed |
+| --- | ---: | ---: |
+| Cross-only INT8 | 4657.413, 4645.811 ms | 1073.56, 1076.24 tokens/s |
+| Fused local plus cross INT8 | 4615.574, 4599.058, 4602.205 ms | 1083.29, 1087.18, 1086.44 tokens/s |
+
+The same prompt was run with detailed GPU profiling enabled. Profiling
+synchronizes each large reduction, so its absolute time is not comparable to
+the normal benchmark, but the phase split is useful:
+
+| Phase | Cross-only INT8 | Fused INT8 |
+| --- | ---: | ---: |
+| Local Blackwell reduction | 2169.840 ms | 0.143 ms |
+| Publish aggregate | 417.906 ms | 1201.922 ms |
+| Exposed peer wait | 310.892 ms | 1471.693 ms |
+| Read peer and add | 539.457 ms | 539.399 ms |
+| Full critical AllReduce | 3439.160 ms | 3214.279 ms |
+
+The fused kernel removes the separate local reduction phase and reduces the
+profiled critical path by 224.881 ms. It also moves local aggregate work into
+the Blackwell publication interval, so the exposed wait becomes the dominant
+phase. The profiled end-to-end prompt times were 4945.125 ms for cross-only and
+4798.406 ms for fused. The normal end-to-end gain on this exact prompt was only
+about one percent because the AllReduce critical path overlaps other graph
+work.
+
+The fused implementation must still be treated as experimental. It is not
+enabled by the production script, and it has not passed a broader output
+quality or perplexity evaluation, a multi-seed rank-equivalence test, or a
+decode regression test. Keep `GGML_CUDA_MIXED_AR_FUSED_INT8=0` for production
+until those checks pass.
 
 ### Tensor split experiments
 
@@ -352,16 +385,16 @@ These failures are configuration-level VRAM limits, not AllReduce failures.
 
 ## Optimization order
 
-1. Validate the fused INT8 kernel for deadlocks and rank-equivalent results on
-   a short prompt before collecting performance data.
-2. Compare fused INT8 against stable cross-only INT8 with the exact 5000-token
-   prompt, including warm runs and detailed phase metrics.
-3. Run a broader quality or perplexity evaluation for every INT8 stage before
-   treating it as lossless.
-4. Reduce or overlap the V100 publication dependency exposed by the faster
+1. Run a broader quality or perplexity evaluation for the fused and local INT8
+   stages before treating them as lossless.
+2. Add a multi-seed rank-equivalence test and a decode regression test for the
+   fused kernel.
+3. Reduce or overlap the V100 publication dependency exposed by the faster
    local path. Direct CUDA P2P between the Blackwell devices is unavailable on
    this host, so further local transport work must account for the PHB
    mapped-host path.
+4. Investigate finer-grained publication or more parallel block scheduling;
+   the fused profile now spends 1201.922 ms publishing and 1471.693 ms waiting.
 5. Reduce the number of cross-runtime reductions per layer. Reaching 1500
    tokens/s requires a total prompt time near 3.33 seconds, so transport
    compression alone is not sufficient.
