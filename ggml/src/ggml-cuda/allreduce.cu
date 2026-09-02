@@ -241,6 +241,233 @@ static __global__ void ggml_cuda_ar_kernel(
     }
 }
 
+// Offset inside a rank's staging region where the two-rank runtime's leader
+// parks its local aggregate.  A region is 64 MiB and a decode collective is
+// about 10 KiB, so the aggregate never collides with the contribution below it.
+static constexpr size_t GGML_CUDA_MIXED_AR_FLAT_AGG_OFFSET = GGML_CUDA_MIXED_AR_RANK_BYTES / 2;
+
+// Two-stage variant of the flat path for the 2+1 topology.  In the flat kernel
+// below every rank reads every peer's contribution, so the V100 pulls two
+// payloads per collective across its x4 link.  Here the local pair sums itself
+// first and only the leader's aggregate crosses, so the single-rank runtime
+// reads one payload instead of two.  The aggregate goes to the upper half of
+// the leader's own staging region and is announced with a second word in the
+// same signal line, so no new buffers are needed.
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
+        const T_dst  *              sendbuf,
+        T_dst        *              recvbuf,
+        T_wire       * __restrict__ slot_data,
+        int                         rank,
+        int                         n_ranks,
+        int                         leader_rank,
+        int                         peer_leader_rank,
+        int                         local_peer_rank,
+        size_t                      rank_stride,
+        int                         count,
+        int *                       arrival_slot,
+        int *                       departure_slot,
+        int                         token,
+        bool                        contribute,
+        ggml_cuda_mixed_ar_trace_record * trace) {
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
+    constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(int));
+    constexpr int AGG_SIGNAL_INTS = 4;  // second word inside the same signal line
+
+    const int tid  = threadIdx.x;
+    const int bid  = blockIdx.x;
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gnt  = gridDim.x * blockDim.x;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail = count_vec * ELEMS_PER_VEC;
+    const bool has_local_peer = local_peer_rank >= 0;
+    const bool is_leader = rank == leader_rank;
+    const size_t agg_elems = GGML_CUDA_MIXED_AR_FLAT_AGG_OFFSET / sizeof(T_wire);
+
+    T_wire * host_mine = slot_data + (size_t) rank * rank_stride;
+    // leader_rank names this group's own leader, so the two-rank runtime writes
+    // the aggregate into its leader's region while the single-rank runtime
+    // reads it from the other group's leader.
+    const int agg_owner = has_local_peer ? leader_rank : peer_leader_rank;
+    T_wire * host_agg  = slot_data + (size_t) agg_owner * rank_stride + agg_elems;
+    const T_wire * host_local = has_local_peer
+        ? slot_data + (size_t) local_peer_rank * rank_stride : nullptr;
+    const T_wire * host_cross = has_local_peer
+        ? slot_data + (size_t) peer_leader_rank * rank_stride : nullptr;
+
+    int * my_signal = arrival_slot + ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+
+    const uint64_t begin_ns = ggml_cuda_ar_globaltimer_ns();
+    uint64_t publish_ns = begin_ns;
+    uint64_t peer_ready_ns = begin_ns;
+
+    if (departure_slot && token > (int) GGML_CUDA_MIXED_AR_SLOTS) {
+        if (tid == 0) {
+            const int previous_token = token - (int) GGML_CUDA_MIXED_AR_SLOTS;
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer == rank) {
+                    continue;
+                }
+                const int * peer_departure = departure_slot +
+                    ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                while (!ggml_cuda_ar_token_reached(ggml_cuda_ar_signal_get(peer_departure), previous_token)) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Stage 1: publish this rank's own contribution.
+    for (int i = gtid; i < count_vec; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        T_wire wire[ELEMS_PER_VEC];
+#pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            wire[k] = contribute ? ggml_cuda_cast<T_wire>(sendbuf[off + k])
+                                 : ggml_cuda_cast<T_wire>(0.0f);
+        }
+        ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
+    }
+    if (bid == 0 && tid < count - tail) {
+        host_mine[tail + tid] = contribute ? ggml_cuda_cast<T_wire>(sendbuf[tail + tid])
+                                           : ggml_cuda_cast<T_wire>(0.0f);
+    }
+    __threadfence_system();
+    __syncthreads();
+    publish_ns = ggml_cuda_ar_globaltimer_ns();
+    if (tid == 0) {
+        ggml_cuda_ar_signal_set(my_signal, token);
+        __threadfence_system();
+    }
+
+    if (has_local_peer) {
+        // Stage 2: sum the local pair, and let the leader republish that sum
+        // once for the other runtime.
+        if (tid == 0) {
+            const int * peer_signal = arrival_slot +
+                ((size_t) local_peer_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+            while (ggml_cuda_ar_signal_get(peer_signal) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif
+            }
+        }
+        __syncthreads();
+        __threadfence_system();
+
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T_wire peer[ELEMS_PER_VEC];
+            ggml_cuda_memcpy_1<sizeof(peer)>(peer, &host_local[off]);
+            T_wire pair[ELEMS_PER_VEC];
+#pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                const T_wire own = contribute ? ggml_cuda_cast<T_wire>(sendbuf[off + k])
+                                              : ggml_cuda_cast<T_wire>(0.0f);
+                pair[k] = ggml_cuda_cast<T_wire>(
+                    ggml_cuda_cast<float>(own) + ggml_cuda_cast<float>(peer[k]));
+                recvbuf[off + k] = ggml_cuda_cast<T_dst>(ggml_cuda_cast<float>(pair[k]));
+            }
+            if (is_leader) {
+                ggml_cuda_memcpy_1<sizeof(pair)>(&host_agg[off], pair);
+            }
+        }
+        if (bid == 0 && tid < count - tail) {
+            const T_wire own = contribute ? ggml_cuda_cast<T_wire>(sendbuf[tail + tid])
+                                          : ggml_cuda_cast<T_wire>(0.0f);
+            const T_wire pair = ggml_cuda_cast<T_wire>(
+                ggml_cuda_cast<float>(own) + ggml_cuda_cast<float>(host_local[tail + tid]));
+            recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(ggml_cuda_cast<float>(pair));
+            if (is_leader) {
+                host_agg[tail + tid] = pair;
+            }
+        }
+        if (is_leader) {
+            __threadfence_system();
+            __syncthreads();
+            if (tid == 0) {
+                ggml_cuda_ar_signal_set(my_signal + AGG_SIGNAL_INTS, token);
+                __threadfence_system();
+            }
+        }
+    }
+
+    // Stage 3: add what the other runtime published.  A local rank adds the
+    // single-rank runtime's contribution to the pair sum already in recvbuf;
+    // the single-rank runtime adds the pair's aggregate to its own value.
+    if (tid == 0) {
+        const int * wait_signal = has_local_peer
+            ? arrival_slot + ((size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS
+            : arrival_slot + ((size_t) agg_owner * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS
+                  + AGG_SIGNAL_INTS;
+        while (ggml_cuda_ar_signal_get(wait_signal) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    peer_ready_ns = ggml_cuda_ar_globaltimer_ns();
+
+    {
+        const T_wire * src = has_local_peer ? host_cross : host_agg;
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T_wire other[ELEMS_PER_VEC];
+            ggml_cuda_memcpy_1<sizeof(other)>(other, &src[off]);
+#pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                const float base = has_local_peer
+                    ? ggml_cuda_cast<float>(recvbuf[off + k])
+                    : ggml_cuda_cast<float>(contribute ? ggml_cuda_cast<T_wire>(sendbuf[off + k])
+                                                       : ggml_cuda_cast<T_wire>(0.0f));
+                recvbuf[off + k] = ggml_cuda_cast<T_dst>(base + ggml_cuda_cast<float>(other[k]));
+            }
+        }
+        if (bid == 0 && tid < count - tail) {
+            const float base = has_local_peer
+                ? ggml_cuda_cast<float>(recvbuf[tail + tid])
+                : ggml_cuda_cast<float>(contribute ? ggml_cuda_cast<T_wire>(sendbuf[tail + tid])
+                                                   : ggml_cuda_cast<T_wire>(0.0f));
+            recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(base + ggml_cuda_cast<float>(src[tail + tid]));
+        }
+    }
+
+    if (departure_slot) {
+        __syncthreads();
+        __threadfence_system();
+        if (tid == 0) {
+            for (int slot_index = bid; slot_index < (int) GGML_CUDA_MIXED_AR_BLOCKS;
+                 slot_index += (int) gridDim.x) {
+                int * mine = departure_slot +
+                    ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + slot_index) * SIGNAL_INTS;
+                ggml_cuda_ar_signal_set(mine, token);
+            }
+            __threadfence_system();
+        }
+    }
+
+    if (trace) {
+        __syncthreads();
+        if (tid == 0) {
+            trace[(size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid] = {
+                begin_ns, publish_ns, peer_ready_ns, ggml_cuda_ar_globaltimer_ns(),
+            };
+            __threadfence_system();
+        }
+    }
+}
+
 // Same host-mapped strategy as the two-device kernel above, but the staging
 // allocation is shared by independent CUDA runtime instances.  Each rank is
 // launched by the DSO that owns its device pointers.  Cross-runtime ordering
@@ -2024,6 +2251,7 @@ struct ggml_cuda_mixed_ar_group {
     bool stream_int8 = false;
     bool stream_duplex = true;
     bool stream_local_duplex = true;
+    bool flat_2stage = false;
     int stream_chunk = 1;
     // Blocks the most recent launch used, so the collector only reads records
     // that call actually wrote.  The flat and striped paths differ.
@@ -2133,6 +2361,10 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     // up, so overlapping it buys nothing.  Off by default, kept for A/B.
     group->stream_local_duplex =
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_LOCAL_DUPLEX", 0) != 0;
+    // Two-stage small path: the local pair sums itself and publishes one
+    // aggregate, halving what the single-rank runtime reads per collective.
+    group->flat_2stage = group->hierarchical &&
+        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_2STAGE", 0) != 0;
     group->leader_rank = config->leader_rank;
     group->peer_leader_rank = config->peer_leader_rank;
     group->shared_host = config->shared_host;
@@ -2166,6 +2398,9 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     }
     if (group->fused_int8) {
         GGML_LOG_WARN("%s: fused local and cross-runtime INT8 enabled\n", __func__);
+    }
+    if (group->flat_2stage) {
+        GGML_LOG_WARN("%s: two-stage flat small path enabled\n", __func__);
     }
     if (group->stream_int8) {
         GGML_LOG_WARN("%s: chunked streaming publication enabled (%d qblocks per step, duplex %s, local duplex %s)\n",
@@ -2292,12 +2527,26 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             ? reinterpret_cast<ggml_cuda_mixed_ar_trace_record *>(base + group->trace_offset)
             : nullptr;
 
+        // The local peer only exists on a two-rank runtime; -1 marks the
+        // single-rank side, which takes the aggregate instead.
+        const int local_peer_rank = group->flat_2stage && group->backends.size() == 2
+            ? group->ranks[1 - i] : -1;
+
 #define LAUNCH_MIXED_AR(T_dst, T_wire) \
-        ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_FLAT_BLOCKS), dim3(256), 0, stream>>>( \
-            reinterpret_cast<const T_dst *>(tensor->data), \
-            reinterpret_cast<T_dst *>(tensor->data), \
-            reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-            (int) ne, arrival_slot, departure_slot, token, contribute, trace)
+        if (group->flat_2stage) { \
+            ggml_cuda_mixed_ar_flat_2stage_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_FLAT_BLOCKS), dim3(256), 0, stream>>>( \
+                reinterpret_cast<const T_dst *>(tensor->data), \
+                reinterpret_cast<T_dst *>(tensor->data), \
+                reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, \
+                group->leader_rank, group->peer_leader_rank, local_peer_rank, rank_stride, \
+                (int) ne, arrival_slot, departure_slot, token, contribute, trace); \
+        } else { \
+            ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_FLAT_BLOCKS), dim3(256), 0, stream>>>( \
+                reinterpret_cast<const T_dst *>(tensor->data), \
+                reinterpret_cast<T_dst *>(tensor->data), \
+                reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
+                (int) ne, arrival_slot, departure_slot, token, contribute, trace); \
+        }
 
         if (use_bf16) {
             LAUNCH_MIXED_AR(float, nv_bfloat16);

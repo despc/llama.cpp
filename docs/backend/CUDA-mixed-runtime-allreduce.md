@@ -677,6 +677,71 @@ What remains, in order of expected value:
    per token, so concurrent sequences amortize it almost linearly while VRAM
    allows.
 
+### Volta mat-vec: the configuration knobs are exhausted
+
+Generation is bounded by the V100 streaming its half of the weights, so the
+first question is whether its mat-vec kernel leaves bandwidth on the table.
+Measured alone with llama-bench, `--device V100_CUDA0 -sm none`, the card runs
+the whole 26.11 GiB model at 24.72 +/- 0.06 tokens/s, which is 40.45 ms per
+token and about 645 GB/s against roughly 900 GB/s of peak HBM2, or 72 percent.
+For comparison, a Blackwell in the three-GPU run reads its 6.75 GiB share in
+11 ms, about 610 GB/s of 960, or 64 percent, so the V100 is not the outlier.
+
+The fork already carries a Volta-specific mmvq table taken from
+dalzyu/llama.cpp-volta. Re-tuning it on the isolated harness changed nothing:
+
+| Configuration | tg64 |
+| --- | ---: |
+| nwarps 2 for Q8_0, the tuned default | 24.72 tokens/s |
+| nwarps 4 | 24.80 tokens/s |
+| 2 rows per block | 24.50 tokens/s |
+
+The differences are at or below the measurement's own spread, so the table
+stands. `should_halve_iters` is gated to the GB10 table and never fires on
+Volta; since doubling nwarps by hand did nothing, enabling it would not help
+either. Beyond these knobs, this lever needs a new Volta mat-vec kernel rather
+than tuning, with an uncertain payoff against the 72 percent already achieved.
+
+### Two-stage small path
+
+`GGML_CUDA_MIXED_AR_FLAT_2STAGE=1` selects a two-stage flat kernel for the 2+1
+topology. The flat path has every rank read every peer's contribution, so the
+V100 pulls two payloads per collective across its x4 link. In the two-stage
+kernel the local pair sums itself first and only the leader republishes that
+sum, into the upper half of its own staging region and announced by a second
+word in the same signal line, so the single-rank runtime reads one payload
+instead of two. No new buffers are needed.
+
+Generation of 128 tokens, speculative decoding off:
+
+| Path | Generation |
+| --- | ---: |
+| Flat, BF16 wire, the default | 35.07-35.10 tokens/s |
+| Two-stage, BF16 wire | 35.92-36.05 tokens/s |
+| Flat, F32 wire | 33.46-33.53 tokens/s |
+| Two-stage, F32 wire | 34.73-34.81 tokens/s |
+
+The in-kernel records confirm the mechanism. The V100's kernel total falls from
+769.9 to 669.4 ms over 16768 collectives and its read-and-add from 255.3 to
+188.6 ms; the Blackwell ranks fall from 2712.9 to 2656.9 ms.
+
+In the production shape, 262144 context, `1,1,2`, MTP draft on, generation goes
+from 54.4-55.2 to 57.2-57.9 tokens/s, about 5 percent, with prefill unchanged
+at 982-1002 tokens/s.
+
+There is a numerical caveat. The pair sum is rounded through the wire type
+before it is published, and every rank uses that rounded value so the ranks
+stay consistent. On the BF16 wire that is one extra BF16 rounding of an
+intermediate sum, of the same kind the wire already applies to each
+contribution but not bit-identical to the current path. On an F32 wire the
+rounding disappears -- the cast is a no-op -- and the two-stage kernel is still
+worth 1.3 tokens/s over the flat one, but the wider wire costs more than the
+saving: 34.8 against 35.1 for today's default. The mode is therefore off by
+default, and choosing it is a precision decision, not a performance one.
+
+A deterministic 5000-token prompt with 16 generated tokens produced the same
+text on the two-stage path as on the default one.
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token
