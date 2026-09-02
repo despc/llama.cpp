@@ -2106,8 +2106,10 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->stream_duplex = ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_DUPLEX", 1) != 0;
     // Same overlap for the two-rank local exchange, which also published a
     // whole chunk before reading its peer's.
+    // Measured neutral: the local exchange finishes long before the V100 shows
+    // up, so overlapping it buys nothing.  Off by default, kept for A/B.
     group->stream_local_duplex =
-        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_LOCAL_DUPLEX", 1) != 0;
+        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_LOCAL_DUPLEX", 0) != 0;
     group->leader_rank = config->leader_rank;
     group->peer_leader_rank = config->peer_leader_rank;
     group->shared_host = config->shared_host;

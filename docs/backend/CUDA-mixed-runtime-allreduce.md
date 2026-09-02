@@ -532,6 +532,87 @@ same text under the streamed duplex kernel as on the stable cross-only path,
 the coarse fused kernel, and the streamed kernel without duplex. This is a
 smoke test, not a quality evaluation, and the fused family stays default-off.
 
+### Where the prefill time actually goes (2026-09-02)
+
+An exact-window Nsight trace of the streamed duplex kernel at 64 blocks, taken
+over one 5000-token prompt, changes the picture that guided the earlier work.
+Within the 3964 ms prompt window, per Blackwell device:
+
+| Work | RTX 5080 | Share |
+| --- | ---: | ---: |
+| Mixed AllReduce kernel | 3170.6 ms | 80.0 percent |
+| Q8 matrix kernel | 390.6 ms | 9.9 percent |
+| Gated delta net | 116.4 ms | 2.9 percent |
+| Everything else | ~143 ms | 3.6 percent |
+| True idle, no kernel resident | 143.1 ms | 3.6 percent |
+
+The device is almost never idle, but four fifths of the time it is resident in
+the AllReduce kernel. That bounds the classic optimization of overlapping
+communication with computation: all compute on a Blackwell device is about
+650 ms, so perfect pipelining could hide at most that much, and it would
+require splitting the ubatch across two in-flight micro-batches in the graph
+and the meta-backend scheduler.
+
+The in-kernel phases show why the AllReduce kernel is so long, and it is not
+transport. Per prompt:
+
+| Rank | Own work | Waiting |
+| --- | ---: | ---: |
+| 0, RTX 5080 | 991 ms | 2222 ms |
+| 1, RTX 5070 Ti | 821 ms | 2280 ms |
+| 2, V100 | 1576 ms | 1.4 ms |
+
+The Blackwell ranks wait 2.2 seconds, while the V100's entire kernel lasts
+1.58 seconds and it never waits itself. The V100 therefore enters each
+collective late: with `--tensor-split 1,1,2` it owns half the model and is the
+slowest device, so every collective is a barrier behind its computation.
+
+A diagnostic split sweep confirms it. At a context short enough to allow the
+allocation, the exact same 5000-token prompt gives:
+
+| Tensor split | Prompt time | Prompt speed |
+| --- | ---: | ---: |
+| 1,1,2 | 4126.2 ms | 1211.8 tokens/s |
+| 1.3,1.3,1.4 | 3530.3 ms | 1416.3 tokens/s |
+| 1.5,1.5,1.0 | 3175.4 ms | 1574.6 tokens/s |
+| 1.7,1.7,0.6 | 2972.0 ms | 1682.3 tokens/s |
+| 1.9,1.9,0.2 | 3030.6 ms | 1649.8 tokens/s |
+
+This is a measurement, not a proposal: the deployment needs a 262144-token
+context, which only fits when the V100 holds half the model. The rebalanced
+splits do not allocate at that context, and with the MTP draft they do not
+allocate even at 131072. The number is here because it quantifies the cost of
+the constraint: roughly 1150 ms of the prompt is the V100 arriving late.
+
+### Ubatch size
+
+Larger ubatches produce fewer and larger collectives and better GEMM shapes on
+Volta. The cross-runtime staging capacity was raised from 32 to 64 MiB per rank
+so that a 4096-token BF16 wire fits. Measured with the streamed duplex kernel,
+`1,1,2`, 262144 context, speculative decoding off:
+
+| Ubatch | Prompt time | Prompt speed |
+| --- | ---: | ---: |
+| 1024 | 4382.3 ms | 1141.0 tokens/s |
+| 2048 | 4138.8 ms | 1208.1 tokens/s |
+| 4096 | 4024.4 ms | 1242.4 tokens/s |
+| 6144 | 3830.8 ms | 1305.2 tokens/s |
+
+With the MTP draft model loaded, however, neither 4096 nor 6144 allocates at
+that context: device 0 fails a 2592 MiB compute buffer at 4096 and a 3888 MiB
+one at 6144. The production configuration therefore stays at 2048 unless the
+draft is dropped or the context is shortened.
+
+### Standing configuration
+
+Production shape, 262144 context, `1,1,2`, MTP draft on, three prompt and
+generation cycles:
+
+| Path | Prefill | Generation |
+| --- | ---: | ---: |
+| Stable cross-only INT8 | 4988-5086 ms, ~1000 tokens/s | 54.3-55.2 tokens/s |
+| Streamed duplex fused INT8 | 4494-4601 ms, 1087-1113 tokens/s | 54.1-54.7 tokens/s |
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token
@@ -554,20 +635,28 @@ duplex. Raw bandwidth is now within 10 to 15 percent of the link's ceiling and
 the card cannot move to a wider slot, so the remaining levers have to move
 bytes or calls.
 
-1. Reduce the bytes crossing to and from the V100. At 3.02 GB/s measured on a
-   3.94 GB/s link, the transfer itself is the floor; packed INT6 or INT4 with
-   the existing per-4096 scales would cut it close to linearly. This needs a
-   real quality evaluation before it can be considered.
-2. Reduce the number of cross-runtime reductions per layer. There are 384 large
-   reductions per 5000-token prompt. Reaching 1500 tokens/s requires a total
-   prompt time near 3.33 seconds, so transport compression alone is not
-   sufficient.
-3. Extend the duplex drain to the local Blackwell exchange, which still
-   publishes a whole chunk before reading the peer's.
-4. Run a broader quality or perplexity evaluation for the fused, streamed, and
-   local INT8 stages before treating them as lossless.
-5. Add a multi-seed rank-equivalence test and a decode regression test for the
-   fused and streamed kernels.
+The profile above reorders this list. The exposed wait is no longer transport:
+it is the V100 arriving late at each collective because it computes half the
+model. Transport work now has a much smaller ceiling than device throughput.
+
+1. Speed up the V100's own computation, which is the critical term at roughly
+   2.8 seconds per prompt. Its share cannot move, so this means the Volta
+   matrix kernels themselves: check which MMQ path sm_70 selects for Q8_K_L and
+   whether a better one exists. This is the only remaining lever that trades
+   nothing away.
+2. Use a larger ubatch wherever VRAM allows; 6144 is worth 8 percent over 2048.
+   This currently conflicts with the MTP draft at a 262144 context.
+3. Extend the duplex drain to the local Blackwell exchange. Implemented and
+   measured neutral, default off; revisit only if the balance changes.
+4. Overlap communication with computation by pipelining two micro-batches.
+   Bounded by about 650 ms, the total compute on one Blackwell device, and it
+   requires graph and scheduler changes.
+5. Reduce the bytes crossing to and from the V100 with a narrower wire. Ruled
+   out for now: it would change numerics, and the link is no longer the binding
+   constraint.
+6. Run a broader quality or perplexity evaluation for the fused, streamed, and
+   local INT8 stages before treating them as lossless, and add a multi-seed
+   rank-equivalence test and a decode regression test.
 6. Re-run the same exact 5000-token prompt after every change. Also test token
    generation because the small flat path has different latency requirements.
 
