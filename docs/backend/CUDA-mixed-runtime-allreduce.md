@@ -777,6 +777,40 @@ about 85 percent. That remaining 15 to 20 percent, worth 3 to 4 ms per forward
 pass, is the only untapped generation lever left, and it requires a better
 Volta mat-vec kernel rather than any configuration change.
 
+### Spending Blackwell VRAM headroom on the split
+
+The `1,1,2` split was treated as fixed because the 262144-token context only
+fits when the V100 carries the large share. That is true of the context, but it
+left the two 16 GB cards at 86 percent: 14048 and 14004 MiB of 16303, or about
+2.2 GiB unused each. Since the V100 gates every collective, that headroom is
+worth more as model share than as free memory.
+
+Moving share is not free on the Blackwell side, because the KV cache is split by
+the same ratio and at this context it is far larger than the weights. A 2.5
+point shift adds roughly 670 MiB of weights and 535 MiB of KV per card, so
+`1.1,1.1,1.8` alone fails the 1296 MiB compute buffer that ubatch 2048 needs.
+
+The compute buffer is the thing to trade away: it scales with ubatch, roughly
+1296 MiB at 2048 and 650 MiB at 1024. Measured at 262144 context with the MTP
+draft loaded:
+
+| Split | Ubatch | Generation | Prefill | Device 0 |
+| --- | ---: | ---: | ---: | ---: |
+| 1,1,2 | 2048 | 57.5 tokens/s | 1096 tokens/s | 86 percent |
+| 1.1,1.1,1.8 | 1024 | 61.0 tokens/s | 1084 tokens/s | 92 percent |
+| **1.2,1.2,1.6** | **1024** | **63.7 tokens/s** | **1130 tokens/s** | **95 percent** |
+| 1.2,1.2,1.6 | 1536 | fails a 972 MiB buffer | | |
+| 1.25,1.25,1.5 | 1024 | loads, dies on the first request | | |
+
+Both phases improve, which is the tell that the V100 gated both: a smaller
+ubatch on its own costs prefill about 5 percent, yet prefill still ends up
+ahead. Three prompt-and-generation cycles at the chosen setting gave 1126-1155
+tokens/s prefill and 62.4-64.0 tokens/s generation.
+
+The edge is sharp and every neighbouring setting moves it, so the split has to
+be re-checked after any change to context length, the draft model, or the
+projector.
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token
