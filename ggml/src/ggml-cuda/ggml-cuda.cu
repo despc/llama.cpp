@@ -1025,6 +1025,7 @@ struct ggml_backend_cuda_comm_context {
     bool                       mixed_hierarchical = false;
     bool                       mixed_device_slots = true;
     uint64_t                   mixed_call_count = 0;
+    size_t                     mixed_hier_threshold = 1024 * 1024;
     int                        mixed_profile_level = 0;
     bool                       mixed_cpu_profile = false;
     ggml_backend_cuda_mixed_ar_profile_accum mixed_profile_critical;
@@ -1290,7 +1291,7 @@ static bool ggml_backend_cuda_comm_allreduce_mixed(
 
     ++comm_ctx->mixed_call_count;
     const int token = (int) comm_ctx->mixed_call_count;
-    const bool use_hier = comm_ctx->mixed_hierarchical && wire_bytes >= 1024 * 1024;
+    const bool use_hier = comm_ctx->mixed_hierarchical && wire_bytes >= comm_ctx->mixed_hier_threshold;
     for (auto & group : comm_ctx->mixed_groups) {
         auto enqueue = use_hier ? group.enqueue_hier : group.enqueue;
         const auto cpu_begin = comm_ctx->mixed_cpu_profile
@@ -1307,7 +1308,7 @@ static bool ggml_backend_cuda_comm_allreduce_mixed(
         }
     }
 
-    if (use_hier && comm_ctx->mixed_profile_level > 0) {
+    if (comm_ctx->mixed_profile_level > 0) {
         std::array<ggml_cuda_mixed_ar_rank_profile, GGML_CUDA_MAX_DEVICES> entries = {};
         std::array<bool, GGML_CUDA_MAX_DEVICES> seen = {};
         for (auto & group : comm_ctx->mixed_groups) {
@@ -1456,6 +1457,10 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     }
     memset(ret->mixed_host, 0, ret->mixed_host_bytes);
     ret->mixed_bf16_threshold = ggml_backend_cuda_comm_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // Wire size at which the striped hierarchical path takes over from the flat
+    // one.  Decode's collectives are ~10 KiB and sit far below the default.
+    ret->mixed_hier_threshold = ggml_backend_cuda_comm_env_u64(
+        "GGML_CUDA_MIXED_AR_HIER_THRESHOLD", 1024 * 1024);
 
     for (const auto & item : ranks_by_registry) {
         ggml_backend_reg_t registry = item.first;

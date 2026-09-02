@@ -613,6 +613,70 @@ generation cycles:
 | Stable cross-only INT8 | 4988-5086 ms, ~1000 tokens/s | 54.3-55.2 tokens/s |
 | Streamed duplex fused INT8 | 4494-4601 ms, 1087-1113 tokens/s | 54.1-54.7 tokens/s |
 
+### Generation profile (2026-09-02)
+
+The flat small-tensor kernel now writes the same globaltimer records as the
+striped ones, and profile collection runs for it too, so decode is finally
+visible on both runtimes. `GGML_CUDA_MIXED_AR_HIER_THRESHOLD` sets the wire
+size at which the striped path takes over; the default remains 1 MiB.
+
+A 128-token generation with speculative decoding off runs at 34.9 tokens/s,
+or 28.45 ms per token. An exact-window Nsight trace over the generation phase
+gives, per Blackwell device:
+
+| Work | Per token | Share |
+| --- | ---: | ---: |
+| Mixed AllReduce kernel | 17.4 ms | 60.9 percent |
+| Q8 mat-vec over its own weights | 8.2 ms | 28.7 percent |
+| Everything else | 2.3 ms | 8.2 percent |
+| True idle | 1.8 ms | 6.2 percent |
+
+The in-kernel records show what those 17.4 ms are. Over 16768 collectives:
+
+| Rank | Total | Publish | Wait | Read and add |
+| --- | ---: | ---: | ---: | ---: |
+| 0, RTX 5080 | 2712.9 ms | 48.5 ms | 2518.8 ms | 60.3 ms |
+| 1, RTX 5070 Ti | 2572.3 ms | 45.7 ms | 2385.4 ms | 57.8 ms |
+| 2, V100 | 769.9 ms | 173.2 ms | 168.4 ms | 255.3 ms |
+
+93 percent of the Blackwell AllReduce time is waiting. Per 10240-byte
+collective that is 149 us of wait against 6 us of own work. Host-side enqueue
+is not the problem either: 8.0 us per call for the Blackwell group and 4.4 us
+for the V100 group.
+
+The cause is the same as in prefill. Generation is memory-bound, and with
+`1,1,2` the V100 streams half the model, 13.5 GiB, on every forward pass. Both
+runtimes reach a similar effective bandwidth -- about 610 GB/s for a Blackwell
+reading 6.75 GiB in 11 ms, about 640 GB/s for the V100 reading 13.5 GiB in
+roughly 21 ms -- so the V100 simply has twice the work and every collective is
+a barrier behind it. A forward pass therefore cannot go below roughly 17 to
+21 ms while the split stands.
+
+Measured attempts that did not pay:
+
+- Deeper speculation. MTP at `--spec-draft-n-max` 2 gives 54.9 tokens/s at
+  60.0 percent acceptance; 3 gives 53.1 at 47.1 percent; 4 gives 49.1 at
+  38.0 percent. Two is the optimum.
+- Routing small collectives through the striped hierarchical path with
+  `GGML_CUDA_MIXED_AR_HIER_THRESHOLD=4096`. That path runs a full local
+  AllReduce pipeline at 64 blocks and costs far more than it saves on a 10 KiB
+  payload: 28.9 tokens/s against 35.1 on the flat path.
+
+What remains, in order of expected value:
+
+1. The V100's mat-vec kernels. At about 640 GB/s against roughly 900 GB/s of
+   peak HBM2 bandwidth, every 10 percent recovered is about 2 ms per forward
+   pass, or 7 percent of generation. This is the largest lever left and it
+   trades nothing away.
+2. A lightweight two-stage small path: reduce the Blackwell pair over their own
+   link and let the leader publish one aggregate, so the V100 reads 10 KiB
+   instead of 20 KiB per collective. Its own kernel currently costs 46 us per
+   call against 6 us on a Blackwell. The existing striped path is the wrong
+   tool for this; it would need a flat two-stage kernel.
+3. Serving several requests at once. The barrier cost is per forward pass, not
+   per token, so concurrent sequences amortize it almost linearly while VRAM
+   allows.
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token

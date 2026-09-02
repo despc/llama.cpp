@@ -257,9 +257,16 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
         int *                       arrival_slot,
         int *                       departure_slot,
         int                         token,
-        bool                        contribute) {
+        bool                        contribute,
+        ggml_cuda_mixed_ar_trace_record * trace) {
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
     constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(int));
+    // Decode runs entirely on this path, so it carries the same globaltimer
+    // records as the striped kernels: the V100 runtime is invisible to Nsight
+    // and this is the only way to see its side of a small collective.
+    const uint64_t begin_ns = ggml_cuda_ar_globaltimer_ns();
+    uint64_t publish_ns = begin_ns;
+    uint64_t peer_ready_ns = begin_ns;
 
     const int tid       = threadIdx.x;
     const int nt        = blockDim.x;
@@ -309,6 +316,8 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
     __threadfence_system();
     __syncthreads();
 
+    publish_ns = ggml_cuda_ar_globaltimer_ns();
+
     if (tid == 0) {
         int * my_signal = arrival_slot +
             ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
@@ -333,6 +342,7 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
 
     __syncthreads();
     __threadfence_system();
+    peer_ready_ns = ggml_cuda_ar_globaltimer_ns();
 
     for (int i = gtid; i < count_vec; i += gnt) {
         const int off = i * ELEMS_PER_VEC;
@@ -385,6 +395,16 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
                     ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + slot_index) * SIGNAL_INTS;
                 ggml_cuda_ar_signal_set(mine, token);
             }
+            __threadfence_system();
+        }
+    }
+
+    if (trace) {
+        __syncthreads();
+        if (tid == 0) {
+            trace[(size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid] = {
+                begin_ns, publish_ns, peer_ready_ns, ggml_cuda_ar_globaltimer_ns(),
+            };
             __threadfence_system();
         }
     }
@@ -2005,6 +2025,9 @@ struct ggml_cuda_mixed_ar_group {
     bool stream_duplex = true;
     bool stream_local_duplex = true;
     int stream_chunk = 1;
+    // Blocks the most recent launch used, so the collector only reads records
+    // that call actually wrote.  The flat and striped paths differ.
+    int trace_blocks = (int) GGML_CUDA_MIXED_AR_BLOCKS;
     int leader_rank = -1;
     int peer_leader_rank = -1;
     ggml_cuda_ar_pipeline * local_ar = nullptr;
@@ -2234,6 +2257,18 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         return false;
     }
 
+    group->trace_blocks = (int) GGML_CUDA_MIXED_AR_FLAT_BLOCKS;
+    if (group->profile) {
+        for (size_t i = 0; i < group->backends.size(); ++i) {
+            ggml_cuda_set_device(group->devices[i]);
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(group->backends[i]->context);
+            CUDA_CHECK(cudaEventRecord(group->profile_start[i], ctx->stream()));
+            // The flat path has no separate local stage; keep the marker so the
+            // collector's local_ms stays defined and reads as zero.
+            CUDA_CHECK(cudaEventRecord(group->profile_local[i], ctx->stream()));
+        }
+    }
+
     for (size_t i = 0; i < group->backends.size(); ++i) {
         const int rank = group->ranks[i];
         ggml_tensor * tensor = tensors[rank];
@@ -2253,13 +2288,16 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             ? reinterpret_cast<int *>(base + group->departure_offset +
                 slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE)
             : nullptr;
+        auto * trace = group->profile
+            ? reinterpret_cast<ggml_cuda_mixed_ar_trace_record *>(base + group->trace_offset)
+            : nullptr;
 
 #define LAUNCH_MIXED_AR(T_dst, T_wire) \
         ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_FLAT_BLOCKS), dim3(256), 0, stream>>>( \
             reinterpret_cast<const T_dst *>(tensor->data), \
             reinterpret_cast<T_dst *>(tensor->data), \
             reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-            (int) ne, arrival_slot, departure_slot, token, contribute)
+            (int) ne, arrival_slot, departure_slot, token, contribute, trace)
 
         if (use_bf16) {
             LAUNCH_MIXED_AR(float, nv_bfloat16);
@@ -2278,6 +2316,9 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             const size_t event_index = i * GGML_CUDA_MIXED_AR_SLOTS + slot;
             CUDA_CHECK(cudaEventRecord(group->done[event_index], stream));
             group->done_valid[event_index] = true;
+        }
+        if (group->profile) {
+            CUDA_CHECK(cudaEventRecord(group->profile_done[i], stream));
         }
     }
     return true;
@@ -2299,6 +2340,7 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
         }
     }
 
+    group->trace_blocks = (int) GGML_CUDA_MIXED_AR_BLOCKS;
     const bool fused_int8 = group->fused_int8 && use_bf16;
     ggml_tensor * local_tensors[GGML_CUDA_MAX_DEVICES] = {};
     for (size_t i = 0; i < group->backends.size(); ++i) {
@@ -2456,7 +2498,9 @@ bool ggml_cuda_mixed_ar_group_profile_collect(
         const int rank = group->ranks[i];
         const ggml_cuda_mixed_ar_trace_record * critical = nullptr;
         uint64_t critical_ns = 0;
-        for (size_t block = 0; block < GGML_CUDA_MIXED_AR_BLOCKS; ++block) {
+        const size_t n_trace_blocks = group->trace_blocks > 0
+            ? (size_t) group->trace_blocks : GGML_CUDA_MIXED_AR_BLOCKS;
+        for (size_t block = 0; block < n_trace_blocks; ++block) {
             const auto & record = records[(size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + block];
             const uint64_t duration_ns = record.done_ns - record.begin_ns;
             if (!critical || duration_ns > critical_ns) {
