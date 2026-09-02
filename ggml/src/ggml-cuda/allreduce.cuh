@@ -22,8 +22,16 @@ static constexpr size_t   GGML_CUDA_MIXED_AR_SLOTS       = 2;
 static constexpr size_t   GGML_CUDA_MIXED_AR_RANK_BYTES  = 32 * 1024 * 1024;
 // The hierarchical kernels process large prefill buffers in stripes. More
 // blocks reduce the serial qblock loop in the fused local+cross path; the
-// mapped-host token arrays are sized from this constant as well.
-static constexpr size_t   GGML_CUDA_MIXED_AR_BLOCKS      = 32;
+// mapped-host token arrays are sized from this constant as well. 32 was the
+// best value while publication and consumption were separated by a barrier;
+// with the streamed duplex kernel 64 wins, because each block runs its own
+// independent overlap of the two link directions.
+static constexpr size_t   GGML_CUDA_MIXED_AR_BLOCKS      = 64;
+// Grid width for the small flat path, which decode runs on.  Those tensors are
+// a few tens of KiB, so the kernel is latency-bound: every extra block adds one
+// more arrival token to publish and poll across the link.  It is kept separate
+// from the striped hierarchical width above, which wants the opposite.
+static constexpr size_t   GGML_CUDA_MIXED_AR_FLAT_BLOCKS = 4;
 static constexpr size_t   GGML_CUDA_MIXED_AR_SIGNAL_STRIDE = 64;
 
 // Optional profiling records written by the hierarchical kernel into the

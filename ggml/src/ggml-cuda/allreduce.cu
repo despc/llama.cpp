@@ -374,9 +374,17 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
         __syncthreads();
         __threadfence_system();
         if (tid == 0) {
-            int * mine = departure_slot +
-                ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
-            ggml_cuda_ar_signal_set(mine, token);
+            // This kernel is launched with GGML_CUDA_MIXED_AR_FLAT_BLOCKS, which
+            // is narrower than the striped kernels' grid, but the departure ring
+            // is indexed by GGML_CUDA_MIXED_AR_BLOCKS and a later hierarchical
+            // call waits on every one of those entries.  Cover the whole ring,
+            // or those blocks would wait forever on a token no one publishes.
+            for (int slot_index = bid; slot_index < (int) GGML_CUDA_MIXED_AR_BLOCKS;
+                 slot_index += (int) gridDim.x) {
+                int * mine = departure_slot +
+                    ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + slot_index) * SIGNAL_INTS;
+                ggml_cuda_ar_signal_set(mine, token);
+            }
             __threadfence_system();
         }
     }
@@ -1166,6 +1174,7 @@ static __global__ void ggml_cuda_mixed_ar_hier_fused_int8_kernel(
 // qblock instead measured slower than the coarse kernel.  Both runtimes launch
 // the same grid and walk the same qblock sequence, so block bid on either side
 // is always working on the same qblocks.
+template <bool LOCAL_DUPLEX>
 static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         const float *              sendbuf,
         float       *              recvbuf,
@@ -1275,6 +1284,9 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
     // drain below never runs ahead of the chunks whose own contribution is
     // final, because the publication step still writes recvbuf outright.
     int read_step = 0;
+    // Chunks whose local aggregate is final in recvbuf.  The cross drain never
+    // runs past this, because the aggregate writes recvbuf outright.
+    int agg_step = 0;
     __shared__ int peer_ready;
 
     // Consume one already-published peer chunk.  Every thread must reach this,
@@ -1315,7 +1327,7 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
     // instead of queueing behind all of it.  PCIe is full duplex; publishing
     // everything before reading anything left one direction idle.
 #define GGML_CUDA_AR_STREAM_DRAIN(published_steps)                                                  \
-    if (duplex) {                                                                                   \
+    if (duplex && read_step < (published_steps)) {                                                  \
         if (tid == 0) {                                                                             \
             peer_ready = ggml_cuda_ar_progress_get(cross_progress_peer, token);                     \
         }                                                                                           \
@@ -1332,13 +1344,121 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         }                                                                                           \
     }
 
+    // Fold one already-published local peer chunk into recvbuf and, on the
+    // leader, hand the finished aggregate straight to the other runtime.
+#define GGML_CUDA_AR_STREAM_AGGREGATE(chunk_step)                                                   \
+    {                                                                                               \
+        const int agg_first = (chunk_step) * chunk;                                                 \
+        const int agg_last = min(agg_first + chunk, stripe_len);                                    \
+        for (int j = agg_first; j < agg_last; ++j) {                                                \
+            const int qb = bid + j * (int) gridDim.x;                                               \
+            const int block_start = qb * QK;                                                        \
+            const int local_offset = tid * 16;                                                      \
+            const int vector_index = block_start + local_offset;                                    \
+            if (tid == 0) {                                                                         \
+                block_scale = local_peer_scales[qb];                                                \
+            }                                                                                       \
+            if (vector_index + 16 <= count) {                                                       \
+                ggml_cuda_memcpy_1<16>(&block_values[local_offset], &local_peer_values[vector_index]); \
+            } else {                                                                                \
+                for (int k = 0; k < 16 && vector_index + k < count; ++k) {                          \
+                    block_values[local_offset + k] = local_peer_values[vector_index + k];           \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            float aggregate[VALUES_PER_THREAD];                                                     \
+            float agg_max = 0.0f;                                                                   \
+            _Pragma("unroll")                                                                       \
+            for (int k = 0; k < VALUES_PER_THREAD; ++k) {                                           \
+                const int index = block_start + k * blockDim.x + tid;                               \
+                aggregate[k] = index < count                                                        \
+                    ? recvbuf[index] + (float) block_values[k * blockDim.x + tid] * block_scale     \
+                    : 0.0f;                                                                         \
+                agg_max = fmaxf(agg_max, fabsf(aggregate[k]));                                      \
+            }                                                                                       \
+            _Pragma("unroll")                                                                       \
+            for (int offset = 16; offset > 0; offset >>= 1) {                                       \
+                agg_max = fmaxf(agg_max, __shfl_down_sync(0xffffffff, agg_max, offset));            \
+            }                                                                                       \
+            if (lane == 0) {                                                                        \
+                warp_max[warp] = agg_max;                                                           \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            if (warp == 0) {                                                                        \
+                agg_max = lane < 8 ? warp_max[lane] : 0.0f;                                         \
+                _Pragma("unroll")                                                                   \
+                for (int offset = 16; offset > 0; offset >>= 1) {                                   \
+                    agg_max = fmaxf(agg_max, __shfl_down_sync(0xffffffff, agg_max, offset));        \
+                }                                                                                   \
+                if (lane == 0) {                                                                    \
+                    block_scale = agg_max > 0.0f ? agg_max / 127.0f : 1.0f;                         \
+                    block_inv_scale = 1.0f / block_scale;                                           \
+                    if (is_leader) {                                                                \
+                        cross_mine_scales[qb] = block_scale;                                        \
+                    }                                                                               \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            _Pragma("unroll")                                                                       \
+            for (int k = 0; k < VALUES_PER_THREAD; ++k) {                                           \
+                const int index = block_start + k * blockDim.x + tid;                               \
+                if (index < count) {                                                                \
+                    const int quantized = max(-127, min(127, __float2int_rn(aggregate[k] * block_inv_scale))); \
+                    recvbuf[index] = (float) quantized * block_scale;                               \
+                    block_values[k * blockDim.x + tid] = (int8_t) quantized;                        \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            if (is_leader) {                                                                        \
+                if (vector_index + 16 <= count) {                                                   \
+                    ggml_cuda_memcpy_1<16>(&cross_mine_values[vector_index], &block_values[local_offset]); \
+                } else {                                                                            \
+                    for (int k = 0; k < 16 && vector_index + k < count; ++k) {                      \
+                        cross_mine_values[vector_index + k] = block_values[local_offset + k];        \
+                    }                                                                               \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+        }                                                                                           \
+        if (is_leader) {                                                                            \
+            __threadfence_system();                                                                 \
+            __syncthreads();                                                                        \
+            if (tid == 0) {                                                                         \
+                ggml_cuda_ar_progress_set(cross_progress_mine, token, (chunk_step) + 1);            \
+                __threadfence_system();                                                             \
+            }                                                                                       \
+        }                                                                                           \
+    }
+
+    // Take whatever the local peer has already published, without blocking, so
+    // the local exchange overlaps its own publication the same way the
+    // cross-runtime exchange does.
+#define GGML_CUDA_AR_STREAM_LOCAL_DRAIN(published_steps)                                            \
+    if (LOCAL_DUPLEX && agg_step < (published_steps)) {                                             \
+        if (tid == 0) {                                                                             \
+            peer_ready = ggml_cuda_ar_progress_get(local_progress_peer, token);                     \
+        }                                                                                           \
+        __syncthreads();                                                                            \
+        const int local_limit = min(peer_ready, (published_steps));                                 \
+        if (agg_step < local_limit) {                                                               \
+            __threadfence_system();                                                                 \
+            GGML_CUDA_AR_STREAM_MARK(work_ns)                                                       \
+            while (agg_step < local_limit) {                                                        \
+                GGML_CUDA_AR_STREAM_AGGREGATE(agg_step)                                             \
+                ++agg_step;                                                                         \
+            }                                                                                       \
+            GGML_CUDA_AR_STREAM_MARK(work_ns)                                                       \
+        }                                                                                           \
+    }
+
     // Phase 1: quantize and publish this block's own contribution, releasing
-    // one progress step per chunk.  On the single-rank runtime this is already
-    // the cross-runtime publication.
+    // one progress step per chunk, and pull in both peers' finished chunks as
+    // soon as they appear.  On the single-rank runtime the publication is
+    // already the cross-runtime one.
     for (int step = 0; step < n_steps; ++step) {
-        const int first = step * chunk;
-        const int last = min(first + chunk, stripe_len);
-        for (int j = first; j < last; ++j) {
+        const int publish_first = step * chunk;
+        const int publish_last = min(publish_first + chunk, stripe_len);
+        for (int j = publish_first; j < publish_last; ++j) {
             const int qb = bid + j * (int) gridDim.x;
             const int block_start = qb * QK;
             const int local_offset = tid * 16;
@@ -1398,20 +1518,21 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
                 has_local_peer ? local_progress_mine : cross_progress_mine, token, step + 1);
             __threadfence_system();
         }
-        // The single-rank runtime has just put this chunk on the wire, so its
-        // inbound reads can start overlapping right away.
-        if (!has_local_peer) {
-            GGML_CUDA_AR_STREAM_DRAIN(step + 1)
+        if (has_local_peer) {
+            GGML_CUDA_AR_STREAM_LOCAL_DRAIN(step + 1)
+        } else {
+            agg_step = step + 1;
         }
+        GGML_CUDA_AR_STREAM_DRAIN(agg_step)
     }
     GGML_CUDA_AR_STREAM_MARK(work_ns)
 
-    // Phase 2: build the local aggregate chunk by chunk and let the leader
-    // forward each finished chunk to the other runtime right away.
+    // Phase 2: block for the local chunks the drain has not taken yet, still
+    // folding in cross-runtime chunks whenever they show up.
     if (has_local_peer) {
-        for (int step = 0; step < n_steps; ++step) {
+        for (; agg_step < n_steps; ++agg_step) {
             if (tid == 0) {
-                while (ggml_cuda_ar_progress_get(local_progress_peer, token) < step + 1) {
+                while (ggml_cuda_ar_progress_get(local_progress_peer, token) < agg_step + 1) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
                     __nanosleep(100);
 #else
@@ -1423,89 +1544,9 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             __threadfence_system();
             GGML_CUDA_AR_STREAM_MARK(wait_ns)
 
-            const int first = step * chunk;
-            const int last = min(first + chunk, stripe_len);
-            for (int j = first; j < last; ++j) {
-                const int qb = bid + j * (int) gridDim.x;
-                const int block_start = qb * QK;
-                const int local_offset = tid * 16;
-                const int vector_index = block_start + local_offset;
-                if (tid == 0) {
-                    block_scale = local_peer_scales[qb];
-                }
-                if (vector_index + 16 <= count) {
-                    ggml_cuda_memcpy_1<16>(&block_values[local_offset], &local_peer_values[vector_index]);
-                } else {
-                    for (int k = 0; k < 16 && vector_index + k < count; ++k) {
-                        block_values[local_offset + k] = local_peer_values[vector_index + k];
-                    }
-                }
-                __syncthreads();
-
-                float aggregate[VALUES_PER_THREAD];
-                float max_value = 0.0f;
-#pragma unroll
-                for (int k = 0; k < VALUES_PER_THREAD; ++k) {
-                    const int index = block_start + k * blockDim.x + tid;
-                    aggregate[k] = index < count
-                        ? recvbuf[index] + (float) block_values[k * blockDim.x + tid] * block_scale
-                        : 0.0f;
-                    max_value = fmaxf(max_value, fabsf(aggregate[k]));
-                }
-#pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
-                }
-                if (lane == 0) {
-                    warp_max[warp] = max_value;
-                }
-                __syncthreads();
-                if (warp == 0) {
-                    max_value = lane < 8 ? warp_max[lane] : 0.0f;
-#pragma unroll
-                    for (int offset = 16; offset > 0; offset >>= 1) {
-                        max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
-                    }
-                    if (lane == 0) {
-                        block_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
-                        block_inv_scale = 1.0f / block_scale;
-                        if (is_leader) {
-                            cross_mine_scales[qb] = block_scale;
-                        }
-                    }
-                }
-                __syncthreads();
-#pragma unroll
-                for (int k = 0; k < VALUES_PER_THREAD; ++k) {
-                    const int index = block_start + k * blockDim.x + tid;
-                    if (index < count) {
-                        const int quantized = max(-127, min(127, __float2int_rn(aggregate[k] * block_inv_scale)));
-                        recvbuf[index] = (float) quantized * block_scale;
-                        block_values[k * blockDim.x + tid] = (int8_t) quantized;
-                    }
-                }
-                __syncthreads();
-                if (is_leader) {
-                    if (vector_index + 16 <= count) {
-                        ggml_cuda_memcpy_1<16>(&cross_mine_values[vector_index], &block_values[local_offset]);
-                    } else {
-                        for (int k = 0; k < 16 && vector_index + k < count; ++k) {
-                            cross_mine_values[vector_index + k] = block_values[local_offset + k];
-                        }
-                    }
-                }
-                __syncthreads();
-            }
-            if (is_leader) {
-                __threadfence_system();
-                __syncthreads();
-                if (tid == 0) {
-                    ggml_cuda_ar_progress_set(cross_progress_mine, token, step + 1);
-                    __threadfence_system();
-                }
-            }
+            GGML_CUDA_AR_STREAM_AGGREGATE(agg_step)
             GGML_CUDA_AR_STREAM_MARK(work_ns)
-            GGML_CUDA_AR_STREAM_DRAIN(step + 1)
+            GGML_CUDA_AR_STREAM_DRAIN(agg_step + 1)
         }
     }
 
@@ -1552,6 +1593,8 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             __threadfence_system();
         }
     }
+#undef GGML_CUDA_AR_STREAM_LOCAL_DRAIN
+#undef GGML_CUDA_AR_STREAM_AGGREGATE
 #undef GGML_CUDA_AR_STREAM_DRAIN
 #undef GGML_CUDA_AR_STREAM_CONSUME
 #undef GGML_CUDA_AR_STREAM_MARK
@@ -1960,6 +2003,7 @@ struct ggml_cuda_mixed_ar_group {
     bool fused_int8 = false;
     bool stream_int8 = false;
     bool stream_duplex = true;
+    bool stream_local_duplex = true;
     int stream_chunk = 1;
     int leader_rank = -1;
     int peer_leader_rank = -1;
@@ -2050,9 +2094,9 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FUSED_STREAM", 0) != 0;
     // Qblocks published per progress step.  One step per qblock spends more on
     // system fences than it wins back, but with the duplex drain below small
-    // chunks pay off: 4 measured best for the 20 MiB wire at 32 blocks.  Sweep
-    // it with GGML_CUDA_MIXED_AR_STREAM_CHUNK.
-    group->stream_chunk = (int) ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_CHUNK", 4);
+    // chunks pay off: 2 measured best for the 20 MiB wire at 64 blocks, which
+    // is 20 progress steps.  Sweep it with GGML_CUDA_MIXED_AR_STREAM_CHUNK.
+    group->stream_chunk = (int) ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_CHUNK", 2);
     if (group->stream_chunk < 1) {
         group->stream_chunk = 1;
     }
@@ -2060,6 +2104,10 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     // PCIe Gen3 x4 and full duplex, so publishing everything before reading
     // anything wastes one direction.
     group->stream_duplex = ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_DUPLEX", 1) != 0;
+    // Same overlap for the two-rank local exchange, which also published a
+    // whole chunk before reading its peer's.
+    group->stream_local_duplex =
+        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_LOCAL_DUPLEX", 1) != 0;
     group->leader_rank = config->leader_rank;
     group->peer_leader_rank = config->peer_leader_rank;
     group->shared_host = config->shared_host;
@@ -2095,8 +2143,9 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         GGML_LOG_WARN("%s: fused local and cross-runtime INT8 enabled\n", __func__);
     }
     if (group->stream_int8) {
-        GGML_LOG_WARN("%s: chunked streaming publication enabled (%d qblocks per step, duplex %s)\n",
-                      __func__, group->stream_chunk, group->stream_duplex ? "on" : "off");
+        GGML_LOG_WARN("%s: chunked streaming publication enabled (%d qblocks per step, duplex %s, local duplex %s)\n",
+                      __func__, group->stream_chunk, group->stream_duplex ? "on" : "off",
+                      group->stream_local_duplex ? "on" : "off");
     }
 
     if (group->hierarchical && group->devices.size() == 2) {
@@ -2204,7 +2253,7 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             : nullptr;
 
 #define LAUNCH_MIXED_AR(T_dst, T_wire) \
-        ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
+        ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_FLAT_BLOCKS), dim3(256), 0, stream>>>( \
             reinterpret_cast<const T_dst *>(tensor->data), \
             reinterpret_cast<T_dst *>(tensor->data), \
             reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
@@ -2319,15 +2368,23 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
                 local_arrival_peer = ggml_cuda_ar_arrival_ptr(group->local_ar, (int) slot, peer);
             }
             if (group->stream_int8) {
-                ggml_cuda_mixed_ar_hier_stream_int8_kernel<<<
-                    dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>(
-                    reinterpret_cast<const float *>(tensor->data),
-                    reinterpret_cast<float *>(tensor->data),
-                    reinterpret_cast<uint8_t *>(slot_data), local_mine, local_peer,
-                    rank, (int) group->n_ranks, group->leader_rank, group->peer_leader_rank,
-                    (int) ne, arrival_slot, departure_slot, local_arrival_mine,
-                    local_arrival_peer, token, group->stream_chunk, group->stream_duplex,
-                    contribute, has_local_peer, trace);
+#define LAUNCH_MIXED_AR_STREAM(local_duplex) \
+                ggml_cuda_mixed_ar_hier_stream_int8_kernel<local_duplex><<< \
+                    dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
+                    reinterpret_cast<const float *>(tensor->data), \
+                    reinterpret_cast<float *>(tensor->data), \
+                    reinterpret_cast<uint8_t *>(slot_data), local_mine, local_peer, \
+                    rank, (int) group->n_ranks, group->leader_rank, group->peer_leader_rank, \
+                    (int) ne, arrival_slot, departure_slot, local_arrival_mine, \
+                    local_arrival_peer, token, group->stream_chunk, group->stream_duplex, \
+                    contribute, has_local_peer, trace)
+
+                if (group->stream_local_duplex) {
+                    LAUNCH_MIXED_AR_STREAM(true);
+                } else {
+                    LAUNCH_MIXED_AR_STREAM(false);
+                }
+#undef LAUNCH_MIXED_AR_STREAM
             } else {
                 ggml_cuda_mixed_ar_hier_fused_int8_kernel<<<
                     dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>(
