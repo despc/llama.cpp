@@ -190,11 +190,182 @@ blocking, but did not materially improve BF16 throughput because the same
 dependency still had to complete on the GPU. Reaching 1500 tokens/s requires
 a total prompt time near 3.33 seconds.
 
+## Current development status (2026-09-02)
+
+This section is a checkpoint for the work after the vectorized cross-runtime
+INT8 path. It deliberately distinguishes measured code from build-only
+experiments.
+
+### Stable production baseline
+
+The current production launch configuration remains:
+
+- model: `unsloth/Qwen3.8-27B-GGUF:Q8_K_L`;
+- devices: `CUDA0,CUDA1,V100_CUDA0`;
+- split mode: tensor;
+- tensor split: `1,1,2`;
+- batch and ubatch: 4096 and 2048;
+- context: 262144 tokens;
+- cross-runtime wire: vectorized INT8, enabled with
+  `GGML_CUDA_MIXED_AR_INT8=1`.
+
+The latest exact 5000-token run of this baseline completed in 4993.778 ms, or
+1001.25 tokens/s. The detailed profile, which adds synchronization and is not
+a throughput benchmark, completed in 5379.015 ms, or 929.54 tokens/s. It
+reported the following totals across 384 large reductions and 6245 MiB of
+logical BF16 tensor payload:
+
+| Phase | Critical-path total |
+| --- | ---: |
+| Local Blackwell reduction | 2167.716 ms |
+| Publish aggregate | 418.020 ms |
+| Exposed peer wait | 299.321 ms |
+| Read peer and add | 539.690 ms |
+| Other measured time | 1.038 ms |
+| Full critical AllReduce | 3425.785 ms |
+
+The rank totals were 3359.099 ms for rank 0, 3364.879 ms for rank 1, and
+2206.952 ms for rank 2. CPU enqueue time was 26.079 ms for the Blackwell
+runtime and 2.625 ms for the V100 runtime. The local Blackwell reduction is
+therefore the largest isolated phase in this baseline.
+
+The deployed DSOs under `/home/despc/llama.cpp/fork_v100` contain the stable
+cross-runtime INT8 path and the separately tested local INT8 implementation.
+They do not contain the newest fused INT8 experiment described below. The
+production launch script enables only `GGML_CUDA_MIXED_AR_INT8`; both new
+experimental modes remain disabled.
+
+### Topology and current transport limit
+
+`nvidia-smi topo -m` reports a PHB connection between the RTX 5080 and RTX
+5070 Ti. `nvidia-smi topo -p2p r` reports `CNS` in both directions, and a CUDA
+probe confirmed `cudaDeviceCanAccessPeer == 0` for both device pairs. Direct
+CUDA P2P access between the two Blackwell cards is therefore unavailable on
+this host. The measured link is PCIe Gen3 x8 under load.
+
+An exact-window Nsight Systems trace of the stable cross-runtime INT8 path
+completed the prompt in 5119.926 ms, or 976.58 tokens/s. In the 5.120-second
+prompt interval, device 0 was active for 4.464 seconds and device 1 for 4.452
+seconds. Both visible GPUs were simultaneously idle for approximately 0.562
+seconds. The main visible costs were:
+
+| Work | RTX 5080 | RTX 5070 Ti |
+| --- | ---: | ---: |
+| Mixed hierarchical INT8 kernel | 1711 ms | 1102 ms |
+| Q8 matrix kernel | 315 ms | 361 ms |
+| Gated delta net | 117 ms | 112 ms |
+| Type-14 conversion work | 73 ms | 84 ms |
+| H2D copies | 1097 ms, 6686.2 MiB | 1512 ms, 6682.2 MiB |
+| D2H copies | 948 ms, 6480.4 MiB | 1026 ms, 6382.9 MiB |
+
+The report and exported SQLite database are stored outside the repository at:
+
+- `/home/despc/llama.cpp/profiles/qwen27b-q8-3gpu-prefill-5000-int8.nsys-rep`;
+- `/home/despc/llama.cpp/profiles/qwen27b-q8-3gpu-prefill-5000-int8.sqlite`.
+
+No thermal or power throttling was observed. During the run, the RTX 5080 and
+RTX 5070 Ti stayed in P1 with core clocks near 2.9 and 3.06 GHz respectively.
+The current bottleneck is transport and synchronization, not clocking.
+
+### Experimental local INT8 reduction
+
+`GGML_CUDA_AR_LOCAL_INT8_THRESHOLD=<bytes>` enables a new two-device local
+path for large F32 tensors. A value of zero, which is the default, disables
+it. The implementation:
+
+- quantizes each local contribution in blocks of 4096 values using one FP32
+  scale per block;
+- exchanges aligned 16-byte INT8 vectors through mapped pinned host memory;
+- uses a dedicated two-slot 32 MiB-per-slot host ring on each local device;
+- rounds each local result through the same representation before adding the
+  peer contribution.
+
+The first implementation could deadlock after ring wraparound because one
+rank re-recorded an event before the peer queued its wait on the previous
+generation. The corrected implementation queues both N-2 dependencies before
+either completion event is re-recorded.
+
+With both local and cross-runtime INT8 enabled, warmed exact 5000-token runs
+were 4968.420, 4952.042, and 4951.248 ms, corresponding to 1006.36, 1009.68,
+and 1009.85 tokens/s. Compared with the 4993.778 ms stable baseline, the best
+end-to-end gain was approximately 0.9 percent.
+
+The detailed experimental profile completed in 5203.953 ms, or 960.81
+tokens/s:
+
+| Phase | Stable cross INT8 | Local plus cross INT8 |
+| --- | ---: | ---: |
+| Local Blackwell reduction | 2167.716 ms | 1152.708 ms |
+| Publish aggregate | 418.020 ms | 503.842 ms |
+| Exposed peer wait | 299.321 ms | 1002.615 ms |
+| Read peer and add | 539.690 ms | 539.939 ms |
+| Full critical AllReduce | 3425.785 ms | 3200.181 ms |
+
+The local phase improved by approximately 1.015 seconds, but exposed peer wait
+grew by approximately 0.703 seconds. The optimization reveals the V100
+arrival and publication dependency, so most of its isolated gain does not
+reach end-to-end prompt time. CPU enqueue time fell to 7.145 ms on the
+Blackwell runtime and was 3.462 ms on the V100 runtime.
+
+This path is intentionally default-off. Its result quality has not yet been
+evaluated independently, and its extra 64 MiB mapped-host allocation per local
+GPU is currently made when the local pipeline is initialized even when the
+feature threshold is zero.
+
+### Experimental fused local and cross-runtime INT8
+
+`GGML_CUDA_MIXED_AR_FUSED_INT8=1`, together with
+`GGML_CUDA_MIXED_AR_INT8=1`, selects a new fused 2+1 kernel for large F32
+reductions. It is disabled by default. The kernel is intended to remove the
+full-tensor boundary between local and cross-runtime reduction:
+
+1. Both Blackwell ranks quantize and publish their original contributions to
+   the local mapped-host ring.
+2. Each Blackwell rank builds the same local aggregate and rounds it through
+   INT8; only the leader publishes it to the cross-runtime buffer.
+3. The V100 publishes its contribution directly to the cross-runtime buffer.
+4. All ranks wait for the peer runtime and add the peer aggregate.
+
+The code builds successfully for both CUDA backends with:
+
+```bash
+cmake --build build-v100 --target ggml-cuda ggml-v100-cuda -j8
+```
+
+At this checkpoint the fused kernel has not been copied into the deployed
+runtime directory, launched, benchmarked, or checked for numerical
+correctness. It must be treated as build-only experimental code. In
+particular, do not enable `GGML_CUDA_MIXED_AR_FUSED_INT8` in the production
+script until deadlock, rank-equivalence, output-quality, warm-prefill, and
+decode tests have passed.
+
+### Tensor split experiments
+
+The `1,1,2` tensor split remains required with the current 262144-token
+context. Attempts to shift more model weight from the V100 to the two
+Blackwell GPUs failed while reserving the draft context graph:
+
+- `1.2,1.2,1.6`: device 0 failed a 1296.06 MiB allocation;
+- `1.1,1.1,1.8`: device 0 failed the same 1296.06 MiB allocation.
+
+These failures are configuration-level VRAM limits, not AllReduce failures.
+
 ## Optimization order
 
-1. Run a broader quality or perplexity evaluation for the INT8 wire before treating it as lossless.
-2. Investigate whether the local Blackwell copy path can use direct P2P without regressing overlap with the V100 runtime.
-3. Reduce the number of cross-runtime reductions per layer. Reaching 1500 tokens/s requires a total prompt time near 3.33 seconds, so transport compression alone is not sufficient.
-4. Re-run the same exact 5000-token prompt after every change. Also test token generation because the small flat path has different latency requirements.
+1. Validate the fused INT8 kernel for deadlocks and rank-equivalent results on
+   a short prompt before collecting performance data.
+2. Compare fused INT8 against stable cross-only INT8 with the exact 5000-token
+   prompt, including warm runs and detailed phase metrics.
+3. Run a broader quality or perplexity evaluation for every INT8 stage before
+   treating it as lossless.
+4. Reduce or overlap the V100 publication dependency exposed by the faster
+   local path. Direct CUDA P2P between the Blackwell devices is unavailable on
+   this host, so further local transport work must account for the PHB
+   mapped-host path.
+5. Reduce the number of cross-runtime reductions per layer. Reaching 1500
+   tokens/s requires a total prompt time near 3.33 seconds, so transport
+   compression alone is not sufficient.
+6. Re-run the same exact 5000-token prompt after every change. Also test token
+   generation because the small flat path has different latency requirements.
 
 The reference Nsight report is stored outside the source tree under `llama.cpp/profiles/qwen27b-q8-3gpu-prefill-5000.nsys-rep` on the measured host.

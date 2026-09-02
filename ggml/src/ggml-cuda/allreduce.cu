@@ -686,6 +686,442 @@ static __global__ void ggml_cuda_mixed_ar_hier_int8_kernel(
     }
 }
 
+// Two-device INT8 transport for GPUs that share one CUDA runtime but cannot
+// access each other's device memory.  Each rank publishes one block-quantized
+// contribution through its mapped host buffer and consumes the peer buffer
+// with aligned 16-byte loads through shared memory.
+static __global__ void ggml_cuda_ar_local_int8_kernel(
+        const float *              sendbuf,
+        float       *              recvbuf,
+        uint8_t     * __restrict__ host_mine_base,
+        const uint8_t * __restrict__ host_peer_base,
+        int                         count,
+        int *                       arrival_mine,
+        int *                       arrival_peer,
+        int                         token,
+        bool                        contribute) {
+    constexpr int QK = 4096;
+    constexpr int VALUES_PER_THREAD = QK / 256;
+    constexpr int ARRIVAL_INTS = (int) (GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_qblocks = (count + QK - 1) / QK;
+    const size_t scale_offset = ((size_t) count + 15) & ~(size_t) 15;
+    int8_t * host_mine = reinterpret_cast<int8_t *>(host_mine_base);
+    const int8_t * host_peer = reinterpret_cast<const int8_t *>(host_peer_base);
+    float * host_mine_scales = reinterpret_cast<float *>(host_mine_base + scale_offset);
+    const float * host_peer_scales = reinterpret_cast<const float *>(host_peer_base + scale_offset);
+    __shared__ float warp_max[8];
+    __shared__ float block_scale;
+    __shared__ float block_inv_scale;
+    __shared__ __align__(16) int8_t block_values[QK];
+
+    for (int qb = bid; qb < n_qblocks; qb += gridDim.x) {
+        const int block_start = qb * QK;
+        float max_value = 0.0f;
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            const float value = index < count && contribute ? sendbuf[index] : 0.0f;
+            max_value = fmaxf(max_value, fabsf(value));
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+        }
+        if (lane == 0) {
+            warp_max[warp] = max_value;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            max_value = lane < 8 ? warp_max[lane] : 0.0f;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+            }
+            if (lane == 0) {
+                block_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
+                block_inv_scale = 1.0f / block_scale;
+                host_mine_scales[qb] = block_scale;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            if (index < count) {
+                const float value = contribute ? sendbuf[index] : 0.0f;
+                const int quantized = max(-127, min(127, __float2int_rn(value * block_inv_scale)));
+                recvbuf[index] = (float) quantized * block_scale;
+                block_values[k * blockDim.x + tid] = (int8_t) quantized;
+            }
+        }
+        __syncthreads();
+        const int local_offset = tid * 16;
+        const int index = block_start + local_offset;
+        if (index + 16 <= count) {
+            ggml_cuda_memcpy_1<16>(&host_mine[index], &block_values[local_offset]);
+        } else {
+            for (int k = 0; k < 16 && index + k < count; ++k) {
+                host_mine[index + k] = block_values[local_offset + k];
+            }
+        }
+        __syncthreads();
+    }
+
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        int * mine = arrival_mine + bid * ARRIVAL_INTS;
+        const int * peer = arrival_peer + bid * ARRIVAL_INTS;
+        ggml_cuda_ar_signal_set(mine, token);
+        __threadfence_system();
+        while (ggml_cuda_ar_signal_get(peer) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif
+        }
+    }
+
+    __syncthreads();
+    __threadfence_system();
+    for (int qb = bid; qb < n_qblocks; qb += gridDim.x) {
+        if (tid == 0) {
+            block_scale = host_peer_scales[qb];
+        }
+        const int block_start = qb * QK;
+        const int local_offset = tid * 16;
+        const int vector_index = block_start + local_offset;
+        if (vector_index + 16 <= count) {
+            ggml_cuda_memcpy_1<16>(&block_values[local_offset], &host_peer[vector_index]);
+        } else {
+            for (int k = 0; k < 16 && vector_index + k < count; ++k) {
+                block_values[local_offset + k] = host_peer[vector_index + k];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            if (index < count) {
+                recvbuf[index] += (float) block_values[k * blockDim.x + tid] * block_scale;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Fused 2+1 INT8 reduction.  The two local ranks first exchange their own
+// quantized contributions, round the local aggregate through INT8, and let
+// only the leader publish that aggregate to the other runtime.  The one-rank
+// runtime publishes directly.  Keeping all three phases in one kernel removes
+// the full-tensor boundary between local reduction and cross-runtime exchange.
+static __global__ void ggml_cuda_mixed_ar_hier_fused_int8_kernel(
+        const float *              sendbuf,
+        float       *              recvbuf,
+        uint8_t     * __restrict__ cross_slot_data,
+        uint8_t     * __restrict__ local_mine_base,
+        const uint8_t * __restrict__ local_peer_base,
+        int                         rank,
+        int                         n_ranks,
+        int                         leader_rank,
+        int                         peer_leader_rank,
+        int                         count,
+        int *                       cross_arrival,
+        int *                       departure_slot,
+        int *                       local_arrival_mine,
+        int *                       local_arrival_peer,
+        int                         token,
+        bool                        contribute,
+        bool                        has_local_peer,
+        ggml_cuda_mixed_ar_trace_record * trace) {
+    constexpr int QK = 4096;
+    constexpr int VALUES_PER_THREAD = QK / 256;
+    constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(int));
+    constexpr int LOCAL_SIGNAL_INTS = (int) (GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_qblocks = (count + QK - 1) / QK;
+    const size_t scale_offset = ((size_t) count + 15) & ~(size_t) 15;
+    const bool is_leader = rank == leader_rank;
+    uint8_t * cross_mine_base = cross_slot_data + (size_t) leader_rank * GGML_CUDA_MIXED_AR_RANK_BYTES;
+    const uint8_t * cross_peer_base = cross_slot_data +
+        (size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_RANK_BYTES;
+    uint8_t * first_publish_base = has_local_peer ? local_mine_base : cross_mine_base;
+    int8_t * first_values = reinterpret_cast<int8_t *>(first_publish_base);
+    float * first_scales = reinterpret_cast<float *>(first_publish_base + scale_offset);
+    const int8_t * local_peer_values = has_local_peer
+        ? reinterpret_cast<const int8_t *>(local_peer_base) : nullptr;
+    const float * local_peer_scales = has_local_peer
+        ? reinterpret_cast<const float *>(local_peer_base + scale_offset) : nullptr;
+    int8_t * cross_mine_values = reinterpret_cast<int8_t *>(cross_mine_base);
+    float * cross_mine_scales = reinterpret_cast<float *>(cross_mine_base + scale_offset);
+    const int8_t * cross_peer_values = reinterpret_cast<const int8_t *>(cross_peer_base);
+    const float * cross_peer_scales = reinterpret_cast<const float *>(cross_peer_base + scale_offset);
+    __shared__ float warp_max[8];
+    __shared__ float block_scale;
+    __shared__ float block_inv_scale;
+    __shared__ __align__(16) int8_t block_values[QK];
+    const uint64_t begin_ns = ggml_cuda_ar_globaltimer_ns();
+
+    if (departure_slot && token > (int) GGML_CUDA_MIXED_AR_SLOTS) {
+        if (tid == 0) {
+            const int previous_token = token - (int) GGML_CUDA_MIXED_AR_SLOTS;
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer == rank) {
+                    continue;
+                }
+                const int * peer_departure = departure_slot +
+                    ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                while (!ggml_cuda_ar_token_reached(ggml_cuda_ar_signal_get(peer_departure), previous_token)) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Publish the original local contribution.  On the V100 side this is
+    // already the cross-runtime publication; Blackwell ranks use local host
+    // staging first.
+    for (int qb = bid; qb < n_qblocks; qb += gridDim.x) {
+        const int block_start = qb * QK;
+        float max_value = 0.0f;
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            const float value = index < count && contribute ? sendbuf[index] : 0.0f;
+            max_value = fmaxf(max_value, fabsf(value));
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+        }
+        if (lane == 0) {
+            warp_max[warp] = max_value;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            max_value = lane < 8 ? warp_max[lane] : 0.0f;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+            }
+            if (lane == 0) {
+                block_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
+                block_inv_scale = 1.0f / block_scale;
+                first_scales[qb] = block_scale;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            if (index < count) {
+                const float value = contribute ? sendbuf[index] : 0.0f;
+                const int quantized = max(-127, min(127, __float2int_rn(value * block_inv_scale)));
+                recvbuf[index] = (float) quantized * block_scale;
+                block_values[k * blockDim.x + tid] = (int8_t) quantized;
+            }
+        }
+        __syncthreads();
+        const int local_offset = tid * 16;
+        const int index = block_start + local_offset;
+        if (index + 16 <= count) {
+            ggml_cuda_memcpy_1<16>(&first_values[index], &block_values[local_offset]);
+        } else {
+            for (int k = 0; k < 16 && index + k < count; ++k) {
+                first_values[index + k] = block_values[local_offset + k];
+            }
+        }
+        __syncthreads();
+    }
+
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        if (has_local_peer) {
+            ggml_cuda_ar_signal_set(local_arrival_mine + bid * LOCAL_SIGNAL_INTS, token);
+        } else {
+            int * mine = cross_arrival +
+                ((size_t) leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+            ggml_cuda_ar_signal_set(mine, token);
+        }
+        __threadfence_system();
+        if (has_local_peer) {
+            while (ggml_cuda_ar_signal_get(local_arrival_peer + bid * LOCAL_SIGNAL_INTS) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif
+            }
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+
+    // Build and publish the local Blackwell aggregate.  Both local ranks do
+    // the same rounding so they remain bit-equivalent; only the leader writes
+    // the cross-runtime buffer.
+    if (has_local_peer) {
+        for (int qb = bid; qb < n_qblocks; qb += gridDim.x) {
+            if (tid == 0) {
+                block_scale = local_peer_scales[qb];
+            }
+            const int block_start = qb * QK;
+            const int local_offset = tid * 16;
+            const int vector_index = block_start + local_offset;
+            if (vector_index + 16 <= count) {
+                ggml_cuda_memcpy_1<16>(&block_values[local_offset], &local_peer_values[vector_index]);
+            } else {
+                for (int k = 0; k < 16 && vector_index + k < count; ++k) {
+                    block_values[local_offset + k] = local_peer_values[vector_index + k];
+                }
+            }
+            __syncthreads();
+
+            float aggregate[VALUES_PER_THREAD];
+            float max_value = 0.0f;
+#pragma unroll
+            for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+                const int index = block_start + k * blockDim.x + tid;
+                aggregate[k] = index < count
+                    ? recvbuf[index] + (float) block_values[k * blockDim.x + tid] * block_scale
+                    : 0.0f;
+                max_value = fmaxf(max_value, fabsf(aggregate[k]));
+            }
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+            }
+            if (lane == 0) {
+                warp_max[warp] = max_value;
+            }
+            __syncthreads();
+            if (warp == 0) {
+                max_value = lane < 8 ? warp_max[lane] : 0.0f;
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+                }
+                if (lane == 0) {
+                    block_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
+                    block_inv_scale = 1.0f / block_scale;
+                    if (is_leader) {
+                        cross_mine_scales[qb] = block_scale;
+                    }
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+                const int index = block_start + k * blockDim.x + tid;
+                if (index < count) {
+                    const int quantized = max(-127, min(127, __float2int_rn(aggregate[k] * block_inv_scale)));
+                    recvbuf[index] = (float) quantized * block_scale;
+                    block_values[k * blockDim.x + tid] = (int8_t) quantized;
+                }
+            }
+            __syncthreads();
+            if (is_leader) {
+                if (vector_index + 16 <= count) {
+                    ggml_cuda_memcpy_1<16>(&cross_mine_values[vector_index], &block_values[local_offset]);
+                } else {
+                    for (int k = 0; k < 16 && vector_index + k < count; ++k) {
+                        cross_mine_values[vector_index + k] = block_values[local_offset + k];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if (is_leader) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (tid == 0 && is_leader) {
+            int * mine = cross_arrival +
+                ((size_t) leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+            ggml_cuda_ar_signal_set(mine, token);
+            __threadfence_system();
+        }
+    }
+    const uint64_t publish_ns = ggml_cuda_ar_globaltimer_ns();
+
+    if (tid == 0) {
+        const int * peer = cross_arrival +
+            ((size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+        while (ggml_cuda_ar_signal_get(peer) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    const uint64_t peer_ready_ns = ggml_cuda_ar_globaltimer_ns();
+
+    for (int qb = bid; qb < n_qblocks; qb += gridDim.x) {
+        if (tid == 0) {
+            block_scale = cross_peer_scales[qb];
+        }
+        const int block_start = qb * QK;
+        const int local_offset = tid * 16;
+        const int vector_index = block_start + local_offset;
+        if (vector_index + 16 <= count) {
+            ggml_cuda_memcpy_1<16>(&block_values[local_offset], &cross_peer_values[vector_index]);
+        } else {
+            for (int k = 0; k < 16 && vector_index + k < count; ++k) {
+                block_values[local_offset + k] = cross_peer_values[vector_index + k];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            if (index < count) {
+                recvbuf[index] += (float) block_values[k * blockDim.x + tid] * block_scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (departure_slot || trace) {
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+            if (departure_slot) {
+                int * mine = departure_slot +
+                    ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                ggml_cuda_ar_signal_set(mine, token);
+            }
+            if (trace) {
+                trace[(size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid] = {
+                    begin_ns,
+                    publish_ns,
+                    peer_ready_ns,
+                    ggml_cuda_ar_globaltimer_ns(),
+                };
+            }
+            __threadfence_system();
+        }
+    }
+}
+
 // Combined load-convert-add kernel.  The peer's contribution arrives as T_src
 // (which may be a lower-precision type than T_dst when the BF16 round-trip is
 // active).  For bit-equivalence between the two GPUs, dst is first rounded
@@ -792,11 +1228,13 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    size_t   local_int8_threshold; // F32 tensors at or above this size use mapped-host INT8; 0 disables
     uint64_t call_count;
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
+    ggml_cuda_ar_host_mapping host_int8[GGML_CUDA_MAX_DEVICES];  // two-slot mapped INT8 staging
     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
     cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
     ggml_cuda_ar_event_slot  ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
@@ -909,6 +1347,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    p->local_int8_threshold = ggml_cuda_ar_env_u64("GGML_CUDA_AR_LOCAL_INT8_THRESHOLD", 0);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -1006,11 +1445,21 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
+        if (p->host_int8[i].alloc((size_t) GGML_CUDA_AR_POOL_SIZE * p->copy_bytes) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: alloc for local INT8 staging failed (%zu bytes)\n",
+                           __func__, (size_t) GGML_CUDA_AR_POOL_SIZE * p->copy_bytes);
+            ggml_cuda_ar_pipeline_free(p);
+            return nullptr;
+        }
     }
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+    if (p->local_int8_threshold > 0) {
+        GGML_LOG_WARN("%s: mapped-host local INT8 enabled at %zu bytes\n",
+                      __func__, p->local_int8_threshold);
+    }
 
     return p;
 }
@@ -1031,6 +1480,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         p->host_buf[i].free();
         p->host_large[i].free();
+        p->host_int8[i].free();
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
             cudaFree(p->dev_tmp[i]);
@@ -1072,6 +1522,7 @@ struct ggml_cuda_mixed_ar_group {
     bool device_slots = false;
     bool hierarchical = false;
     bool wire_int8 = false;
+    bool fused_int8 = false;
     int leader_rank = -1;
     int peer_leader_rank = -1;
     ggml_cuda_ar_pipeline * local_ar = nullptr;
@@ -1156,6 +1607,7 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->device_slots = config->device_slots;
     group->hierarchical = config->hierarchical;
     group->wire_int8 = config->hierarchical && ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_INT8", 0) != 0;
+    group->fused_int8 = group->wire_int8 && ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FUSED_INT8", 0) != 0;
     group->leader_rank = config->leader_rank;
     group->peer_leader_rank = config->peer_leader_rank;
     group->shared_host = config->shared_host;
@@ -1186,6 +1638,9 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
 
     if (group->wire_int8) {
         GGML_LOG_WARN("%s: block-quantized INT8 cross-runtime wire enabled\n", __func__);
+    }
+    if (group->fused_int8) {
+        GGML_LOG_WARN("%s: fused local and cross-runtime INT8 enabled\n", __func__);
     }
 
     if (group->hierarchical && group->devices.size() == 2) {
@@ -1337,11 +1792,12 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
         }
     }
 
+    const bool fused_int8 = group->fused_int8 && use_bf16;
     ggml_tensor * local_tensors[GGML_CUDA_MAX_DEVICES] = {};
     for (size_t i = 0; i < group->backends.size(); ++i) {
         local_tensors[i] = tensors[group->ranks[i]];
     }
-    if (group->local_ar && !ggml_cuda_ar_allreduce(
+    if (!fused_int8 && group->local_ar && !ggml_cuda_ar_allreduce(
             group->local_ar, group->backends.data(), local_tensors)) {
         return false;
     }
@@ -1364,8 +1820,9 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
         }
         // local_ar has already folded all local flags into an aggregate.  A
         // one-rank runtime still needs to honour its original compute flag.
-        const bool contribute = group->backends.size() > 1 ||
-            (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        const bool contribute = fused_int8
+            ? (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0
+            : group->backends.size() > 1 || (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
         const ggml_type wire_type = use_bf16 ? GGML_TYPE_BF16 : tensor->type;
         const size_t rank_stride = GGML_CUDA_MIXED_AR_RANK_BYTES / ggml_type_size(wire_type);
 
@@ -1391,7 +1848,29 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
             group->leader_rank, group->peer_leader_rank, rank_stride, (int) ne, \
             arrival_slot, departure_slot, token, contribute, trace)
 
-        if (use_bf16 && group->wire_int8 && tensor->type == GGML_TYPE_F32) {
+        if (fused_int8 && tensor->type == GGML_TYPE_F32) {
+            const bool has_local_peer = group->backends.size() > 1;
+            uint8_t * local_mine = nullptr;
+            const uint8_t * local_peer = nullptr;
+            int * local_arrival_mine = nullptr;
+            int * local_arrival_peer = nullptr;
+            if (has_local_peer) {
+                GGML_ASSERT(group->local_ar && group->backends.size() == 2);
+                const int peer = 1 - (int) i;
+                local_mine = group->local_ar->host_int8[i].dev + slot * group->local_ar->copy_bytes;
+                local_peer = group->local_ar->host_int8[peer].dev + slot * group->local_ar->copy_bytes;
+                local_arrival_mine = ggml_cuda_ar_arrival_ptr(group->local_ar, (int) slot, (int) i);
+                local_arrival_peer = ggml_cuda_ar_arrival_ptr(group->local_ar, (int) slot, peer);
+            }
+            ggml_cuda_mixed_ar_hier_fused_int8_kernel<<<
+                dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>(
+                reinterpret_cast<const float *>(tensor->data),
+                reinterpret_cast<float *>(tensor->data),
+                reinterpret_cast<uint8_t *>(slot_data), local_mine, local_peer,
+                rank, (int) group->n_ranks, group->leader_rank, group->peer_leader_rank,
+                (int) ne, arrival_slot, departure_slot, local_arrival_mine,
+                local_arrival_peer, token, contribute, has_local_peer, trace);
+        } else if (use_bf16 && group->wire_int8 && tensor->type == GGML_TYPE_F32) {
             ggml_cuda_mixed_ar_hier_int8_kernel<<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>(
                 reinterpret_cast<const float *>(tensor->data),
                 reinterpret_cast<float *>(tensor->data),
@@ -1478,6 +1957,73 @@ bool ggml_cuda_mixed_ar_group_profile_collect(
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
+
+static bool ggml_cuda_ar_allreduce_local_int8_impl(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        float * const           buffers[GGML_CUDA_MAX_DEVICES],
+        const bool              compute[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne) {
+    GGML_ASSERT(p->n_devices == 2);
+    GGML_ASSERT(ne > 0 && ne <= std::numeric_limits<int>::max());
+    const size_t scale_offset = ((size_t) ne + 15) & ~(size_t) 15;
+    const size_t scale_bytes = ((size_t) ne + 4095) / 4096 * sizeof(float);
+    GGML_ASSERT(scale_offset + scale_bytes <= p->copy_bytes);
+
+    const auto [slot, token, pool_lapped] = ggml_cuda_ar_acquire_slot(p);
+
+    // Queue both N-2 slot dependencies before either completion event is
+    // re-recorded for N.  Doing this in the launch loop would let the first
+    // rank's new record change what the second rank waits on and form a cycle.
+    if (pool_lapped) {
+        for (int i = 0; i < 2; ++i) {
+            const int peer = 1 - i;
+            ggml_cuda_set_device(p->devices[i]);
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), p->ev_pool[peer][slot].ker));
+        }
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        const int peer = 1 - i;
+        ggml_cuda_set_device(p->devices[i]);
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+        cudaStream_t stream = cuda_ctx->stream();
+
+        uint8_t * mine = p->host_int8[i].dev + (size_t) slot * p->copy_bytes;
+        const uint8_t * other = p->host_int8[peer].dev + (size_t) slot * p->copy_bytes;
+        ggml_cuda_ar_local_int8_kernel<<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>(
+            buffers[i], buffers[i], mine, other,
+            (int) ne, ggml_cuda_ar_arrival_ptr(p, slot, i),
+            ggml_cuda_ar_arrival_ptr(p, slot, peer), token, compute[i]);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+    }
+    return true;
+}
+
+static bool ggml_cuda_ar_allreduce_local_int8(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        float * const           buffers[GGML_CUDA_MAX_DEVICES],
+        const bool              compute[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne) {
+    // Keep room for one FP32 scale per 4096 INT8 values.  Half the staging
+    // byte capacity is a conservative element cap and matches the existing
+    // BF16 copy-engine outer chunk size.
+    const int64_t max_elems = (int64_t) p->copy_bytes / 2;
+    bool ok = true;
+    for (int64_t start = 0; start < ne && ok; start += max_elems) {
+        const int64_t count = std::min(max_elems, ne - start);
+        float * chunk[GGML_CUDA_MAX_DEVICES] = {};
+        for (int i = 0; i < p->n_devices; ++i) {
+            chunk[i] = buffers[i] + start;
+        }
+        ok = ggml_cuda_ar_allreduce_local_int8_impl(p, backends, chunk, compute, count);
+    }
+    return ok;
+}
 
 // Asymmetric copy_impl: data sent over PCIe in T_src precision (one element of
 // nbytes per ne element); accumulated locally into a T_dst buffer.  When
@@ -1677,6 +2223,10 @@ bool ggml_cuda_ar_allreduce(
     const bool use_copy_engine =
         p->copy_threshold > 0 &&
         nbytes >= p->copy_threshold;
+    const bool use_local_int8 =
+        use_copy_engine && use_bf16 &&
+        p->local_int8_threshold > 0 &&
+        input_nbytes >= p->local_int8_threshold;
 
     // BF16 inactive-shard zeroing: when use_bf16 is on, the combined kernel
     // (chunked kernel path) and the combined add kernel (copy_engine path)
@@ -1699,7 +2249,7 @@ bool ggml_cuda_ar_allreduce(
     ggml_cuda_pool_alloc<nv_bfloat16> bf16_tmp[GGML_CUDA_MAX_DEVICES];
     void * copy_src_ptr[GGML_CUDA_MAX_DEVICES] = {};
 
-    if (use_copy_engine && use_bf16) {
+    if (use_copy_engine && use_bf16 && !use_local_int8) {
         to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
         for (int i = 0; i < n; ++i) {
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
@@ -1718,7 +2268,14 @@ bool ggml_cuda_ar_allreduce(
     }
 
     bool ok = true;
-    if (use_copy_engine) {
+    if (use_local_int8) {
+        float * buffers[GGML_CUDA_MAX_DEVICES] = {};
+        for (int i = 0; i < n; ++i) {
+            buffers[i] = static_cast<float *>(tensors[i]->data);
+        }
+        ok = ggml_cuda_ar_allreduce_local_int8(
+            p, backends, buffers, compute_flag, ne);
+    } else if (use_copy_engine) {
         // After up-front BF16 conversion, the tmp buffers already hold the
         // (possibly zeroed-for-inactive) data, so the inner path can treat
         // every shard as compute.
