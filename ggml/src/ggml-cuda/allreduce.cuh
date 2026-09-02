@@ -20,7 +20,10 @@ static constexpr size_t   GGML_CUDA_MIXED_AR_SLOTS       = 2;
 // and forced normal 2K-token prefill (about 20 MiB for n_embd=5120) through
 // the meta-backend fallback.  Keep enough pinned staging space for that path.
 static constexpr size_t   GGML_CUDA_MIXED_AR_RANK_BYTES  = 32 * 1024 * 1024;
-static constexpr size_t   GGML_CUDA_MIXED_AR_BLOCKS      = 8;
+// The hierarchical kernels process large prefill buffers in stripes. More
+// blocks reduce the serial qblock loop in the fused local+cross path; the
+// mapped-host token arrays are sized from this constant as well.
+static constexpr size_t   GGML_CUDA_MIXED_AR_BLOCKS      = 32;
 static constexpr size_t   GGML_CUDA_MIXED_AR_SIGNAL_STRIDE = 64;
 
 // Optional profiling records written by the hierarchical kernel into the

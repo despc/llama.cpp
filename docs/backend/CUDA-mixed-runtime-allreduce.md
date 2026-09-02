@@ -366,6 +366,21 @@ phase. The profiled end-to-end prompt times were 4945.125 ms for cross-only and
 about one percent because the AllReduce critical path overlaps other graph
 work.
 
+A quick stripe-count sweep changed `GGML_CUDA_MIXED_AR_BLOCKS` for all
+hierarchical kernels. The normal fused runs were approximately:
+
+| Hierarchical blocks | 5000-token prompt |
+| ---: | ---: |
+| 16 | 4580-4626 ms |
+| 32 | 4578-4618 ms |
+| 64 | 4587-4618 ms |
+
+The 32-block setting is kept. It reduced the profiled fused critical path to
+3085.967 ms and read/add to 405.210 ms; 64 blocks did not improve the normal
+end-to-end result and increased synchronization pressure. The setting also
+sizes the mapped-host arrival, departure, and trace arrays, so it cannot be
+changed independently for only one runtime group.
+
 The fused implementation must still be treated as experimental. It is not
 enabled by the production script, and it has not passed a broader output
 quality or perplexity evaluation, a multi-seed rank-equivalence test, or a
