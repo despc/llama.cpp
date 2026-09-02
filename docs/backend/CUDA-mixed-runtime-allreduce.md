@@ -63,9 +63,11 @@ The process prints totals by rank and wire size during context destruction. This
 `GGML_CUDA_MIXED_AR_CPU_PROFILE=1` measures existing `prepare` and `enqueue` calls with `steady_clock`. It does not introduce CUDA synchronization and has negligible measured overhead. It identifies CPU blocking caused by slot reuse.
 
 `GGML_CUDA_MIXED_AR_FUSED_STREAM=1` switches the fused kernel to chunked
-progress publication, and `GGML_CUDA_MIXED_AR_STREAM_CHUNK` sets the qblocks
-per progress step (default 20). Both require `GGML_CUDA_MIXED_AR_FUSED_INT8=1`
-and are default-off; see the streamed publication experiment below.
+progress publication, `GGML_CUDA_MIXED_AR_STREAM_CHUNK` sets the qblocks per
+progress step (default 4), and `GGML_CUDA_MIXED_AR_STREAM_DUPLEX=0` turns off
+the opportunistic inbound drain that overlaps the two link directions. All
+require `GGML_CUDA_MIXED_AR_FUSED_INT8=1`; see the streamed publication and
+duplex overlap experiments below.
 
 `GGML_CUDA_MIXED_AR_DEVICE_SLOTS=0` restores the original CPU event wait for
 the two-slot ring. The default is `1`: kernels publish a per-rank departure
@@ -468,6 +470,68 @@ streamed kernel at chunk 20. This is a smoke test, not a quality evaluation.
 Both experimental modes remain default-off. The production script still
 enables only `GGML_CUDA_MIXED_AR_INT8`.
 
+### Duplex overlap on the V100 link
+
+`lspci` reports the V100 as `LnkCap: Speed 8GT/s, Width x16` but
+`LnkSta: Speed 8GT/s, Width x4`. The card negotiates full Gen3 speed on four
+lanes, which is a board limit: the host has no spare lanes, so the card cannot
+be moved to a wider slot. Gen3 x4 gives 3.94 GB/s in theory, and the measured
+2.81 GiB/s publication rate is 3.02 GB/s, about 77 percent of that. Only
+10 to 15 percent of raw bandwidth is left, so switching the publication from
+in-kernel stores to the copy engine cannot pay for itself.
+
+PCIe is full duplex, and the kernel was using it as if it were not: every rank
+published its whole contribution before reading anything, so the inbound and
+outbound streams were strictly serialized and one direction always sat idle.
+`GGML_CUDA_MIXED_AR_STREAM_DUPLEX=1`, the default under the streamed mode,
+adds an opportunistic drain: after publishing a chunk, a block folds in
+whatever peer chunks are already visible without blocking, and only the
+remainder is drained with a blocking wait at the end. The drain never runs
+ahead of the chunks whose own contribution is final, because publication still
+writes `recvbuf` outright.
+
+Warmed exact 5000-token prompts, speculative decoding off:
+
+| Mode | Prompt runs | Prompt speed |
+| --- | ---: | ---: |
+| Stable cross-only INT8 | 4613.2-4614.6 ms | 1083.5 tokens/s |
+| Fused, coarse barrier | 4575.4-4581.1 ms | 1091.4-1092.8 tokens/s |
+| Streamed, chunk 20, no duplex | 4567.9-4571.7 ms | 1093.7-1094.6 tokens/s |
+| Streamed, chunk 4, no duplex | 4681.1-4684.3 ms | 1067.4-1068.1 tokens/s |
+| Streamed, chunk 20, duplex | 4418.3-4420.9 ms | 1131.0-1131.7 tokens/s |
+| Streamed, chunk 8, duplex | 4389.2-4393.1 ms | 1138.2-1139.2 tokens/s |
+| Streamed, chunk 5, duplex | 4262.0-4264.3 ms | 1172.5-1173.2 tokens/s |
+| **Streamed, chunk 4, duplex** | **4242.4-4245.2 ms** | **1177.8-1178.6 tokens/s** |
+| Streamed, chunk 3, duplex | 4260.9-4263.1 ms | 1172.9-1173.5 tokens/s |
+| Streamed, chunk 2, duplex | 4284.8-4285.2 ms | 1166.8-1166.9 tokens/s |
+
+Chunk 4 with the drain disabled is the control that isolates the effect: the
+same chunk size costs 4681 ms without duplex and 4243 ms with it, so the whole
+441 ms belongs to the overlap rather than to the chunk size. Against the
+stable production path the streamed duplex kernel is 8.7 percent faster, and
+against the coarse fused kernel 7.3 percent.
+
+Small chunks only pay once the drain exists. Without it the optimum was 20
+qblocks per step, because every step costs system fences and buys nothing;
+with it the optimum moves to 4, because a smaller step puts inbound traffic on
+the wire sooner.
+
+The V100 rank's own kernel time fell from about 2006 ms to about 1680 ms per
+prompt, and its exposed wait from 100 ms to under 2 ms. The Blackwell-side
+profile is no longer comparable across modes: `GGML_CUDA_MIXED_AR_PROFILE=1`
+synchronizes every large reduction, which removes exactly the overlap this
+mode exploits, so its totals grow while normal throughput improves. Use the
+normal benchmark for this mode and the profile only for the phase split.
+
+Token generation is unaffected, as expected from decode using the small flat
+path: 128 generated tokens ran at 32.79 and 32.82 tokens/s under the streamed
+duplex kernel against 32.93 and 32.98 tokens/s on the production path.
+
+A deterministic 5000-token prompt with 16 generated tokens produced exactly the
+same text under the streamed duplex kernel as on the stable cross-only path,
+the coarse fused kernel, and the streamed kernel without duplex. This is a
+smoke test, not a quality evaluation, and the fused family stays default-off.
+
 ### Tensor split experiments
 
 The `1,1,2` tensor split remains required with the current 262144-token
@@ -481,25 +545,28 @@ These failures are configuration-level VRAM limits, not AllReduce failures.
 
 ## Optimization order
 
-Finer-grained publication, which was the previous first item, has been tried
-and measured: see the streamed publication experiment above. It cuts the
-profiled critical path by 11 percent and end-to-end time by 0.2 percent,
-because the exposed wait is the V100's mapped-host transfer time and not a
-synchronization artifact. The remaining levers therefore have to move bytes
-or calls, not signals.
+Two levers have been tried and measured, and both results narrow what is left.
+Finer publication granularity on its own is worth 0.2 percent, because the
+exposed wait is transfer time rather than a synchronization artifact.
+Overlapping the two link directions is worth 7.3 percent over the coarse fused
+kernel, because the V100's Gen3 x4 link was being driven as if it were half
+duplex. Raw bandwidth is now within 10 to 15 percent of the link's ceiling and
+the card cannot move to a wider slot, so the remaining levers have to move
+bytes or calls.
 
-1. Reduce the bytes the V100 pushes and pulls. It writes 1912 ms per prompt at
-   approximately 2.81 GiB/s while the Blackwell ranks wait 1491 ms for exactly
-   that traffic. A narrower wire in the V100 direction, for example packed
-   INT6 or INT4 with the existing per-4096 scales, or dropping the V100's
-   tensor share once context allows it, attacks the measured bottleneck
-   directly.
-2. Reduce the number of cross-runtime reductions per layer. Reaching 1500
-   tokens/s requires a total prompt time near 3.33 seconds, so transport
-   compression alone is not sufficient.
-3. Run a broader quality or perplexity evaluation for the fused, streamed, and
+1. Reduce the bytes crossing to and from the V100. At 3.02 GB/s measured on a
+   3.94 GB/s link, the transfer itself is the floor; packed INT6 or INT4 with
+   the existing per-4096 scales would cut it close to linearly. This needs a
+   real quality evaluation before it can be considered.
+2. Reduce the number of cross-runtime reductions per layer. There are 384 large
+   reductions per 5000-token prompt. Reaching 1500 tokens/s requires a total
+   prompt time near 3.33 seconds, so transport compression alone is not
+   sufficient.
+3. Extend the duplex drain to the local Blackwell exchange, which still
+   publishes a whole chunk before reading the peer's.
+4. Run a broader quality or perplexity evaluation for the fused, streamed, and
    local INT8 stages before treating them as lossless.
-4. Add a multi-seed rank-equivalence test and a decode regression test for the
+5. Add a multi-seed rank-equivalence test and a decode regression test for the
    fused and streamed kernels.
 6. Re-run the same exact 5000-token prompt after every change. Also test token
    generation because the small flat path has different latency requirements.

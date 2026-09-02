@@ -1183,6 +1183,7 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         int *                       local_arrival_peer,
         int                         token,
         int                         chunk,
+        bool                        duplex,
         bool                        contribute,
         bool                        has_local_peer,
         ggml_cuda_mixed_ar_trace_record * trace) {
@@ -1270,6 +1271,67 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         GGML_CUDA_AR_STREAM_MARK(wait_ns)
     }
 
+    // Chunks of the peer runtime already folded into recvbuf.  The opportunistic
+    // drain below never runs ahead of the chunks whose own contribution is
+    // final, because the publication step still writes recvbuf outright.
+    int read_step = 0;
+    __shared__ int peer_ready;
+
+    // Consume one already-published peer chunk.  Every thread must reach this,
+    // so it stays a macro rather than a helper with its own control flow.
+#define GGML_CUDA_AR_STREAM_CONSUME(chunk_step)                                                     \
+    {                                                                                               \
+        const int consume_first = (chunk_step) * chunk;                                             \
+        const int consume_last = min(consume_first + chunk, stripe_len);                            \
+        for (int j = consume_first; j < consume_last; ++j) {                                        \
+            const int qb = bid + j * (int) gridDim.x;                                               \
+            const int block_start = qb * QK;                                                        \
+            const int local_offset = tid * 16;                                                      \
+            const int vector_index = block_start + local_offset;                                    \
+            if (tid == 0) {                                                                         \
+                block_scale = cross_peer_scales[qb];                                                \
+            }                                                                                       \
+            if (vector_index + 16 <= count) {                                                       \
+                ggml_cuda_memcpy_1<16>(&block_values[local_offset], &cross_peer_values[vector_index]); \
+            } else {                                                                                \
+                for (int k = 0; k < 16 && vector_index + k < count; ++k) {                          \
+                    block_values[local_offset + k] = cross_peer_values[vector_index + k];           \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            _Pragma("unroll")                                                                       \
+            for (int k = 0; k < VALUES_PER_THREAD; ++k) {                                           \
+                const int index = block_start + k * blockDim.x + tid;                               \
+                if (index < count) {                                                                \
+                    recvbuf[index] += (float) block_values[k * blockDim.x + tid] * block_scale;     \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+        }                                                                                           \
+    }
+
+    // Pull in whatever the peer runtime has already published, without
+    // blocking, so inbound traffic shares the link with our outbound writes
+    // instead of queueing behind all of it.  PCIe is full duplex; publishing
+    // everything before reading anything left one direction idle.
+#define GGML_CUDA_AR_STREAM_DRAIN(published_steps)                                                  \
+    if (duplex) {                                                                                   \
+        if (tid == 0) {                                                                             \
+            peer_ready = ggml_cuda_ar_progress_get(cross_progress_peer, token);                     \
+        }                                                                                           \
+        __syncthreads();                                                                            \
+        const int drain_limit = min(peer_ready, (published_steps));                                 \
+        if (read_step < drain_limit) {                                                              \
+            __threadfence_system();                                                                 \
+            GGML_CUDA_AR_STREAM_MARK(work_ns)                                                       \
+            while (read_step < drain_limit) {                                                       \
+                GGML_CUDA_AR_STREAM_CONSUME(read_step)                                              \
+                ++read_step;                                                                        \
+            }                                                                                       \
+            GGML_CUDA_AR_STREAM_MARK(work_ns)                                                       \
+        }                                                                                           \
+    }
+
     // Phase 1: quantize and publish this block's own contribution, releasing
     // one progress step per chunk.  On the single-rank runtime this is already
     // the cross-runtime publication.
@@ -1335,6 +1397,11 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             ggml_cuda_ar_progress_set(
                 has_local_peer ? local_progress_mine : cross_progress_mine, token, step + 1);
             __threadfence_system();
+        }
+        // The single-rank runtime has just put this chunk on the wire, so its
+        // inbound reads can start overlapping right away.
+        if (!has_local_peer) {
+            GGML_CUDA_AR_STREAM_DRAIN(step + 1)
         }
     }
     GGML_CUDA_AR_STREAM_MARK(work_ns)
@@ -1438,13 +1505,14 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
                 }
             }
             GGML_CUDA_AR_STREAM_MARK(work_ns)
+            GGML_CUDA_AR_STREAM_DRAIN(step + 1)
         }
     }
 
-    // Phase 3: consume the other runtime's chunks as they become visible.
-    for (int step = 0; step < n_steps; ++step) {
+    // Phase 3: block for whatever the opportunistic drain has not taken yet.
+    for (; read_step < n_steps; ++read_step) {
         if (tid == 0) {
-            while (ggml_cuda_ar_progress_get(cross_progress_peer, token) < step + 1) {
+            while (ggml_cuda_ar_progress_get(cross_progress_peer, token) < read_step + 1) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
                 __nanosleep(100);
 #else
@@ -1456,33 +1524,7 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         __threadfence_system();
         GGML_CUDA_AR_STREAM_MARK(wait_ns)
 
-        const int first = step * chunk;
-        const int last = min(first + chunk, stripe_len);
-        for (int j = first; j < last; ++j) {
-            const int qb = bid + j * (int) gridDim.x;
-            const int block_start = qb * QK;
-            const int local_offset = tid * 16;
-            const int vector_index = block_start + local_offset;
-            if (tid == 0) {
-                block_scale = cross_peer_scales[qb];
-            }
-            if (vector_index + 16 <= count) {
-                ggml_cuda_memcpy_1<16>(&block_values[local_offset], &cross_peer_values[vector_index]);
-            } else {
-                for (int k = 0; k < 16 && vector_index + k < count; ++k) {
-                    block_values[local_offset + k] = cross_peer_values[vector_index + k];
-                }
-            }
-            __syncthreads();
-#pragma unroll
-            for (int k = 0; k < VALUES_PER_THREAD; ++k) {
-                const int index = block_start + k * blockDim.x + tid;
-                if (index < count) {
-                    recvbuf[index] += (float) block_values[k * blockDim.x + tid] * block_scale;
-                }
-            }
-            __syncthreads();
-        }
+        GGML_CUDA_AR_STREAM_CONSUME(read_step)
         GGML_CUDA_AR_STREAM_MARK(work_ns)
     }
 
@@ -1510,6 +1552,8 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             __threadfence_system();
         }
     }
+#undef GGML_CUDA_AR_STREAM_DRAIN
+#undef GGML_CUDA_AR_STREAM_CONSUME
 #undef GGML_CUDA_AR_STREAM_MARK
 }
 
@@ -1915,6 +1959,7 @@ struct ggml_cuda_mixed_ar_group {
     bool wire_int8 = false;
     bool fused_int8 = false;
     bool stream_int8 = false;
+    bool stream_duplex = true;
     int stream_chunk = 1;
     int leader_rank = -1;
     int peer_leader_rank = -1;
@@ -2004,13 +2049,17 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->stream_int8 = group->fused_int8 &&
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FUSED_STREAM", 0) != 0;
     // Qblocks published per progress step.  One step per qblock spends more on
-    // system fences than it wins back; 20 was the best measured value for the
-    // 20 MiB wire at 32 blocks (80 qblocks per stripe, so four steps).  Sweep
+    // system fences than it wins back, but with the duplex drain below small
+    // chunks pay off: 4 measured best for the 20 MiB wire at 32 blocks.  Sweep
     // it with GGML_CUDA_MIXED_AR_STREAM_CHUNK.
-    group->stream_chunk = (int) ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_CHUNK", 20);
+    group->stream_chunk = (int) ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_CHUNK", 4);
     if (group->stream_chunk < 1) {
         group->stream_chunk = 1;
     }
+    // Overlap inbound peer chunks with outbound publication.  The V100 link is
+    // PCIe Gen3 x4 and full duplex, so publishing everything before reading
+    // anything wastes one direction.
+    group->stream_duplex = ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_DUPLEX", 1) != 0;
     group->leader_rank = config->leader_rank;
     group->peer_leader_rank = config->peer_leader_rank;
     group->shared_host = config->shared_host;
@@ -2046,8 +2095,8 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         GGML_LOG_WARN("%s: fused local and cross-runtime INT8 enabled\n", __func__);
     }
     if (group->stream_int8) {
-        GGML_LOG_WARN("%s: chunked streaming publication enabled (%d qblocks per step)\n",
-                      __func__, group->stream_chunk);
+        GGML_LOG_WARN("%s: chunked streaming publication enabled (%d qblocks per step, duplex %s)\n",
+                      __func__, group->stream_chunk, group->stream_duplex ? "on" : "off");
     }
 
     if (group->hierarchical && group->devices.size() == 2) {
@@ -2277,8 +2326,8 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
                     reinterpret_cast<uint8_t *>(slot_data), local_mine, local_peer,
                     rank, (int) group->n_ranks, group->leader_rank, group->peer_leader_rank,
                     (int) ne, arrival_slot, departure_slot, local_arrival_mine,
-                    local_arrival_peer, token, group->stream_chunk, contribute,
-                    has_local_peer, trace);
+                    local_arrival_peer, token, group->stream_chunk, group->stream_duplex,
+                    contribute, has_local_peer, trace);
             } else {
                 ggml_cuda_mixed_ar_hier_fused_int8_kernel<<<
                     dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>(
