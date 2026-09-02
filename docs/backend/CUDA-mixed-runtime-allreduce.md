@@ -850,10 +850,37 @@ of the pair sum is lost in floating-point reordering noise. It is worth 3.5
 percent of generation, and 2.1 tokens/s in the table above, at no measurable
 quality cost.
 
-Read together: the whole optimisation stack costs 0.74 percent of perplexity,
-all of it from the INT8 wire family on the prefill path, and returns 57 percent
+Read together: the whole optimisation stack cost 0.74 percent of perplexity,
+all of it from the INT8 wire family on the prefill path, and returned 57 percent
 of prefill and 3 percent of generation. The remaining generation gain came from
 the tensor split and speculation, which do not approximate anything.
+
+### Narrowing the INT8 scale block
+
+That 0.74 percent turned out to be mostly avoidable. The INT8 wire carried one
+FP32 scale per 4096 values, which is a very long run to put under a single
+scale. The transfer tile has to stay at 4096, because a 256-thread block moves
+it as one 16-byte-per-thread vector, but the scale block does not: the streamed
+kernel now computes and applies `GGML_CUDA_MIXED_AR_SCALE_VALUES` per group
+inside the tile. Each extra scale costs 4 bytes.
+
+| Values per scale | Perplexity | Delta vs BF16 wire | Prefill | Generation |
+| ---: | ---: | ---: | ---: | ---: |
+| 4096 | 4.0948 | +0.74 percent | 1154.8 tok/s | 63.80 tok/s |
+| 1024 | 4.0720 | +0.18 percent | 1165.3 tok/s | 63.35 tok/s |
+| 512 | 4.0688 | +0.10 percent | 1163.6 tok/s | 63.73 tok/s |
+| **256** | **4.0661** | **+0.03 percent** | **1157.6 tok/s** | **63.65 tok/s** |
+| BF16 wire reference | 4.0647 | reference | 734.1 tok/s | 61.82 tok/s |
+
+Speed is flat across the sweep -- the extra scales are 1.6 percent more wire
+bytes at 256 values, which is nothing against what the INT8 wire saves in the
+first place. 256 is now the default, so the cross-runtime approximation costs
+0.03 percent of perplexity instead of 0.74 while keeping the 57 percent prefill
+gain.
+
+Only the streamed kernel implements the finer scale. The coarse fused kernel
+and the plain hierarchical INT8 kernel still use one scale per tile, so turning
+`GGML_CUDA_MIXED_AR_FUSED_STREAM` off also reverts to the coarser quantization.
 
 ### Tensor split experiments
 

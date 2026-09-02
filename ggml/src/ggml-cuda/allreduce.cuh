@@ -32,6 +32,18 @@ static constexpr size_t   GGML_CUDA_MIXED_AR_BLOCKS      = 64;
 // more arrival token to publish and poll across the link.  It is kept separate
 // from the striped hierarchical width above, which wants the opposite.
 static constexpr size_t   GGML_CUDA_MIXED_AR_FLAT_BLOCKS = 4;
+// Values per INT8 scale on the cross-runtime wire.  The transfer tile stays at
+// 4096 because a 256-thread block moves it as one 16-byte-per-thread vector,
+// but the scale can be finer: a shorter run of values under one scale means
+// less quantization error, and each extra FP32 scale costs 4 bytes per group.
+// Measured on a fixed corpus, perplexity against the BF16 wire's 4.0647:
+// 4096 -> 4.0948, 1024 -> 4.0720, 512 -> 4.0688, 256 -> 4.0661.  Prefill stays
+// within noise across all of them (1155-1165 tok/s), so 256 is chosen: it costs
+// 1.6% more wire bytes and brings the INT8 path back to +0.03% perplexity.
+// Only the streamed kernel implements this; the coarse fused and plain
+// hierarchical kernels still carry one scale per 4096-value tile.
+static constexpr int      GGML_CUDA_MIXED_AR_SCALE_VALUES = 256;
+
 static constexpr size_t   GGML_CUDA_MIXED_AR_SIGNAL_STRIDE = 64;
 
 // Optional profiling records written by the hierarchical kernel into the

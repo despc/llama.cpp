@@ -1445,6 +1445,12 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         ggml_cuda_mixed_ar_trace_record * trace) {
     constexpr int QK = 4096;
     constexpr int VALUES_PER_THREAD = QK / 256;
+    // Scale groups inside one transfer tile.  The tile stays 4096 because the
+    // block moves it as one 16-byte-per-thread vector, but a shorter run of
+    // values under a single scale means less quantization error.  A thread's
+    // k-th value belongs to group k / VPT_PER_GROUP.
+    constexpr int GROUPS = QK / GGML_CUDA_MIXED_AR_SCALE_VALUES;
+    constexpr int VPT_PER_GROUP = VALUES_PER_THREAD / GROUPS;
     constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(int));
     constexpr int LOCAL_SIGNAL_INTS = (int) (GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
 
@@ -1488,9 +1494,9 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             local_arrival_peer + bid * LOCAL_SIGNAL_INTS + GGML_CUDA_AR_PROGRESS_OFFSET_INTS)
         : nullptr;
 
-    __shared__ float warp_max[8];
-    __shared__ float block_scale;
-    __shared__ float block_inv_scale;
+    __shared__ float warp_max[GROUPS][8];
+    __shared__ float group_scale[GROUPS];
+    __shared__ float group_inv_scale[GROUPS];
     __shared__ __align__(16) int8_t block_values[QK];
 
     const uint64_t begin_ns = ggml_cuda_ar_globaltimer_ns();
@@ -1547,8 +1553,8 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             const int block_start = qb * QK;                                                        \
             const int local_offset = tid * 16;                                                      \
             const int vector_index = block_start + local_offset;                                    \
-            if (tid == 0) {                                                                         \
-                block_scale = cross_peer_scales[qb];                                                \
+            if (tid < GROUPS) {                                                                     \
+                group_scale[tid] = cross_peer_scales[qb * GROUPS + tid];                            \
             }                                                                                       \
             if (vector_index + 16 <= count) {                                                       \
                 ggml_cuda_memcpy_1<16>(&block_values[local_offset], &cross_peer_values[vector_index]); \
@@ -1562,7 +1568,8 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             for (int k = 0; k < VALUES_PER_THREAD; ++k) {                                           \
                 const int index = block_start + k * blockDim.x + tid;                               \
                 if (index < count) {                                                                \
-                    recvbuf[index] += (float) block_values[k * blockDim.x + tid] * block_scale;     \
+                    recvbuf[index] += (float) block_values[k * blockDim.x + tid] *                  \
+                        group_scale[k / VPT_PER_GROUP];                                             \
                 }                                                                                   \
             }                                                                                       \
             __syncthreads();                                                                        \
@@ -1602,8 +1609,8 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             const int block_start = qb * QK;                                                        \
             const int local_offset = tid * 16;                                                      \
             const int vector_index = block_start + local_offset;                                    \
-            if (tid == 0) {                                                                         \
-                block_scale = local_peer_scales[qb];                                                \
+            if (tid < GROUPS) {                                                                     \
+                group_scale[tid] = local_peer_scales[qb * GROUPS + tid];                            \
             }                                                                                       \
             if (vector_index + 16 <= count) {                                                       \
                 ggml_cuda_memcpy_1<16>(&block_values[local_offset], &local_peer_values[vector_index]); \
@@ -1614,34 +1621,47 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             }                                                                                       \
             __syncthreads();                                                                        \
             float aggregate[VALUES_PER_THREAD];                                                     \
-            float agg_max = 0.0f;                                                                   \
+            float agg_max[GROUPS];                                                                  \
+            _Pragma("unroll")                                                                       \
+            for (int g = 0; g < GROUPS; ++g) {                                                      \
+                agg_max[g] = 0.0f;                                                                  \
+            }                                                                                       \
             _Pragma("unroll")                                                                       \
             for (int k = 0; k < VALUES_PER_THREAD; ++k) {                                           \
                 const int index = block_start + k * blockDim.x + tid;                               \
                 aggregate[k] = index < count                                                        \
-                    ? recvbuf[index] + (float) block_values[k * blockDim.x + tid] * block_scale     \
+                    ? recvbuf[index] + (float) block_values[k * blockDim.x + tid] *                 \
+                          group_scale[k / VPT_PER_GROUP]                                            \
                     : 0.0f;                                                                         \
-                agg_max = fmaxf(agg_max, fabsf(aggregate[k]));                                      \
+                agg_max[k / VPT_PER_GROUP] =                                                        \
+                    fmaxf(agg_max[k / VPT_PER_GROUP], fabsf(aggregate[k]));                         \
             }                                                                                       \
             _Pragma("unroll")                                                                       \
-            for (int offset = 16; offset > 0; offset >>= 1) {                                       \
-                agg_max = fmaxf(agg_max, __shfl_down_sync(0xffffffff, agg_max, offset));            \
-            }                                                                                       \
-            if (lane == 0) {                                                                        \
-                warp_max[warp] = agg_max;                                                           \
+            for (int g = 0; g < GROUPS; ++g) {                                                      \
+                _Pragma("unroll")                                                                   \
+                for (int offset = 16; offset > 0; offset >>= 1) {                                   \
+                    agg_max[g] = fmaxf(agg_max[g], __shfl_down_sync(0xffffffff, agg_max[g], offset)); \
+                }                                                                                   \
+                if (lane == 0) {                                                                    \
+                    warp_max[g][warp] = agg_max[g];                                                 \
+                }                                                                                   \
             }                                                                                       \
             __syncthreads();                                                                        \
             if (warp == 0) {                                                                        \
-                agg_max = lane < 8 ? warp_max[lane] : 0.0f;                                         \
                 _Pragma("unroll")                                                                   \
-                for (int offset = 16; offset > 0; offset >>= 1) {                                   \
-                    agg_max = fmaxf(agg_max, __shfl_down_sync(0xffffffff, agg_max, offset));        \
-                }                                                                                   \
-                if (lane == 0) {                                                                    \
-                    block_scale = agg_max > 0.0f ? agg_max / 127.0f : 1.0f;                         \
-                    block_inv_scale = 1.0f / block_scale;                                           \
-                    if (is_leader) {                                                                \
-                        cross_mine_scales[qb] = block_scale;                                        \
+                for (int g = 0; g < GROUPS; ++g) {                                                  \
+                    float value = lane < 8 ? warp_max[g][lane] : 0.0f;                              \
+                    _Pragma("unroll")                                                               \
+                    for (int offset = 16; offset > 0; offset >>= 1) {                               \
+                        value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));          \
+                    }                                                                               \
+                    if (lane == 0) {                                                                \
+                        const float scale = value > 0.0f ? value / 127.0f : 1.0f;                   \
+                        group_scale[g] = scale;                                                     \
+                        group_inv_scale[g] = 1.0f / scale;                                          \
+                        if (is_leader) {                                                            \
+                            cross_mine_scales[qb * GROUPS + g] = scale;                             \
+                        }                                                                           \
                     }                                                                               \
                 }                                                                                   \
             }                                                                                       \
@@ -1650,8 +1670,9 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             for (int k = 0; k < VALUES_PER_THREAD; ++k) {                                           \
                 const int index = block_start + k * blockDim.x + tid;                               \
                 if (index < count) {                                                                \
-                    const int quantized = max(-127, min(127, __float2int_rn(aggregate[k] * block_inv_scale))); \
-                    recvbuf[index] = (float) quantized * block_scale;                               \
+                    const int g = k / VPT_PER_GROUP;                                                \
+                    const int quantized = max(-127, min(127, __float2int_rn(aggregate[k] * group_inv_scale[g]))); \
+                    recvbuf[index] = (float) quantized * group_scale[g];                            \
                     block_values[k * blockDim.x + tid] = (int8_t) quantized;                        \
                 }                                                                                   \
             }                                                                                       \
@@ -1710,31 +1731,42 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             const int block_start = qb * QK;
             const int local_offset = tid * 16;
             const int vector_index = block_start + local_offset;
-            float max_value = 0.0f;
+            float group_max[GROUPS];
+#pragma unroll
+            for (int g = 0; g < GROUPS; ++g) {
+                group_max[g] = 0.0f;
+            }
 #pragma unroll
             for (int k = 0; k < VALUES_PER_THREAD; ++k) {
                 const int index = block_start + k * blockDim.x + tid;
                 const float value = index < count && contribute ? sendbuf[index] : 0.0f;
-                max_value = fmaxf(max_value, fabsf(value));
+                group_max[k / VPT_PER_GROUP] = fmaxf(group_max[k / VPT_PER_GROUP], fabsf(value));
             }
 #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
-            }
-            if (lane == 0) {
-                warp_max[warp] = max_value;
+            for (int g = 0; g < GROUPS; ++g) {
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    group_max[g] = fmaxf(group_max[g], __shfl_down_sync(0xffffffff, group_max[g], offset));
+                }
+                if (lane == 0) {
+                    warp_max[g][warp] = group_max[g];
+                }
             }
             __syncthreads();
             if (warp == 0) {
-                max_value = lane < 8 ? warp_max[lane] : 0.0f;
 #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
-                }
-                if (lane == 0) {
-                    block_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
-                    block_inv_scale = 1.0f / block_scale;
-                    first_scales[qb] = block_scale;
+                for (int g = 0; g < GROUPS; ++g) {
+                    float value = lane < 8 ? warp_max[g][lane] : 0.0f;
+#pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+                    }
+                    if (lane == 0) {
+                        const float scale = value > 0.0f ? value / 127.0f : 1.0f;
+                        group_scale[g] = scale;
+                        group_inv_scale[g] = 1.0f / scale;
+                        first_scales[qb * GROUPS + g] = scale;
+                    }
                 }
             }
             __syncthreads();
@@ -1742,9 +1774,10 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             for (int k = 0; k < VALUES_PER_THREAD; ++k) {
                 const int index = block_start + k * blockDim.x + tid;
                 if (index < count) {
+                    const int g = k / VPT_PER_GROUP;
                     const float value = contribute ? sendbuf[index] : 0.0f;
-                    const int quantized = max(-127, min(127, __float2int_rn(value * block_inv_scale)));
-                    recvbuf[index] = (float) quantized * block_scale;
+                    const int quantized = max(-127, min(127, __float2int_rn(value * group_inv_scale[g])));
+                    recvbuf[index] = (float) quantized * group_scale[g];
                     block_values[k * blockDim.x + tid] = (int8_t) quantized;
                 }
             }
