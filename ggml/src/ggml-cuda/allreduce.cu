@@ -65,6 +65,10 @@ static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
     return *(const volatile int *)p;
 }
 
+static __device__ __forceinline__ bool ggml_cuda_ar_token_reached(int value, int target) {
+    return (int32_t) (value - target) >= 0;
+}
+
 static __device__ __forceinline__ uint64_t ggml_cuda_ar_globaltimer_ns() {
     uint64_t value;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
@@ -217,6 +221,7 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
         size_t                      rank_stride,
         int                         count,
         int *                       arrival_slot,
+        int *                       departure_slot,
         int                         token,
         bool                        contribute) {
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
@@ -230,6 +235,27 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
     const int count_vec = count / ELEMS_PER_VEC;
     const int tail      = count_vec * ELEMS_PER_VEC;
     T_wire * host_mine  = slot_data + (size_t) rank * rank_stride;
+
+    if (departure_slot && token > (int) GGML_CUDA_MIXED_AR_SLOTS) {
+        if (tid == 0) {
+            const int previous_token = token - (int) GGML_CUDA_MIXED_AR_SLOTS;
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer == rank) {
+                    continue;
+                }
+                const int * peer_departure = departure_slot +
+                    ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                while (!ggml_cuda_ar_token_reached(ggml_cuda_ar_signal_get(peer_departure), previous_token)) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
 
     for (int i = gtid; i < count_vec; i += gnt) {
         const int off = i * ELEMS_PER_VEC;
@@ -309,6 +335,17 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
         }
         recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(sum);
     }
+
+    if (departure_slot) {
+        __syncthreads();
+        __threadfence_system();
+        if (tid == 0) {
+            int * mine = departure_slot +
+                ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+            ggml_cuda_ar_signal_set(mine, token);
+            __threadfence_system();
+        }
+    }
 }
 
 // Hierarchical cross-runtime step for the common 2+1 topology.  Ranks that
@@ -322,11 +359,13 @@ static __global__ void ggml_cuda_mixed_ar_hier_kernel(
         T_dst        *              recvbuf,
         T_wire       * __restrict__ slot_data,
         int                         rank,
+        int                         n_ranks,
         int                         leader_rank,
         int                         peer_leader_rank,
         size_t                      rank_stride,
         int                         count,
         int *                       arrival_slot,
+        int *                       departure_slot,
         int                         token,
         bool                        contribute,
         ggml_cuda_mixed_ar_trace_record * trace) {
@@ -344,6 +383,27 @@ static __global__ void ggml_cuda_mixed_ar_hier_kernel(
     T_wire * host_mine = slot_data + (size_t) leader_rank * rank_stride;
     const T_wire * host_peer = slot_data + (size_t) peer_leader_rank * rank_stride;
     const uint64_t begin_ns = ggml_cuda_ar_globaltimer_ns();
+
+    if (departure_slot && is_leader && token > (int) GGML_CUDA_MIXED_AR_SLOTS) {
+        if (tid == 0) {
+            const int previous_token = token - (int) GGML_CUDA_MIXED_AR_SLOTS;
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer == rank) {
+                    continue;
+                }
+                const int * peer_departure = departure_slot +
+                    ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                while (!ggml_cuda_ar_token_reached(ggml_cuda_ar_signal_get(peer_departure), previous_token)) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
 
     if (is_leader) {
         for (int i = gtid; i < count_vec; i += gnt) {
@@ -409,15 +469,218 @@ static __global__ void ggml_cuda_mixed_ar_hier_kernel(
             ggml_cuda_cast<float>(local) + ggml_cuda_cast<float>(host_peer[tail + tid]));
     }
 
-    if (trace) {
+    if (departure_slot || trace) {
         __syncthreads();
+        __threadfence_system();
         if (tid == 0) {
-            trace[(size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid] = {
-                begin_ns,
-                publish_ns,
-                peer_ready_ns,
-                ggml_cuda_ar_globaltimer_ns(),
-            };
+            if (departure_slot) {
+                int * mine = departure_slot +
+                    ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                ggml_cuda_ar_signal_set(mine, token);
+            }
+            if (trace) {
+                trace[(size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid] = {
+                    begin_ns,
+                    publish_ns,
+                    peer_ready_ns,
+                    ggml_cuda_ar_globaltimer_ns(),
+                };
+            }
+            __threadfence_system();
+        }
+    }
+}
+
+// Block-quantized cross-runtime transport.  The local aggregate is rounded
+// through symmetric INT8 in 4096-element blocks before it is published.  All
+// ranks retain that rounded local value and add the same rounded peer value,
+// so the tensor-parallel replicas stay bit-equivalent while mapped-host
+// traffic is roughly halved versus BF16.
+static __global__ void ggml_cuda_mixed_ar_hier_int8_kernel(
+        const float *              sendbuf,
+        float       *              recvbuf,
+        uint8_t     * __restrict__ slot_data,
+        int                        rank,
+        int                        n_ranks,
+        int                        leader_rank,
+        int                        peer_leader_rank,
+        int                        count,
+        int *                      arrival_slot,
+        int *                      departure_slot,
+        int                        token,
+        bool                       contribute,
+        ggml_cuda_mixed_ar_trace_record * trace) {
+    constexpr int QK = 4096;
+    constexpr int VALUES_PER_THREAD = QK / 256;
+    constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(int));
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_qblocks = (count + QK - 1) / QK;
+    const size_t scale_offset = ((size_t) count + 15) & ~(size_t) 15;
+    const bool is_leader = rank == leader_rank;
+    uint8_t * host_mine_base = slot_data + (size_t) leader_rank * GGML_CUDA_MIXED_AR_RANK_BYTES;
+    const uint8_t * host_peer_base = slot_data + (size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_RANK_BYTES;
+    int8_t * host_mine = reinterpret_cast<int8_t *>(host_mine_base);
+    const int8_t * host_peer = reinterpret_cast<const int8_t *>(host_peer_base);
+    float * host_mine_scales = reinterpret_cast<float *>(host_mine_base + scale_offset);
+    const float * host_peer_scales = reinterpret_cast<const float *>(host_peer_base + scale_offset);
+    __shared__ float warp_max[8];
+    __shared__ float block_scale;
+    __shared__ float block_inv_scale;
+    __shared__ __align__(16) int8_t block_values[QK];
+    const uint64_t begin_ns = ggml_cuda_ar_globaltimer_ns();
+
+    if (departure_slot && is_leader && token > (int) GGML_CUDA_MIXED_AR_SLOTS) {
+        if (tid == 0) {
+            const int previous_token = token - (int) GGML_CUDA_MIXED_AR_SLOTS;
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer == rank) {
+                    continue;
+                }
+                const int * peer_departure = departure_slot +
+                    ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                while (!ggml_cuda_ar_token_reached(ggml_cuda_ar_signal_get(peer_departure), previous_token)) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int qb = bid; qb < n_qblocks; qb += gridDim.x) {
+        const int block_start = qb * QK;
+        float max_value = 0.0f;
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            const float value = index < count && contribute ? sendbuf[index] : 0.0f;
+            max_value = fmaxf(max_value, fabsf(value));
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+        }
+        if (lane == 0) {
+            warp_max[warp] = max_value;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            max_value = lane < 8 ? warp_max[lane] : 0.0f;
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                max_value = fmaxf(max_value, __shfl_down_sync(0xffffffff, max_value, offset));
+            }
+            if (lane == 0) {
+                block_scale = max_value > 0.0f ? max_value / 127.0f : 1.0f;
+                block_inv_scale = 1.0f / block_scale;
+                if (is_leader) {
+                    host_mine_scales[qb] = block_scale;
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            if (index < count) {
+                const float value = contribute ? sendbuf[index] : 0.0f;
+                const int quantized = max(-127, min(127, __float2int_rn(value * block_inv_scale)));
+                recvbuf[index] = (float) quantized * block_scale;
+                block_values[k * blockDim.x + tid] = (int8_t) quantized;
+            }
+        }
+        __syncthreads();
+        if (is_leader) {
+            const int local_offset = tid * 16;
+            const int index = block_start + local_offset;
+            if (index + 16 <= count) {
+                ggml_cuda_memcpy_1<16>(&host_mine[index], &block_values[local_offset]);
+            } else {
+                for (int k = 0; k < 16 && index + k < count; ++k) {
+                    host_mine[index + k] = block_values[local_offset + k];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (is_leader) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    const uint64_t publish_ns = ggml_cuda_ar_globaltimer_ns();
+
+    if (tid == 0) {
+        if (is_leader) {
+            int * mine = arrival_slot +
+                ((size_t) leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+            ggml_cuda_ar_signal_set(mine, token);
+            __threadfence_system();
+        }
+        const int * peer = arrival_slot +
+            ((size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+        while (ggml_cuda_ar_signal_get(peer) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif
+        }
+    }
+
+    __syncthreads();
+    __threadfence_system();
+    const uint64_t peer_ready_ns = ggml_cuda_ar_globaltimer_ns();
+
+    for (int qb = bid; qb < n_qblocks; qb += gridDim.x) {
+        if (tid == 0) {
+            block_scale = host_peer_scales[qb];
+        }
+        const int block_start = qb * QK;
+        const int local_offset = tid * 16;
+        const int vector_index = block_start + local_offset;
+        if (vector_index + 16 <= count) {
+            ggml_cuda_memcpy_1<16>(&block_values[local_offset], &host_peer[vector_index]);
+        } else {
+            for (int k = 0; k < 16 && vector_index + k < count; ++k) {
+                block_values[local_offset + k] = host_peer[vector_index + k];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < VALUES_PER_THREAD; ++k) {
+            const int index = block_start + k * blockDim.x + tid;
+            if (index < count) {
+                recvbuf[index] += (float) block_values[k * blockDim.x + tid] * block_scale;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (departure_slot || trace) {
+        __syncthreads();
+        __threadfence_system();
+        if (tid == 0) {
+            if (departure_slot) {
+                int * mine = departure_slot +
+                    ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                ggml_cuda_ar_signal_set(mine, token);
+            }
+            if (trace) {
+                trace[(size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid] = {
+                    begin_ns,
+                    publish_ns,
+                    peer_ready_ns,
+                    ggml_cuda_ar_globaltimer_ns(),
+                };
+            }
             __threadfence_system();
         }
     }
@@ -449,10 +712,9 @@ static __global__ void ggml_cuda_ar_add_kernel(
 
 // Number of slots in the event / arrival ring.  Two slots is sufficient:
 // lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
-// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
-// from AR N-2 by the time we get to AR N.  acquire_slot's
-// cudaEventSynchronize on ev.ker for both devices makes that consumption
-// explicit before we overwrite host_buf[slot] for the new AR.
+// slot[N%2] is always safe to reuse after both peer completion events from
+// AR N-2 have entered the current streams.  This keeps the dependency on the
+// device and avoids blocking the CPU submission thread.
 static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 
 // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
@@ -581,21 +843,14 @@ static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) 
 struct ggml_cuda_ar_slot_info {
     int slot;
     int token;
+    bool pool_lapped;
 };
 
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
     const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
     p->call_count++;
-
-    if (pool_lapped) {
-        for (int i = 0; i < p->n_devices; ++i) {
-            ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
-        }
-    }
-
-    return { slot, (int) p->call_count };
+    return { slot, (int) p->call_count, pool_lapped };
 }
 
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
@@ -810,10 +1065,13 @@ struct ggml_cuda_mixed_ar_group {
     size_t n_ranks = 0;
     size_t data_bytes = 0;
     size_t arrival_offset = 0;
+    size_t departure_offset = 0;
     size_t trace_offset = 0;
     size_t bf16_threshold = 0;
     bool profile = false;
+    bool device_slots = false;
     bool hierarchical = false;
+    bool wire_int8 = false;
     int leader_rank = -1;
     int peer_leader_rank = -1;
     ggml_cuda_ar_pipeline * local_ar = nullptr;
@@ -840,10 +1098,12 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
         ggml_cuda_set_device(group->devices[i]);
         auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(group->backends[i]->context);
         cudaStreamSynchronize(cuda_ctx->stream());
-        for (size_t slot = 0; slot < GGML_CUDA_MIXED_AR_SLOTS; ++slot) {
-            cudaEvent_t & event = group->done[i * GGML_CUDA_MIXED_AR_SLOTS + slot];
-            if (event) {
-                cudaEventDestroy(event);
+        if (!group->device_slots) {
+            for (size_t slot = 0; slot < GGML_CUDA_MIXED_AR_SLOTS; ++slot) {
+                cudaEvent_t & event = group->done[i * GGML_CUDA_MIXED_AR_SLOTS + slot];
+                if (event) {
+                    cudaEventDestroy(event);
+                }
             }
         }
         if (i < group->profile_start.size() && group->profile_start[i]) {
@@ -866,14 +1126,21 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
 }
 
 void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * config) {
+    const size_t token_bytes = config
+        ? GGML_CUDA_MIXED_AR_SLOTS * config->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS *
+              GGML_CUDA_MIXED_AR_SIGNAL_STRIDE
+        : 0;
     if (!config || config->abi_version != GGML_CUDA_MIXED_AR_ABI_VERSION ||
         config->n_backends == 0 || config->n_ranks < 2 ||
         config->n_backends > config->n_ranks || !config->shared_host ||
         config->data_bytes > config->shared_bytes ||
         config->arrival_offset < config->data_bytes ||
+        config->arrival_offset + token_bytes > config->shared_bytes ||
+        config->departure_offset < config->arrival_offset + token_bytes ||
+        config->departure_offset + token_bytes > config->shared_bytes ||
+        config->trace_offset < config->departure_offset + token_bytes ||
         (config->profile &&
-         (config->trace_offset < config->arrival_offset ||
-          config->trace_offset + config->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS *
+         (config->trace_offset + config->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS *
               sizeof(ggml_cuda_mixed_ar_trace_record) > config->shared_bytes))) {
         return nullptr;
     }
@@ -882,10 +1149,13 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->n_ranks = config->n_ranks;
     group->data_bytes = config->data_bytes;
     group->arrival_offset = config->arrival_offset;
+    group->departure_offset = config->departure_offset;
     group->trace_offset = config->trace_offset;
     group->bf16_threshold = config->bf16_threshold;
     group->profile = config->profile;
+    group->device_slots = config->device_slots;
     group->hierarchical = config->hierarchical;
+    group->wire_int8 = config->hierarchical && ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_INT8", 0) != 0;
     group->leader_rank = config->leader_rank;
     group->peer_leader_rank = config->peer_leader_rank;
     group->shared_host = config->shared_host;
@@ -893,8 +1163,10 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->ranks.assign(config->ranks, config->ranks + config->n_backends);
     group->devices.reserve(config->n_backends);
     group->device_bases.resize(config->n_backends, nullptr);
-    group->done.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, nullptr);
-    group->done_valid.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, false);
+    if (!group->device_slots) {
+        group->done.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, nullptr);
+        group->done_valid.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, false);
+    }
     if (group->profile) {
         group->profile_start.resize(config->n_backends, nullptr);
         group->profile_local.resize(config->n_backends, nullptr);
@@ -910,6 +1182,10 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
             ggml_cuda_mixed_ar_group_free(group);
             return nullptr;
         }
+    }
+
+    if (group->wire_int8) {
+        GGML_LOG_WARN("%s: block-quantized INT8 cross-runtime wire enabled\n", __func__);
     }
 
     if (group->hierarchical && group->devices.size() == 2) {
@@ -943,13 +1219,15 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
             ggml_cuda_mixed_ar_group_free(group);
             return nullptr;
         }
-        for (size_t slot = 0; slot < GGML_CUDA_MIXED_AR_SLOTS; ++slot) {
-            cudaEvent_t & event = group->done[i * GGML_CUDA_MIXED_AR_SLOTS + slot];
-            if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
-                GGML_LOG_WARN("%s: cudaEventCreate failed on device %d\n", __func__, group->devices[i]);
-                (void) cudaGetLastError();
-                ggml_cuda_mixed_ar_group_free(group);
-                return nullptr;
+        if (!group->device_slots) {
+            for (size_t slot = 0; slot < GGML_CUDA_MIXED_AR_SLOTS; ++slot) {
+                cudaEvent_t & event = group->done[i * GGML_CUDA_MIXED_AR_SLOTS + slot];
+                if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+                    GGML_LOG_WARN("%s: cudaEventCreate failed on device %d\n", __func__, group->devices[i]);
+                    (void) cudaGetLastError();
+                    ggml_cuda_mixed_ar_group_free(group);
+                    return nullptr;
+                }
             }
         }
         if (group->profile &&
@@ -970,6 +1248,9 @@ bool ggml_cuda_mixed_ar_group_prepare(void * context, size_t slot) {
     auto * group = static_cast<ggml_cuda_mixed_ar_group *>(context);
     if (!group || slot >= GGML_CUDA_MIXED_AR_SLOTS) {
         return false;
+    }
+    if (group->device_slots) {
+        return true;
     }
     for (size_t i = 0; i < group->backends.size(); ++i) {
         const size_t index = i * GGML_CUDA_MIXED_AR_SLOTS + slot;
@@ -1006,13 +1287,17 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         void * slot_data = base + slot * group->n_ranks * GGML_CUDA_MIXED_AR_RANK_BYTES;
         int * arrival_slot = reinterpret_cast<int *>(base + group->arrival_offset +
             slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE);
+        int * departure_slot = group->device_slots
+            ? reinterpret_cast<int *>(base + group->departure_offset +
+                slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE)
+            : nullptr;
 
 #define LAUNCH_MIXED_AR(T_dst, T_wire) \
         ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
             reinterpret_cast<const T_dst *>(tensor->data), \
             reinterpret_cast<T_dst *>(tensor->data), \
             reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-            (int) ne, arrival_slot, token, contribute)
+            (int) ne, arrival_slot, departure_slot, token, contribute)
 
         if (use_bf16) {
             LAUNCH_MIXED_AR(float, nv_bfloat16);
@@ -1027,9 +1312,11 @@ bool ggml_cuda_mixed_ar_group_enqueue(
 #undef LAUNCH_MIXED_AR
 
         CUDA_CHECK(cudaGetLastError());
-        const size_t event_index = i * GGML_CUDA_MIXED_AR_SLOTS + slot;
-        CUDA_CHECK(cudaEventRecord(group->done[event_index], stream));
-        group->done_valid[event_index] = true;
+        if (!group->device_slots) {
+            const size_t event_index = i * GGML_CUDA_MIXED_AR_SLOTS + slot;
+            CUDA_CHECK(cudaEventRecord(group->done[event_index], stream));
+            group->done_valid[event_index] = true;
+        }
     }
     return true;
 }
@@ -1088,6 +1375,10 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
         void * slot_data = base + slot * group->n_ranks * GGML_CUDA_MIXED_AR_RANK_BYTES;
         int * arrival_slot = reinterpret_cast<int *>(base + group->arrival_offset +
             slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE);
+        int * departure_slot = group->device_slots
+            ? reinterpret_cast<int *>(base + group->departure_offset +
+                slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE)
+            : nullptr;
         auto * trace = group->profile
             ? reinterpret_cast<ggml_cuda_mixed_ar_trace_record *>(base + group->trace_offset)
             : nullptr;
@@ -1096,10 +1387,18 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
         ggml_cuda_mixed_ar_hier_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
             reinterpret_cast<const T_dst *>(tensor->data), \
             reinterpret_cast<T_dst *>(tensor->data), \
-            reinterpret_cast<T_wire *>(slot_data), rank, group->leader_rank, group->peer_leader_rank, \
-            rank_stride, (int) ne, arrival_slot, token, contribute, trace)
+            reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, \
+            group->leader_rank, group->peer_leader_rank, rank_stride, (int) ne, \
+            arrival_slot, departure_slot, token, contribute, trace)
 
-        if (use_bf16) {
+        if (use_bf16 && group->wire_int8 && tensor->type == GGML_TYPE_F32) {
+            ggml_cuda_mixed_ar_hier_int8_kernel<<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>(
+                reinterpret_cast<const float *>(tensor->data),
+                reinterpret_cast<float *>(tensor->data),
+                reinterpret_cast<uint8_t *>(slot_data), rank, (int) group->n_ranks,
+                group->leader_rank, group->peer_leader_rank, (int) ne,
+                arrival_slot, departure_slot, token, contribute, trace);
+        } else if (use_bf16) {
             LAUNCH_MIXED_AR_HIER(float, nv_bfloat16);
         } else {
             switch (tensor->type) {
@@ -1112,9 +1411,11 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
 #undef LAUNCH_MIXED_AR_HIER
 
         CUDA_CHECK(cudaGetLastError());
-        const size_t event_index = i * GGML_CUDA_MIXED_AR_SLOTS + slot;
-        CUDA_CHECK(cudaEventRecord(group->done[event_index], stream));
-        group->done_valid[event_index] = true;
+        if (!group->device_slots) {
+            const size_t event_index = i * GGML_CUDA_MIXED_AR_SLOTS + slot;
+            CUDA_CHECK(cudaEventRecord(group->done[event_index], stream));
+            group->done_valid[event_index] = true;
+        }
         if (group->profile) {
             CUDA_CHECK(cudaEventRecord(group->profile_done[i], stream));
         }
@@ -1290,7 +1591,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
 
         // Record dev_tmp-released on the compute stream so the next copy_impl
         // can wait for the kernel to finish before overwriting dev_tmp.  Also
-        // record AR-done as ev.ker for acquire_slot's pool-wraparound sync.
+        // Record AR-done as ev.ker for the next device-side pool-wraparound wait.
         CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
     }
@@ -1485,14 +1786,23 @@ bool ggml_cuda_ar_allreduce(
         // cross-stream event handshake that the copy-engine path needs, and
         // skips the cross-stream scheduling overhead that was hurting the
         // small-tensor (tg) latency on the AR-stream variant.  Only ev.ker is
-        // still recorded at end-of-AR for acquire_slot's pool-wraparound check.
+        // still recorded at end-of-AR for the next pool-wraparound stream wait.
         for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
             const size_t remaining_elems = (size_t) (ne - chunk_start);
             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
             const size_t chunk_dst_bytes  = chunk_elems * input_type_size;
 
-            const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+            const auto [slot, token, pool_lapped] = ggml_cuda_ar_acquire_slot(p);
             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
+
+            if (pool_lapped) {
+                for (int i = 0; i < n; ++i) {
+                    const int peer = 1 - i;
+                    ggml_cuda_set_device(p->devices[i]);
+                    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), p->ev_pool[peer][slot].ker));
+                }
+            }
 
             for (int i = 0; i < n; ++i) {
                 const int peer = 1 - i;  // valid for n == 2 only

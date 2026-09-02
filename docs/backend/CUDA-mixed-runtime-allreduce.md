@@ -18,6 +18,9 @@ The mixed implementation resolves a small group API from each backend DSO. Each 
 
 `GGML_CUDA_ALLREDUCE=mixed` enables this path.
 
+`GGML_CUDA_MIXED_AR_INT8=1` enables the optimized large-buffer wire used by
+the Q8 launch script. Set it to `0` to restore the BF16 cross-runtime wire.
+
 ## Reduction paths
 
 Small tensors use a flat mapped-host kernel. Every active rank publishes its contribution, waits for all other ranks, reads every peer contribution, and writes the sum to its local tensor.
@@ -34,6 +37,17 @@ The hierarchical path is selected at 1 MiB. The per-rank mapped staging capacity
 
 The local Blackwell pipeline currently stages large data through pinned host memory with D2H and H2D copies. It is not a direct P2P transfer. This is an important optimization target even though both devices share one CUDA runtime.
 
+The optimized large-buffer path quantizes each local runtime aggregate to
+symmetric INT8 with one FP32 scale per 4096 elements. The kernel rounds its
+local aggregate through the same representation before adding the peer, so
+all tensor-parallel ranks receive the same result. INT8 values are moved
+between mapped host memory and shared memory as aligned 16-byte vectors. This
+reduces physical cross-runtime tensor traffic by approximately one half
+relative to BF16 without issuing thousands of scalar PCIe loads.
+
+The small flat path remains unchanged. Decode therefore retains the BF16
+transport and its original latency characteristics.
+
 ## Profiling controls
 
 `GGML_CUDA_MIXED_AR_PROFILE=1` enables detailed GPU timing for large hierarchical calls. CUDA events measure the local reduction and full rank interval. The hierarchical kernel records `%globaltimer` timestamps for:
@@ -47,6 +61,13 @@ The process prints totals by rank and wire size during context destruction. This
 `GGML_CUDA_MIXED_AR_PROFILE=2` also logs every profiled call. High llama.cpp log verbosity may be needed for the per-call `INFO` lines.
 
 `GGML_CUDA_MIXED_AR_CPU_PROFILE=1` measures existing `prepare` and `enqueue` calls with `steady_clock`. It does not introduce CUDA synchronization and has negligible measured overhead. It identifies CPU blocking caused by slot reuse.
+
+`GGML_CUDA_MIXED_AR_DEVICE_SLOTS=0` restores the original CPU event wait for
+the two-slot ring. The default is `1`: kernels publish a per-rank departure
+token after consuming a slot, and a future writer waits for that token on the
+GPU before reusing the slot. This removed host-side blocking but did not by
+itself improve end-to-end prefill speed because the wait represented real GPU
+dependencies.
 
 Example:
 
@@ -105,6 +126,46 @@ Rank 0 was usually the critical rank. The V100 publication overlaps the local Bl
 
 The V100 mapped-host throughput derived from the profile was approximately 2.81 GiB/s for publication and 3.00 GiB/s for peer reads. Rank 0 reached approximately 5.95 GiB/s for publication and 6.11 GiB/s for peer reads.
 
+## INT8 wire result
+
+The final vectorized INT8 wire was compared with BF16 using the same Q8 model,
+5000-token prompt, `1,1,2` split, 4096 batch, and 2048 ubatch. After the first
+warm-up request, three consecutive runs were stable:
+
+| Cross-runtime wire | Prompt time | Prompt speed |
+| --- | ---: | ---: |
+| BF16 | 6969.4 ms average | 717.42 tokens/s |
+| INT8, scalar prototype | 6738.3 ms average | 741.88 tokens/s |
+| INT8, vectorized | 4999.3 ms average | 1000.15 tokens/s |
+
+The vectorized path improved warmed prefill throughput by 39.4 percent. Its
+first request took 5107.878 ms, or 978.88 tokens/s.
+
+Detailed profiling changes scheduling, but it exposes the phase improvement:
+
+| Critical phase | BF16 | Vectorized INT8 |
+| --- | ---: | ---: |
+| Local Blackwell reduction | 1979.513 ms | 2168.069 ms |
+| Publish aggregate | 1029.725 ms | 417.735 ms |
+| Exposed peer wait | 812.529 ms | 299.843 ms |
+| Read peer and add | 1001.588 ms | 539.752 ms |
+| Full critical AllReduce | 4824.502 ms | 3426.508 ms |
+
+The logical tensor volume is still 6245 MiB in the profiler because it reports
+the BF16 tensor size. The INT8 payload itself is approximately half that size,
+plus one FP32 scale for every 4096 values.
+
+A deterministic 4969-token prompt produced the exact same 64 generated tokens
+with BF16 and INT8. The selected first-token log probability changed from
+-0.0154033 to -0.0146416. This is a smoke test, not a substitute for a model
+quality or perplexity evaluation; use `GGML_CUDA_MIXED_AR_INT8=0` when exact
+BF16-wire behavior is required.
+
+An optional NCCL local reduction between the two Blackwell devices was also
+tested. It reduced the isolated local phase but shifted time into peer waits
+and regressed the full 5000-token prompt to 7253.207 ms in the profiled run.
+The experiment was therefore removed from the production path.
+
 ## Nsight Systems findings
 
 Nsight Systems can trace the normal Blackwell runtime, but it cannot see the redirected V100 runtime. The in-kernel records are therefore required for V100 timing.
@@ -122,13 +183,18 @@ Inside the exact prompt window, the two visible Blackwell devices were busy for 
 
 The visible CUDA runtime spent 4985.1 ms in 1552 `cudaEventSynchronize` calls inside the prompt window. Source-level CPU counters also showed about 1.02 seconds of additional waiting when the host reached the V100 runtime group. The wait time overlaps GPU work and must not be added to the GPU phase totals.
 
-The current two-slot ring waits on the CPU before a slot is reused. This prevents deep host-side submission and leaves approximately 0.68 seconds of visible GPU bubbles. Removing only these bubbles cannot reach the 1500 tokens/s target: 5000 tokens at that rate requires a total prompt time near 3.33 seconds.
+The original two-slot ring waited on the CPU before a slot was reused. This
+prevented deep host-side submission and left approximately 0.68 seconds of
+visible GPU bubbles. Moving reuse ordering to device tokens removed the CPU
+blocking, but did not materially improve BF16 throughput because the same
+dependency still had to complete on the GPU. Reaching 1500 tokens/s requires
+a total prompt time near 3.33 seconds.
 
 ## Optimization order
 
-1. Replace CPU slot-reuse synchronization with a device-side consumed-token handshake. Keep the two-slot memory footprint and make overwrite safety explicit in the kernels.
-2. Retest the local Blackwell path with true P2P or NCCL using phase markers. Compare end-to-end critical time, not only the local microbenchmark.
-3. Reduce cross-runtime wire traffic or the number of reductions per layer. This is required for a large gain after the slot bubbles are removed.
+1. Run a broader quality or perplexity evaluation for the INT8 wire before treating it as lossless.
+2. Investigate whether the local Blackwell copy path can use direct P2P without regressing overlap with the V100 runtime.
+3. Reduce the number of cross-runtime reductions per layer. Reaching 1500 tokens/s requires a total prompt time near 3.33 seconds, so transport compression alone is not sufficient.
 4. Re-run the same exact 5000-token prompt after every change. Also test token generation because the small flat path has different latency requirements.
 
 The reference Nsight report is stored outside the source tree under `llama.cpp/profiles/qwen27b-q8-3gpu-prefill-5000.nsys-rep` on the measured host.

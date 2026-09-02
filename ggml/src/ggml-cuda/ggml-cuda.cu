@@ -1023,6 +1023,7 @@ struct ggml_backend_cuda_comm_context {
     size_t                     mixed_host_bytes = 0;
     size_t                     mixed_bf16_threshold = 1;
     bool                       mixed_hierarchical = false;
+    bool                       mixed_device_slots = true;
     uint64_t                   mixed_call_count = 0;
     int                        mixed_profile_level = 0;
     bool                       mixed_cpu_profile = false;
@@ -1090,6 +1091,7 @@ struct ggml_backend_cuda_comm_context {
         mixed_host_bytes = 0;
         mixed_call_count = 0;
         mixed_hierarchical = false;
+        mixed_device_slots = true;
         mixed_profile_level = 0;
         mixed_cpu_profile = false;
         mixed_profile_critical = {};
@@ -1268,19 +1270,21 @@ static bool ggml_backend_cuda_comm_allreduce_mixed(
     }
 
     const size_t slot = comm_ctx->mixed_call_count % GGML_CUDA_MIXED_AR_SLOTS;
-    for (auto & group : comm_ctx->mixed_groups) {
-        const auto cpu_begin = comm_ctx->mixed_cpu_profile
-            ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (!group.prepare(group.context, slot)) {
-            GGML_LOG_ERROR("%s: failed waiting for mixed AllReduce slot %zu\n", __func__, slot);
-            return false;
-        }
-        if (comm_ctx->mixed_cpu_profile) {
-            const double elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - cpu_begin).count();
-            ++group.cpu_prepare_calls;
-            group.cpu_prepare_ms += elapsed_ms;
-            group.cpu_prepare_max_ms = std::max(group.cpu_prepare_max_ms, elapsed_ms);
+    if (!comm_ctx->mixed_device_slots) {
+        for (auto & group : comm_ctx->mixed_groups) {
+            const auto cpu_begin = comm_ctx->mixed_cpu_profile
+                ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (!group.prepare(group.context, slot)) {
+                GGML_LOG_ERROR("%s: failed waiting for mixed AllReduce slot %zu\n", __func__, slot);
+                return false;
+            }
+            if (comm_ctx->mixed_cpu_profile) {
+                const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cpu_begin).count();
+                ++group.cpu_prepare_calls;
+                group.cpu_prepare_ms += elapsed_ms;
+                group.cpu_prepare_max_ms = std::max(group.cpu_prepare_max_ms, elapsed_ms);
+            }
         }
     }
 
@@ -1430,13 +1434,17 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     ret->mixed_hierarchical = ranks_by_registry.size() == 2;
     ret->mixed_profile_level = (int) ggml_backend_cuda_comm_env_u64("GGML_CUDA_MIXED_AR_PROFILE", 0);
     ret->mixed_cpu_profile = ggml_backend_cuda_comm_env_u64("GGML_CUDA_MIXED_AR_CPU_PROFILE", 0) != 0;
+    ret->mixed_device_slots = ggml_backend_cuda_comm_env_u64("GGML_CUDA_MIXED_AR_DEVICE_SLOTS", 1) != 0;
 
     const size_t data_bytes = GGML_CUDA_MIXED_AR_SLOTS * n_ranks * GGML_CUDA_MIXED_AR_RANK_BYTES;
     const size_t arrival_offset = (data_bytes + GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1) &
                                   ~(GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1);
     const size_t arrival_bytes = GGML_CUDA_MIXED_AR_SLOTS * n_ranks *
                                  GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE;
-    const size_t trace_offset = (arrival_offset + arrival_bytes + GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1) &
+    const size_t departure_offset = (arrival_offset + arrival_bytes + GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1) &
+                                    ~(GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1);
+    const size_t departure_bytes = arrival_bytes;
+    const size_t trace_offset = (departure_offset + departure_bytes + GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1) &
                                 ~(GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1);
     const size_t trace_bytes = ret->mixed_profile_level > 0
         ? n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * sizeof(ggml_cuda_mixed_ar_trace_record)
@@ -1496,9 +1504,11 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             ret->mixed_host_bytes,
             data_bytes,
             arrival_offset,
+            departure_offset,
             trace_offset,
             ret->mixed_bf16_threshold,
             ret->mixed_profile_level > 0,
+            ret->mixed_device_slots,
             ret->mixed_hierarchical,
             leader_rank,
             peer_leader_rank,
@@ -1531,6 +1541,8 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     if (ret->mixed_cpu_profile) {
         GGML_LOG_WARN("%s: mixed AllReduce CPU profiling enabled\n", __func__);
     }
+    GGML_LOG_INFO("%s: mixed AllReduce slot reuse: %s\n", __func__,
+                  ret->mixed_device_slots ? "device tokens" : "CPU events");
     return true;
 }
 

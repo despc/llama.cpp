@@ -13,7 +13,7 @@ struct ggml_cuda_ar_pipeline;
 // only devices owned by a single backend registry / CUDA runtime.  Multiple
 // groups register the same ordinary host allocation and launch their local
 // ranks through function pointers resolved from their own backend DSO.
-static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 3;
+static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 4;
 static constexpr size_t   GGML_CUDA_MIXED_AR_SLOTS       = 2;
 // The tensor-parallel Qwen prefill graph reduces hidden-state buffers of
 // roughly ubatch * n_embd * sizeof(BF16).  A 1 MiB lane only covered decode
@@ -58,9 +58,11 @@ struct ggml_cuda_mixed_ar_group_config {
     size_t           shared_bytes;
     size_t           data_bytes;
     size_t           arrival_offset;
+    size_t           departure_offset;
     size_t           trace_offset;
     size_t           bf16_threshold;
     bool             profile;
+    bool             device_slots;
     bool             hierarchical;
     int              leader_rank;
     int              peer_leader_rank;
