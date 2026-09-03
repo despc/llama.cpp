@@ -1029,3 +1029,37 @@ inbound traffic saves.
 Four GPUs now stand at 1092-1123 prefill and 72.1-73.4 generation against
 1135-1150 and 66.2-66.9 on three, so the fourth card is finally worth its place
 in both phases rather than trading one against the other.
+
+### MTP for Qwen3.8-Flash-Next (2026-09-03)
+
+The model ships its own multi-token-prediction head, trained jointly with it and
+distributed as a separate GGUF. Unsloth's guide points at a dedicated llama.cpp
+branch for it; that turned out to be unnecessary. The upstream merge of
+2026-09-02 already brought the support into this fork -- `load_mtp`,
+`borrow_shared_tensor` and the draft-only export path are all present, and
+cherry-picking the branch's first commits came back empty or conflicted only
+where our tree was already ahead.
+
+What the model needs is placement and depth, not code:
+
+- The draft costs about 1.9 GB and, without `--spec-draft-device`, lands on
+  CUDA1 where it fails to allocate. It goes on the second Tesla, which has the
+  headroom.
+- Depth matters far more than the guide suggests. Every drafted token costs a
+  full set of barriers across four ranks, so acceptance falls off fast:
+  `n_max` 1 gives 78.9 percent acceptance and 57.3-65.3 tokens/s, 2 gives 52.4
+  percent and 53.0-60.6, 3 gives 44.7 percent and 49.5, and the guide's 5 gives
+  27.2 percent and 47.4 -- barely above no speculation at all.
+- The draft's share of the CUDA pool during a large prefill is what caps the
+  context: 49152 works, 65536 loads and then dies in the pool at top-k inside
+  the MoE router.
+
+At 49152 context, against the same configuration without the draft:
+
+| | With MTP | Without |
+| --- | ---: | ---: |
+| Prefill | 566-600 tok/s | 607-642 tok/s |
+| Generation | 58.1-64.9 tok/s | 44.8-48.1 tok/s |
+
+Generation gains 35 percent for 6 percent of prefill. The script without the
+draft remains the one to use when context matters: it reaches 98304 tokens.
