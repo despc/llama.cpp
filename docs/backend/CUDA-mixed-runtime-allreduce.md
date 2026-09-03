@@ -930,3 +930,43 @@ model. Transport work now has a much smaller ceiling than device throughput.
    generation because the small flat path has different latency requirements.
 
 The reference Nsight report is stored outside the source tree under `llama.cpp/profiles/qwen27b-q8-3gpu-prefill-5000.nsys-rep` on the measured host.
+
+### Flat publication for the slow group (2026-09-03)
+
+With a second V100 the topology becomes 2+2, and the hierarchical scheme costs
+the Tesla side dearly. Reducing a pair locally means each rank publishes its
+contribution and reads its partner's before anything crosses, so a Tesla moves
+4N over its Gen3 x4 link where a single Tesla moved 2N. The profile showed it
+exactly: on the 5000-token prompt the Tesla leader's productive time went from
+1691.6 ms with one card to 3071.4 ms with two, and the Blackwell ranks' exposed
+wait grew from 2029.1 to 2635.8 ms. The compute saving from halving each
+Tesla's share was spent on transport twice over.
+
+`GGML_CUDA_MIXED_AR_FLAT_GROUP=1` makes the group that does not hold global
+rank 0 publish flat: every rank writes its own contribution into its own cross
+slot and skips the local exchange entirely. Each rank then folds in two
+cross-runtime payloads instead of one -- the aggregating group reads both
+Teslas, and each Tesla reads the Blackwell aggregate plus its partner. The fast
+side absorbs the extra read on its far wider links.
+
+Striped path, 1024 calls, 6255 MiB of logical wire:
+
+| Rank | Hierarchical | Flat group |
+| --- | ---: | ---: |
+| 0, RTX 5080, total | 3837.3 ms | 2758.4 ms |
+| 0, exposed wait | 2635.8 ms | 1390.8 ms |
+| 1, RTX 5070 Ti, total | 3708.6 ms | 2633.2 ms |
+| 2, V100 SXM2, own work | 3071.4 ms | 2444.6 ms |
+| 3, V100 PCIe, own work | 2115.5 ms | 2265.5 ms |
+
+The critical AllReduce path falls 28 percent and prefill goes from 936-960 to
+974-1000 tokens/s. Generation does not move: at 10 KiB its collectives are far
+below the 1 MiB threshold and run on the flat small path, which still reduces
+the pair. Converting that path the same way is the obvious next step and is
+worth roughly one publish step per collective on the Tesla leader.
+
+Two mistakes were made getting here and both hung the large collectives until
+fixed: the progress word must be indexed by the publisher's own rank in flat
+mode rather than by its group leader, and the mode must be selected from
+`config->n_backends` rather than `group->backends.size()`, which is still empty
+at that point in the init function.

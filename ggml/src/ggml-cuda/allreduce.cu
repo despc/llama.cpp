@@ -1443,6 +1443,13 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         int                         n_ranks,
         int                         leader_rank,
         int                         peer_leader_rank,
+        // Second cross-runtime source, or -1.  When the other runtime group
+        // publishes flat -- every rank into its own slot instead of one
+        // aggregate -- each rank has two payloads to fold in rather than one.
+        int                         cross_extra_rank,
+        // This rank publishes its own contribution straight to the cross buffer
+        // and skips the local exchange entirely.
+        bool                        flat_publish,
         int                         count,
         int *                       cross_arrival,
         int *                       departure_slot,
@@ -1475,10 +1482,14 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
     const int n_steps = (stripe_len + chunk - 1) / chunk;
     const size_t scale_offset = ((size_t) count + 15) & ~(size_t) 15;
     const bool is_leader = rank == leader_rank;
-    uint8_t * cross_mine_base = cross_slot_data + (size_t) leader_rank * GGML_CUDA_MIXED_AR_RANK_BYTES;
+    // A flat publisher owns its own cross slot; an aggregating group publishes
+    // through its leader's.
+    uint8_t * cross_mine_base = cross_slot_data +
+        (size_t) (flat_publish ? rank : leader_rank) * GGML_CUDA_MIXED_AR_RANK_BYTES;
     const uint8_t * cross_peer_base = cross_slot_data +
         (size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_RANK_BYTES;
-    uint8_t * first_publish_base = has_local_peer ? local_mine_base : cross_mine_base;
+    const bool local_stage = has_local_peer && !flat_publish;
+    uint8_t * first_publish_base = local_stage ? local_mine_base : cross_mine_base;
     int8_t * first_values = reinterpret_cast<int8_t *>(first_publish_base);
     float * first_scales = reinterpret_cast<float *>(first_publish_base + scale_offset);
     const int8_t * local_peer_values = has_local_peer
@@ -1489,13 +1500,27 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
     float * cross_mine_scales = reinterpret_cast<float *>(cross_mine_base + scale_offset);
     const int8_t * cross_peer_values = reinterpret_cast<const int8_t *>(cross_peer_base);
     const float * cross_peer_scales = reinterpret_cast<const float *>(cross_peer_base + scale_offset);
+    const uint8_t * cross_extra_base = cross_extra_rank >= 0
+        ? cross_slot_data + (size_t) cross_extra_rank * GGML_CUDA_MIXED_AR_RANK_BYTES : nullptr;
+    const int8_t * cross_extra_values = cross_extra_base
+        ? reinterpret_cast<const int8_t *>(cross_extra_base) : nullptr;
+    const float * cross_extra_scales = cross_extra_base
+        ? reinterpret_cast<const float *>(cross_extra_base + scale_offset) : nullptr;
 
+    // Must follow cross_mine_base: a flat publisher announces its own slot, an
+    // aggregating group announces its leader's.  Indexing this by the leader in
+    // flat mode would leave the second publisher's word untouched forever.
     unsigned long long * cross_progress_mine = reinterpret_cast<unsigned long long *>(
-        cross_arrival + ((size_t) leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS +
-        GGML_CUDA_AR_PROGRESS_OFFSET_INTS);
+        cross_arrival + ((size_t) (flat_publish ? rank : leader_rank) * GGML_CUDA_MIXED_AR_BLOCKS + bid) *
+        SIGNAL_INTS + GGML_CUDA_AR_PROGRESS_OFFSET_INTS);
     const unsigned long long * cross_progress_peer = reinterpret_cast<const unsigned long long *>(
         cross_arrival + ((size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS +
         GGML_CUDA_AR_PROGRESS_OFFSET_INTS);
+    const unsigned long long * cross_progress_extra = cross_extra_rank >= 0
+        ? reinterpret_cast<const unsigned long long *>(
+            cross_arrival + ((size_t) cross_extra_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS +
+            GGML_CUDA_AR_PROGRESS_OFFSET_INTS)
+        : nullptr;
     unsigned long long * local_progress_mine = has_local_peer
         ? reinterpret_cast<unsigned long long *>(
             local_arrival_mine + bid * LOCAL_SIGNAL_INTS + GGML_CUDA_AR_PROGRESS_OFFSET_INTS)
@@ -1806,10 +1831,10 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         __syncthreads();
         if (tid == 0) {
             ggml_cuda_ar_progress_set(
-                has_local_peer ? local_progress_mine : cross_progress_mine, token, step + 1);
+                local_stage ? local_progress_mine : cross_progress_mine, token, step + 1);
             __threadfence_system();
         }
-        if (has_local_peer) {
+        if (local_stage) {
             GGML_CUDA_AR_STREAM_LOCAL_DRAIN(step + 1)
         } else {
             agg_step = step + 1;
@@ -1819,8 +1844,9 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
     GGML_CUDA_AR_STREAM_MARK(work_ns)
 
     // Phase 2: block for the local chunks the drain has not taken yet, still
-    // folding in cross-runtime chunks whenever they show up.
-    if (has_local_peer) {
+    // folding in cross-runtime chunks whenever they show up.  A flat publisher
+    // has no local stage at all.
+    if (local_stage) {
         for (; agg_step < n_steps; ++agg_step) {
             if (tid == 0) {
                 while (ggml_cuda_ar_progress_get(local_progress_peer, token) < agg_step + 1) {
@@ -1858,6 +1884,56 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
 
         GGML_CUDA_AR_STREAM_CONSUME(read_step)
         GGML_CUDA_AR_STREAM_MARK(work_ns)
+    }
+
+    // Phase 4: the second cross-runtime payload, present only when the other
+    // group publishes flat.  It was written in parallel with the first, so by
+    // now it is usually already there; this loop just drains it in order.
+    if (cross_extra_rank >= 0) {
+        for (int step = 0; step < n_steps; ++step) {
+            if (tid == 0) {
+                while (ggml_cuda_ar_progress_get(cross_progress_extra, token) < step + 1) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+            }
+            __syncthreads();
+            __threadfence_system();
+            GGML_CUDA_AR_STREAM_MARK(wait_ns)
+
+            const int first = step * chunk;
+            const int last = min(first + chunk, stripe_len);
+            for (int j = first; j < last; ++j) {
+                const int qb = bid + j * (int) gridDim.x;
+                const int block_start = qb * QK;
+                const int local_offset = tid * 16;
+                const int vector_index = block_start + local_offset;
+                if (tid < GROUPS) {
+                    group_scale[tid] = cross_extra_scales[qb * GROUPS + tid];
+                }
+                if (vector_index + 16 <= count) {
+                    ggml_cuda_memcpy_1<16>(&block_values[local_offset], &cross_extra_values[vector_index]);
+                } else {
+                    for (int m = 0; m < 16 && vector_index + m < count; ++m) {
+                        block_values[local_offset + m] = cross_extra_values[vector_index + m];
+                    }
+                }
+                __syncthreads();
+#pragma unroll
+                for (int m = 0; m < VALUES_PER_THREAD; ++m) {
+                    const int index = block_start + m * blockDim.x + tid;
+                    if (index < count) {
+                        recvbuf[index] += (float) block_values[m * blockDim.x + tid] *
+                            group_scale[m / VPT_PER_GROUP];
+                    }
+                }
+                __syncthreads();
+            }
+            GGML_CUDA_AR_STREAM_MARK(work_ns)
+        }
     }
 
     if (departure_slot || trace) {
@@ -2296,6 +2372,11 @@ struct ggml_cuda_mixed_ar_group {
     bool stream_duplex = true;
     bool stream_local_duplex = true;
     bool flat_2stage = false;
+    bool flat_group = false;
+    // Set on the aggregating group when the other one publishes flat: it then
+    // has a second cross payload to read, named here.
+    bool peer_flat = false;
+    int peer_extra_rank = -1;
     int stream_chunk = 1;
     // Blocks the most recent launch used, so the collector only reads records
     // that call actually wrote.  The flat and striped paths differ.
@@ -2410,6 +2491,16 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     // The two-stage path only means anything when at least one runtime group is
     // a pair that can reduce itself; with one rank on each side there is no
     // aggregate to republish and both sides would wait for a signal nobody sets.
+    // Flat publication for the group that does not hold global rank 0, i.e. the
+    // one sitting behind the slower links.  Reducing a pair locally costs that
+    // group 2N on its own links before anything crosses; publishing both
+    // contributions directly costs N and lets the fast side read one payload
+    // more, which its wider links absorb.  Only meaningful for a pair.
+    // config->n_backends, not group->backends: the vector is filled further down
+    // in this function and is still empty here.
+    group->flat_group = group->hierarchical && config->n_backends == 2 &&
+        config->leader_rank != 0 &&
+        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_GROUP", 0) != 0;
     group->flat_2stage = group->hierarchical &&
         (config->n_backends == 2 || config->n_ranks - config->n_backends == 2) &&
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_2STAGE", 0) != 0;
@@ -2449,6 +2540,29 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     }
     if (group->flat_2stage) {
         GGML_LOG_WARN("%s: two-stage flat small path enabled\n", __func__);
+    }
+    if (group->flat_group) {
+        GGML_LOG_WARN("%s: flat cross-runtime publication for this group\n", __func__);
+    }
+    // The mirror of the flag above, seen from the aggregating group: work out
+    // which second rank of the other group it will have to read.
+    if (group->hierarchical && config->leader_rank == 0 &&
+        config->n_ranks - config->n_backends == 2 &&
+        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_GROUP", 0) != 0) {
+        for (size_t r = 0; r < config->n_ranks; ++r) {
+            bool mine = false;
+            for (size_t j = 0; j < config->n_backends; ++j) {
+                mine = mine || config->ranks[j] == (int) r;
+            }
+            if (!mine && (int) r != config->peer_leader_rank) {
+                group->peer_extra_rank = (int) r;
+                group->peer_flat = true;
+            }
+        }
+        if (group->peer_flat) {
+            GGML_LOG_WARN("%s: other group publishes flat, second source is rank %d\n",
+                          __func__, group->peer_extra_rank);
+        }
     }
     if (group->stream_int8) {
         GGML_LOG_WARN("%s: chunked streaming publication enabled (%d qblocks per step, duplex %s, local duplex %s)\n",
@@ -2700,6 +2814,13 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
 
         if (fused_int8 && tensor->type == GGML_TYPE_F32) {
             const bool has_local_peer = group->backends.size() > 1;
+            // Flat publication: my own group's partner contribution is the
+            // extra source; for the aggregating side it is the other group's
+            // second rank.
+            const bool flat_publish = group->flat_group;
+            const int cross_extra_rank = flat_publish
+                ? group->ranks[1 - i]
+                : (group->peer_flat ? group->peer_extra_rank : -1);
             uint8_t * local_mine = nullptr;
             const uint8_t * local_peer = nullptr;
             int * local_arrival_mine = nullptr;
@@ -2720,6 +2841,7 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
                     reinterpret_cast<float *>(tensor->data), \
                     reinterpret_cast<uint8_t *>(slot_data), local_mine, local_peer, \
                     rank, (int) group->n_ranks, group->leader_rank, group->peer_leader_rank, \
+                    cross_extra_rank, flat_publish, \
                     (int) ne, arrival_slot, departure_slot, local_arrival_mine, \
                     local_arrival_peer, token, group->stream_chunk, group->stream_duplex, \
                     contribute, has_local_peer, trace)
