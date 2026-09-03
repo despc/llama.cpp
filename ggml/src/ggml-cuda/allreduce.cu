@@ -263,7 +263,14 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
         int                         leader_rank,
         int                         peer_leader_rank,
         int                         local_peer_rank,
-        bool                        peer_has_pair,
+        // The other group publishes one aggregate (a pair that reduces itself)
+        // rather than raw contributions.
+        bool                        peer_aggregates,
+        // Second cross source: my partner when I publish flat, the other
+        // group's second rank when it does.  -1 when there is none.
+        int                         cross_extra_rank,
+        // I publish my own contribution and skip the pair reduction entirely.
+        bool                        flat_publish,
         size_t                      rank_stride,
         int                         count,
         int *                       arrival_slot,
@@ -282,6 +289,9 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
     const int count_vec = count / ELEMS_PER_VEC;
     const int tail = count_vec * ELEMS_PER_VEC;
     const bool has_local_peer = local_peer_rank >= 0;
+    // Whether this rank builds a pair sum locally.  A flat publisher does not,
+    // so its own value still has to come from sendbuf at the end.
+    const bool local_sum = has_local_peer && !flat_publish;
     const bool is_leader = rank == leader_rank;
     const size_t agg_elems = GGML_CUDA_MIXED_AR_FLAT_AGG_OFFSET / sizeof(T_wire);
 
@@ -289,18 +299,16 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
     // leader_rank names this group's own leader, so the two-rank runtime writes
     // the aggregate into its leader's region while the single-rank runtime
     // reads it from the other group's leader.
-    const int agg_owner = has_local_peer ? leader_rank : peer_leader_rank;
+    const int agg_owner = local_sum ? leader_rank : peer_leader_rank;
     T_wire * host_agg  = slot_data + (size_t) agg_owner * rank_stride + agg_elems;
-    const T_wire * host_local = has_local_peer
+    const T_wire * host_local = local_sum
         ? slot_data + (size_t) local_peer_rank * rank_stride : nullptr;
-    // What the other runtime leaves for us depends on whether it is a pair: a
-    // pair republishes one aggregate in the upper half of its leader's region,
-    // a single rank only ever writes its own contribution in the lower half.
-    // Reading the lower half of a pair's leader would silently drop the second
-    // rank's contribution.
-    const T_wire * host_cross = has_local_peer
-        ? slot_data + (size_t) peer_leader_rank * rank_stride + (peer_has_pair ? agg_elems : 0)
-        : nullptr;
+    // The other group's payload: its aggregate when it reduces itself, its
+    // leader's own contribution when it publishes flat.
+    const T_wire * host_primary = slot_data + (size_t) peer_leader_rank * rank_stride +
+        (peer_aggregates ? agg_elems : 0);
+    const T_wire * host_extra = cross_extra_rank >= 0
+        ? slot_data + (size_t) cross_extra_rank * rank_stride : nullptr;
 
     int * my_signal = arrival_slot + ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
 
@@ -352,9 +360,9 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
         __threadfence_system();
     }
 
-    if (has_local_peer) {
+    if (local_sum) {
         // Stage 2: sum the local pair, and let the leader republish that sum
-        // once for the other runtime.
+        // once for the other runtime.  A flat publisher skips all of this.
         if (tid == 0) {
             const int * peer_signal = arrival_slot +
                 ((size_t) local_peer_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
@@ -411,13 +419,12 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
     // the single-rank runtime adds the pair's aggregate to its own value.
     if (tid == 0) {
         // Wait for whichever word the other runtime actually publishes: its
-        // aggregate signal when it is a pair, its plain arrival otherwise.
+        // aggregate signal when it reduces itself, its plain arrival when it
+        // publishes flat.  Then, if there is a second source, wait for that
+        // rank's plain arrival too.
         const int * peer_line = arrival_slot +
             ((size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
-        const int * wait_signal = has_local_peer
-            ? (peer_has_pair ? peer_line + AGG_SIGNAL_INTS : peer_line)
-            : arrival_slot + ((size_t) agg_owner * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS
-                  + AGG_SIGNAL_INTS;
+        const int * wait_signal = peer_aggregates ? peer_line + AGG_SIGNAL_INTS : peer_line;
         while (ggml_cuda_ar_signal_get(wait_signal) != token) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(100);
@@ -425,32 +432,55 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
             NO_DEVICE_CODE;
 #endif
         }
+        if (cross_extra_rank >= 0) {
+            const int * extra_line = arrival_slot +
+                ((size_t) cross_extra_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+            while (ggml_cuda_ar_signal_get(extra_line) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(100);
+#else
+                NO_DEVICE_CODE;
+#endif
+            }
+        }
     }
     __syncthreads();
     __threadfence_system();
     peer_ready_ns = ggml_cuda_ar_globaltimer_ns();
 
     {
-        const T_wire * src = has_local_peer ? host_cross : host_agg;
+        const T_wire * src = host_primary;
         for (int i = gtid; i < count_vec; i += gnt) {
             const int off = i * ELEMS_PER_VEC;
             T_wire other[ELEMS_PER_VEC];
             ggml_cuda_memcpy_1<sizeof(other)>(other, &src[off]);
+            T_wire extra[ELEMS_PER_VEC];
+            if (host_extra) {
+                ggml_cuda_memcpy_1<sizeof(extra)>(extra, &host_extra[off]);
+            }
 #pragma unroll
             for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                const float base = has_local_peer
+                const float base = local_sum
                     ? ggml_cuda_cast<float>(recvbuf[off + k])
                     : ggml_cuda_cast<float>(contribute ? ggml_cuda_cast<T_wire>(sendbuf[off + k])
                                                        : ggml_cuda_cast<T_wire>(0.0f));
-                recvbuf[off + k] = ggml_cuda_cast<T_dst>(base + ggml_cuda_cast<float>(other[k]));
+                float sum = base + ggml_cuda_cast<float>(other[k]);
+                if (host_extra) {
+                    sum += ggml_cuda_cast<float>(extra[k]);
+                }
+                recvbuf[off + k] = ggml_cuda_cast<T_dst>(sum);
             }
         }
         if (bid == 0 && tid < count - tail) {
-            const float base = has_local_peer
+            const float base = local_sum
                 ? ggml_cuda_cast<float>(recvbuf[tail + tid])
                 : ggml_cuda_cast<float>(contribute ? ggml_cuda_cast<T_wire>(sendbuf[tail + tid])
                                                    : ggml_cuda_cast<T_wire>(0.0f));
-            recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(base + ggml_cuda_cast<float>(src[tail + tid]));
+            float sum = base + ggml_cuda_cast<float>(src[tail + tid]);
+            if (host_extra) {
+                sum += ggml_cuda_cast<float>(host_extra[tail + tid]);
+            }
+            recvbuf[tail + tid] = ggml_cuda_cast<T_dst>(sum);
         }
     }
 
@@ -2695,7 +2725,14 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             ? group->ranks[1 - i] : -1;
         // The other runtime group's size follows from the totals; a pair there
         // means it republishes an aggregate rather than a raw contribution.
-        const bool peer_has_pair = group->n_ranks - group->backends.size() == 2;
+        // The other group publishes an aggregate only if it is a pair that
+        // actually reduces itself; a flat pair publishes raw contributions.
+        const bool peer_aggregates =
+            group->n_ranks - group->backends.size() == 2 && !group->peer_flat;
+        const bool flat_publish = group->flat_group;
+        const int cross_extra_rank = flat_publish
+            ? group->ranks[1 - i]
+            : (group->peer_flat ? group->peer_extra_rank : -1);
 
 #define LAUNCH_MIXED_AR(T_dst, T_wire) \
         if (group->flat_2stage) { \
@@ -2703,8 +2740,8 @@ bool ggml_cuda_mixed_ar_group_enqueue(
                 reinterpret_cast<const T_dst *>(tensor->data), \
                 reinterpret_cast<T_dst *>(tensor->data), \
                 reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, \
-                group->leader_rank, group->peer_leader_rank, local_peer_rank, peer_has_pair, \
-                rank_stride, \
+                group->leader_rank, group->peer_leader_rank, local_peer_rank, peer_aggregates, \
+                cross_extra_rank, flat_publish, rank_stride, \
                 (int) ne, arrival_slot, departure_slot, token, contribute, trace); \
         } else { \
             ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_FLAT_BLOCKS), dim3(256), 0, stream>>>( \

@@ -970,3 +970,32 @@ fixed: the progress word must be indexed by the publisher's own rank in flat
 mode rather than by its group leader, and the mode must be selected from
 `config->n_backends` rather than `group->backends.size()`, which is still empty
 at that point in the init function.
+
+### Flat publication on the small path, and the unequal Tesla pair
+
+Generation runs entirely on the flat small path, so converting only the striped
+kernel left it untouched. Giving the small path the same treatment -- each rank
+of the flat group publishes its own contribution and every rank folds in two
+cross payloads instead of one -- is worth 5 percent: generation goes from 70.2
+to 72.4-74.2 tokens/s with prefill unchanged at 962-990.
+
+The decode profile also showed that the two Teslas are not interchangeable.
+Per 128 tokens on four GPUs, the V100 PCIe card did 286 ms of its own work and
+waited only 241 ms, while the SXM2 card did 232 ms and waited 592 ms: the PCIe
+card, on a 250 W limit against the SXM2's 300 W, is the one everybody waits
+for. Shifting share away from it pays:
+
+| Tensor split | Generation | Prefill |
+| --- | ---: | ---: |
+| 1.1,1.1,0.9,0.9 | 68.5 tok/s | 998 tok/s |
+| 1.1,1.1,1.0,0.8 | 69.5 tok/s | 972 tok/s |
+| **1.2,1.1,0.95,0.75** | **70.2 tok/s** | **989 tok/s** |
+| 1.25,1.1,0.95,0.7 | 70.1 tok/s | 984 tok/s |
+| 1.2,1.1,1.2,0.6 | 66.9 tok/s | 931 tok/s |
+
+The 5080 also takes more than the 5070 Ti, simply because it had VRAM left at
+the previous setting; 1.3 there fails a 756 MiB allocation.
+
+Together with the striped-path change, four GPUs now run generation at
+72.4-74.2 tokens/s against 66.7-66.9 on three, with prefill at 962-990 against
+1136-1150. Three GPUs remain the better choice for prompt-heavy work.
