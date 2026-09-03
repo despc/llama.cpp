@@ -263,6 +263,7 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
         int                         leader_rank,
         int                         peer_leader_rank,
         int                         local_peer_rank,
+        bool                        peer_has_pair,
         size_t                      rank_stride,
         int                         count,
         int *                       arrival_slot,
@@ -292,8 +293,14 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
     T_wire * host_agg  = slot_data + (size_t) agg_owner * rank_stride + agg_elems;
     const T_wire * host_local = has_local_peer
         ? slot_data + (size_t) local_peer_rank * rank_stride : nullptr;
+    // What the other runtime leaves for us depends on whether it is a pair: a
+    // pair republishes one aggregate in the upper half of its leader's region,
+    // a single rank only ever writes its own contribution in the lower half.
+    // Reading the lower half of a pair's leader would silently drop the second
+    // rank's contribution.
     const T_wire * host_cross = has_local_peer
-        ? slot_data + (size_t) peer_leader_rank * rank_stride : nullptr;
+        ? slot_data + (size_t) peer_leader_rank * rank_stride + (peer_has_pair ? agg_elems : 0)
+        : nullptr;
 
     int * my_signal = arrival_slot + ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
 
@@ -403,8 +410,12 @@ static __global__ void ggml_cuda_mixed_ar_flat_2stage_kernel(
     // single-rank runtime's contribution to the pair sum already in recvbuf;
     // the single-rank runtime adds the pair's aggregate to its own value.
     if (tid == 0) {
+        // Wait for whichever word the other runtime actually publishes: its
+        // aggregate signal when it is a pair, its plain arrival otherwise.
+        const int * peer_line = arrival_slot +
+            ((size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
         const int * wait_signal = has_local_peer
-            ? arrival_slot + ((size_t) peer_leader_rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS
+            ? (peer_has_pair ? peer_line + AGG_SIGNAL_INTS : peer_line)
             : arrival_slot + ((size_t) agg_owner * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS
                   + AGG_SIGNAL_INTS;
         while (ggml_cuda_ar_signal_get(wait_signal) != token) {
@@ -2396,7 +2407,11 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_LOCAL_DUPLEX", 0) != 0;
     // Two-stage small path: the local pair sums itself and publishes one
     // aggregate, halving what the single-rank runtime reads per collective.
+    // The two-stage path only means anything when at least one runtime group is
+    // a pair that can reduce itself; with one rank on each side there is no
+    // aggregate to republish and both sides would wait for a signal nobody sets.
     group->flat_2stage = group->hierarchical &&
+        (config->n_backends == 2 || config->n_ranks - config->n_backends == 2) &&
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_2STAGE", 0) != 0;
     group->leader_rank = config->leader_rank;
     group->peer_leader_rank = config->peer_leader_rank;
@@ -2564,6 +2579,9 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         // single-rank side, which takes the aggregate instead.
         const int local_peer_rank = group->flat_2stage && group->backends.size() == 2
             ? group->ranks[1 - i] : -1;
+        // The other runtime group's size follows from the totals; a pair there
+        // means it republishes an aggregate rather than a raw contribution.
+        const bool peer_has_pair = group->n_ranks - group->backends.size() == 2;
 
 #define LAUNCH_MIXED_AR(T_dst, T_wire) \
         if (group->flat_2stage) { \
@@ -2571,7 +2589,8 @@ bool ggml_cuda_mixed_ar_group_enqueue(
                 reinterpret_cast<const T_dst *>(tensor->data), \
                 reinterpret_cast<T_dst *>(tensor->data), \
                 reinterpret_cast<T_wire *>(slot_data), rank, (int) group->n_ranks, \
-                group->leader_rank, group->peer_leader_rank, local_peer_rank, rank_stride, \
+                group->leader_rank, group->peer_leader_rank, local_peer_rank, peer_has_pair, \
+                rank_stride, \
                 (int) ne, arrival_slot, departure_slot, token, contribute, trace); \
         } else { \
             ggml_cuda_mixed_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_MIXED_AR_FLAT_BLOCKS), dim3(256), 0, stream>>>( \
