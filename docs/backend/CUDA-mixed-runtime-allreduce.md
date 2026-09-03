@@ -1063,3 +1063,40 @@ At 49152 context, against the same configuration without the draft:
 
 Generation gains 35 percent for 6 percent of prefill. The script without the
 draft remains the one to use when context matters: it reaches 98304 tokens.
+
+### Long context for Qwen3.8-Flash-Next, and why -ncmoe is the wrong lever
+
+The deployment needs at least 160072 tokens. The obvious route is `-ncmoe`,
+pushing expert layers to the CPU to free VRAM, and it is the wrong one: every
+offloaded layer then runs its MoE on the CPU, which costs far more than the
+memory it frees.
+
+What actually grows with context is the compute buffer, not the KV cache. The
+sparse attention indexer sorts 2048 candidates against the whole cache, so per
+device it is about 1.5 GiB at 49152 tokens, 2.4 at 160072 and 3.9 at 262144.
+The KV cache is almost incidental by comparison: only 12 of the 48 layers are
+full attention, the rest are recurrent, so at 160072 it is 1995 MiB for the
+main cache plus 748 MiB for the indexer against 8873 MiB of compute buffers.
+The 26.8 GiB per-layer-embedding table never enters VRAM at all.
+
+So the lever is the ubatch, with every expert kept on the GPU. Measured at
+160072 tokens on UD-Q4_K_XL with the MTP draft:
+
+| n_cpu_moe | Ubatch | Prefill | Generation |
+| ---: | ---: | ---: | ---: |
+| 10 | 1024 | 354 tok/s | 42.7 tok/s |
+| 2 | 512 | 386 tok/s | 52.0 tok/s |
+| 0 | 512 | 469 tok/s | 62.1 tok/s |
+| **0** | **640** | **497-505 tok/s** | **64.7-64.8 tok/s** |
+| 0 | 704 | loads, dies on a 5000-token prompt | |
+
+Keeping the experts resident and paying with a smaller ubatch is worth 42
+percent of prefill and 52 percent of generation over the offload route.
+
+For the full 262144 context there is a second quant. UD-IQ4_XS puts 60.4 GiB
+in VRAM against 76.9 for UD-Q4_K_XL, and 16.5 GiB is almost exactly what the
+extra 100k tokens cost. It runs the architecture's maximum context at 523
+tokens/s prefill and 64.1 generation -- 4 percent of prefill against the
+Q4_K_XL script at 160072, and nothing measurable in generation. The same MTP
+draft head serves both: it carries no embeddings and borrows them from whatever
+target it is loaded against.
