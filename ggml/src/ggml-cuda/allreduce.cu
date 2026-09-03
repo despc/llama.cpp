@@ -1480,6 +1480,11 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         // This rank publishes its own contribution straight to the cross buffer
         // and skips the local exchange entirely.
         bool                        flat_publish,
+        // The aggregating group finishes the whole sum and republishes it, so
+        // the flat group reads one payload instead of two.  Halves what the
+        // slow links carry inbound, at the cost of one extra publish on the
+        // fast side; only worthwhile because both are streamed per chunk.
+        bool                        republish_total,
         int                         count,
         int *                       cross_arrival,
         int *                       departure_slot,
@@ -1647,7 +1652,7 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
     // instead of queueing behind all of it.  PCIe is full duplex; publishing
     // everything before reading anything left one direction idle.
 #define GGML_CUDA_AR_STREAM_DRAIN(published_steps)                                                  \
-    if (duplex && read_step < (published_steps)) {                                                  \
+    if (duplex && !republish_total && read_step < (published_steps)) {                              \
         if (tid == 0) {                                                                             \
             peer_ready = ggml_cuda_ar_progress_get(cross_progress_peer, token);                     \
         }                                                                                           \
@@ -1897,6 +1902,202 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
         }
     }
 
+    // Fold one chunk of the second cross source into recvbuf.
+#define GGML_CUDA_AR_STREAM_CONSUME_EXTRA(chunk_step)                                               \
+    {                                                                                               \
+        const int xf = (chunk_step) * chunk;                                                        \
+        const int xl = min(xf + chunk, stripe_len);                                                 \
+        for (int j = xf; j < xl; ++j) {                                                             \
+            const int qb = bid + j * (int) gridDim.x;                                               \
+            const int block_start = qb * QK;                                                        \
+            const int local_offset = tid * 16;                                                      \
+            const int vector_index = block_start + local_offset;                                    \
+            if (tid < GROUPS) {                                                                     \
+                group_scale[tid] = cross_extra_scales[qb * GROUPS + tid];                           \
+            }                                                                                       \
+            if (vector_index + 16 <= count) {                                                       \
+                ggml_cuda_memcpy_1<16>(&block_values[local_offset], &cross_extra_values[vector_index]); \
+            } else {                                                                                \
+                for (int m = 0; m < 16 && vector_index + m < count; ++m) {                          \
+                    block_values[local_offset + m] = cross_extra_values[vector_index + m];          \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            _Pragma("unroll")                                                                       \
+            for (int m = 0; m < VALUES_PER_THREAD; ++m) {                                           \
+                const int index = block_start + m * blockDim.x + tid;                               \
+                if (index < count) {                                                                \
+                    recvbuf[index] += (float) block_values[m * blockDim.x + tid] *                  \
+                        group_scale[m / VPT_PER_GROUP];                                             \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+        }                                                                                           \
+    }
+
+    // Round the finished total through the wire representation -- every rank of
+    // this group does it so they stay identical -- and let the leader hand it
+    // back to the other runtime.
+#define GGML_CUDA_AR_STREAM_PUBLISH_TOTAL(chunk_step)                                               \
+    {                                                                                               \
+        const int pf = (chunk_step) * chunk;                                                        \
+        const int pl = min(pf + chunk, stripe_len);                                                 \
+        for (int j = pf; j < pl; ++j) {                                                             \
+            const int qb = bid + j * (int) gridDim.x;                                               \
+            const int block_start = qb * QK;                                                        \
+            const int local_offset = tid * 16;                                                      \
+            const int vector_index = block_start + local_offset;                                    \
+            float tot_max[GROUPS];                                                                  \
+            _Pragma("unroll")                                                                       \
+            for (int g = 0; g < GROUPS; ++g) { tot_max[g] = 0.0f; }                                 \
+            _Pragma("unroll")                                                                       \
+            for (int m = 0; m < VALUES_PER_THREAD; ++m) {                                           \
+                const int index = block_start + m * blockDim.x + tid;                               \
+                const float v = index < count ? recvbuf[index] : 0.0f;                              \
+                tot_max[m / VPT_PER_GROUP] = fmaxf(tot_max[m / VPT_PER_GROUP], fabsf(v));           \
+            }                                                                                       \
+            _Pragma("unroll")                                                                       \
+            for (int g = 0; g < GROUPS; ++g) {                                                      \
+                _Pragma("unroll")                                                                   \
+                for (int offset = 16; offset > 0; offset >>= 1) {                                   \
+                    tot_max[g] = fmaxf(tot_max[g], __shfl_down_sync(0xffffffff, tot_max[g], offset)); \
+                }                                                                                   \
+                if (lane == 0) { warp_max[g][warp] = tot_max[g]; }                                  \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            if (warp == 0) {                                                                        \
+                _Pragma("unroll")                                                                   \
+                for (int g = 0; g < GROUPS; ++g) {                                                  \
+                    float v = lane < 8 ? warp_max[g][lane] : 0.0f;                                  \
+                    _Pragma("unroll")                                                               \
+                    for (int offset = 16; offset > 0; offset >>= 1) {                               \
+                        v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));                      \
+                    }                                                                               \
+                    if (lane == 0) {                                                                \
+                        const float sc = v > 0.0f ? v / 127.0f : 1.0f;                              \
+                        group_scale[g] = sc;                                                        \
+                        group_inv_scale[g] = 1.0f / sc;                                             \
+                        if (is_leader) { cross_mine_scales[qb * GROUPS + g] = sc; }                 \
+                    }                                                                               \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            _Pragma("unroll")                                                                       \
+            for (int m = 0; m < VALUES_PER_THREAD; ++m) {                                           \
+                const int index = block_start + m * blockDim.x + tid;                               \
+                if (index < count) {                                                                \
+                    const int g = m / VPT_PER_GROUP;                                                \
+                    const int q = max(-127, min(127, __float2int_rn(recvbuf[index] * group_inv_scale[g]))); \
+                    recvbuf[index] = (float) q * group_scale[g];                                    \
+                    block_values[m * blockDim.x + tid] = (int8_t) q;                                \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+            if (is_leader) {                                                                        \
+                if (vector_index + 16 <= count) {                                                   \
+                    ggml_cuda_memcpy_1<16>(&cross_mine_values[vector_index], &block_values[local_offset]); \
+                } else {                                                                            \
+                    for (int m = 0; m < 16 && vector_index + m < count; ++m) {                      \
+                        cross_mine_values[vector_index + m] = block_values[local_offset + m];       \
+                    }                                                                               \
+                }                                                                                   \
+            }                                                                                       \
+            __syncthreads();                                                                        \
+        }                                                                                           \
+        if (is_leader) {                                                                            \
+            __threadfence_system();                                                                 \
+            __syncthreads();                                                                        \
+            if (tid == 0) {                                                                         \
+                ggml_cuda_ar_progress_set(cross_progress_mine, token, (chunk_step) + 1);            \
+                __threadfence_system();                                                             \
+            }                                                                                       \
+        }                                                                                           \
+    }
+
+    if (republish_total && flat_publish) {
+        // The other group is finishing the sum for us; take it whole rather
+        // than reconstructing it from two payloads.  One inbound stream on the
+        // slow link instead of two, overlapping our own outbound one.
+        for (int step = 0; step < n_steps; ++step) {
+            if (tid == 0) {
+                while (ggml_cuda_ar_progress_get(cross_progress_peer, token) < step + 1) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+            }
+            __syncthreads();
+            __threadfence_system();
+            GGML_CUDA_AR_STREAM_MARK(wait_ns)
+
+            const int first = step * chunk;
+            const int last = min(first + chunk, stripe_len);
+            for (int j = first; j < last; ++j) {
+                const int qb = bid + j * (int) gridDim.x;
+                const int block_start = qb * QK;
+                const int local_offset = tid * 16;
+                const int vector_index = block_start + local_offset;
+                if (tid < GROUPS) {
+                    group_scale[tid] = cross_peer_scales[qb * GROUPS + tid];
+                }
+                if (vector_index + 16 <= count) {
+                    ggml_cuda_memcpy_1<16>(&block_values[local_offset], &cross_peer_values[vector_index]);
+                } else {
+                    for (int m = 0; m < 16 && vector_index + m < count; ++m) {
+                        block_values[local_offset + m] = cross_peer_values[vector_index + m];
+                    }
+                }
+                __syncthreads();
+#pragma unroll
+                for (int m = 0; m < VALUES_PER_THREAD; ++m) {
+                    const int index = block_start + m * blockDim.x + tid;
+                    if (index < count) {
+                        // Replaces, not adds: this payload already contains us.
+                        recvbuf[index] = (float) block_values[m * blockDim.x + tid] *
+                            group_scale[m / VPT_PER_GROUP];
+                    }
+                }
+                __syncthreads();
+            }
+            GGML_CUDA_AR_STREAM_MARK(work_ns)
+        }
+    } else if (republish_total) {
+        // Aggregating side: fold both flat contributions into this chunk and
+        // hand the finished total straight back, so the slow side can start
+        // reading it while it is still publishing.
+        for (int step = 0; step < n_steps; ++step) {
+            if (tid == 0) {
+                while (ggml_cuda_ar_progress_get(cross_progress_peer, token) < step + 1) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                    __nanosleep(100);
+#else
+                    NO_DEVICE_CODE;
+#endif
+                }
+                if (cross_extra_rank >= 0) {
+                    while (ggml_cuda_ar_progress_get(cross_progress_extra, token) < step + 1) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                        __nanosleep(100);
+#else
+                        NO_DEVICE_CODE;
+#endif
+                    }
+                }
+            }
+            __syncthreads();
+            __threadfence_system();
+            GGML_CUDA_AR_STREAM_MARK(wait_ns)
+
+            GGML_CUDA_AR_STREAM_CONSUME(step)
+            if (cross_extra_rank >= 0) {
+                GGML_CUDA_AR_STREAM_CONSUME_EXTRA(step)
+            }
+            GGML_CUDA_AR_STREAM_PUBLISH_TOTAL(step)
+            GGML_CUDA_AR_STREAM_MARK(work_ns)
+        }
+    } else {
     // Phase 3: block for whatever the opportunistic drain has not taken yet.
     for (; read_step < n_steps; ++read_step) {
         if (tid == 0) {
@@ -1965,6 +2166,7 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             GGML_CUDA_AR_STREAM_MARK(work_ns)
         }
     }
+    }
 
     if (departure_slot || trace) {
         __threadfence_system();
@@ -1990,6 +2192,8 @@ static __global__ void ggml_cuda_mixed_ar_hier_stream_int8_kernel(
             __threadfence_system();
         }
     }
+#undef GGML_CUDA_AR_STREAM_PUBLISH_TOTAL
+#undef GGML_CUDA_AR_STREAM_CONSUME_EXTRA
 #undef GGML_CUDA_AR_STREAM_LOCAL_DRAIN
 #undef GGML_CUDA_AR_STREAM_AGGREGATE
 #undef GGML_CUDA_AR_STREAM_DRAIN
@@ -2403,6 +2607,7 @@ struct ggml_cuda_mixed_ar_group {
     bool stream_local_duplex = true;
     bool flat_2stage = false;
     bool flat_group = false;
+    bool republish_total = false;
     // Set on the aggregating group when the other one publishes flat: it then
     // has a second cross payload to read, named here.
     bool peer_flat = false;
@@ -2531,6 +2736,15 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->flat_group = group->hierarchical && config->n_backends == 2 &&
         config->leader_rank != 0 &&
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_GROUP", 0) != 0;
+    // Only meaningful together with flat publication, and only on the striped
+    // path: decode's small collectives are latency-bound and the extra hop
+    // would cost more than the halved inbound traffic saves.
+    group->republish_total = group->flat_group ||
+        (group->hierarchical && config->leader_rank == 0 &&
+         config->n_ranks - config->n_backends == 2);
+    group->republish_total = group->republish_total &&
+        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_GROUP", 0) != 0 &&
+        ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_REPUBLISH_TOTAL", 0) != 0;
     group->flat_2stage = group->hierarchical &&
         (config->n_backends == 2 || config->n_ranks - config->n_backends == 2) &&
         ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_FLAT_2STAGE", 0) != 0;
@@ -2878,7 +3092,7 @@ bool ggml_cuda_mixed_ar_group_enqueue_hier(
                     reinterpret_cast<float *>(tensor->data), \
                     reinterpret_cast<uint8_t *>(slot_data), local_mine, local_peer, \
                     rank, (int) group->n_ranks, group->leader_rank, group->peer_leader_rank, \
-                    cross_extra_rank, flat_publish, \
+                    cross_extra_rank, flat_publish, group->republish_total, \
                     (int) ne, arrival_slot, departure_slot, local_arrival_mine, \
                     local_arrival_peer, token, group->stream_chunk, group->stream_duplex, \
                     contribute, has_local_peer, trace)

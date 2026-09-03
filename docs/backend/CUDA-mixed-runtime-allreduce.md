@@ -999,3 +999,33 @@ the previous setting; 1.3 there fails a 756 MiB allocation.
 Together with the striped-path change, four GPUs now run generation at
 72.4-74.2 tokens/s against 66.7-66.9 on three, with prefill at 962-990 against
 1136-1150. Three GPUs remain the better choice for prompt-heavy work.
+
+### Handing the finished total back to the slow group
+
+Flat publication left the Teslas moving 3N on their Gen3 x4 links: N out for
+their own contribution, then N in for the Blackwell aggregate and another N in
+for their partner's. The prefill profile put them squarely at the top --
+2940 and 2716 ms of their own work against 2793 for the fastest Blackwell, and
+they barely waited.
+
+`GGML_CUDA_MIXED_AR_REPUBLISH_TOTAL=1` moves the last step to the fast side:
+the aggregating group folds both flat contributions in, finishes the whole sum
+and republishes it, so each Tesla reads one payload instead of two. Its link
+then carries N out and N in, and the two directions overlap.
+
+Doing this in whole tensors would be a loss -- it inserts a second round trip
+into the dependency chain. It only pays because both halves are streamed per
+chunk: the aggregating side consumes chunk k from both sources, rounds the
+total through the wire and publishes it immediately, so the slow side starts
+reading the total while it is still publishing its own contribution. Every rank
+of the aggregating group performs the same rounding so the ranks stay
+identical; only the leader writes.
+
+Prefill goes from 962-990 to 1092-1123 tokens/s with generation unchanged at
+72.1-73.4. The mode is restricted to the striped path: decode's collectives are
+10 KiB and latency-bound, where the extra hop would cost more than the halved
+inbound traffic saves.
+
+Four GPUs now stand at 1092-1123 prefill and 72.1-73.4 generation against
+1135-1150 and 66.2-66.9 on three, so the fourth card is finally worth its place
+in both phases rather than trading one against the other.
