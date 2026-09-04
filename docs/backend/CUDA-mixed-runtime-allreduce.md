@@ -1100,3 +1100,26 @@ tokens/s prefill and 64.1 generation -- 4 percent of prefill against the
 Q4_K_XL script at 160072, and nothing measurable in generation. The same MTP
 draft head serves both: it carries no embeddings and borrows them from whatever
 target it is loaded against.
+
+### A long prompt is not a big prompt: the pool allocation
+
+The Qwen3.8-Flash-Next MTP configuration was tuned against a 5000-token prompt
+and passed everything, then failed in production once the context filled:
+
+    prompt processing, n_tokens = 12144, progress = 0.66
+    CUDA error: out of memory ... in function alloc
+
+The sparse attention indexer's top-k takes its temporaries from the CUDA pool,
+and they are sized by the current cache length rather than by the ubatch. A
+configuration can therefore start, reserve all its declared buffers, run a
+short prompt at full speed, and still run out somewhere past ten thousand
+tokens. Nothing in the startup allocation predicts it.
+
+At ubatch 640 the run dies around 12-30k tokens; at 512 it completes a
+100000-token prompt at 309 tokens/s, and a 30000-token one at 411. The cost of
+the smaller ubatch on the short benchmark is 497 -> 478 tokens/s of prefill.
+
+The practical rule for this architecture: any change to the memory balance --
+split, context, draft, quant -- has to be re-checked with a prompt long enough
+to fill a real fraction of the context. `bench/prompt30k.json` and
+`bench/prompt100k.json` exist for that.
