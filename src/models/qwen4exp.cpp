@@ -24,8 +24,10 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 }
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
-    // NextN/MTP: an extra decoder block appended past the trunk. Read this first, since
-    // n_layer() == n_layer_all - n_layer_nextn feeds every per-layer array below.
+    // NextN/MTP: an extra decoder block appended past the trunk. Read it here so
+    // that n_layer() == n_layer_all - n_layer_nextn is known before the tensor
+    // loop below, which uses it to tell trunk blocks from the MTP one. The
+    // per-layer arrays are sized by n_layer_all and cover the MTP block too.
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
 
