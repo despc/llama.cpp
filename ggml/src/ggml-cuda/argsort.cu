@@ -33,7 +33,21 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
     // perform argsort in chunks up to approximately this size (currently 64MB)
     // to avoid excessive temporary buffers memory usage
-    const int chunk_bytes = 1 << 26;
+    static const size_t prefill_chunk_bytes = []() -> size_t {
+        const char * value = std::getenv("GGML_CUDA_SORT_PREFILL_CHUNK_MIB");
+        if (!value) {
+            return 1 << 26;
+        }
+        char * end = nullptr;
+        const long mib = std::strtol(value, &end, 10);
+        if (end == value || *end != '\0' || mib < 1 || mib > 64) {
+            GGML_LOG_WARN("GGML_CUDA_SORT_PREFILL_CHUNK_MIB must be between 1 and 64; using 64\n");
+            return 1 << 26;
+        }
+        return (size_t) mib << 20;
+    }();
+    // Keep the decode and short speculative verification paths unchanged.
+    const size_t chunk_bytes = nrows > 8 ? prefill_chunk_bytes : (1 << 26);
 
     // calculate how many rows will fit in one chunk (must be at least one)
     const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);
@@ -118,6 +132,10 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
         }
     }
 
+    if (std::getenv("GGML_CUDA_SORT_PROFILE") && nrows > 8 && ncols > 1024) {
+        GGML_LOG_WARN("cuda_sort_scratch device=%d cols=%d rows=%d cub_bytes=%zu arrays_bytes=%zu\n",
+                      ggml_cuda_get_device(), ncols, nrows, temp_storage_bytes, (size_t) ncols * nrows * (sizeof(float) + sizeof(int)));
+    }
     ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
     void *                        d_temp_storage = temp_storage_alloc.get();
 
