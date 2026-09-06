@@ -10609,6 +10609,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // qwen4exp expert projections at their real shapes and quantisations.  With
+    // 512 experts and 10 chosen per token a prefill microbatch touches nearly
+    // every expert, so what this measures is how fast the whole expert weight set
+    // can be streamed -- the quantity the MoE prefill cost is made of.
+    for (int64_t n_tokens : {256, 512, 1024, 2048}) {
+        // gate and up: [2560,640] per expert
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 640, n_tokens, 2560));
+        // down: [640,2560] per expert
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n_tokens, 640));
+    }
+
+    // The same weight bytes as one expert projection above, but read by a dense
+    // matmul: it separates "MoE grouping is slow" from "streaming quantised
+    // weights for a handful of columns is slow whatever the caller".
+    for (int64_t n_cols : {1, 10, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 327680, n_cols, 2560, {1, 1}, {1, 1}));
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

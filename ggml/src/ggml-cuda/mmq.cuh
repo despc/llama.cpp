@@ -1473,6 +1473,50 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
+    // For MUL_MAT_ID the column tile is spent per expert, not per batch.  With 512
+    // experts and 10 chosen per token a prefill microbatch gives each expert only a
+    // handful of tokens, so a tile sized for the whole batch computes mostly padding:
+    // at J = 64 for ~10 real columns that is six times the arithmetic.  Size the tile
+    // to the expert's share instead.  The grid still covers ceil(ncols_max/J) tiles
+    // per expert, so a busier-than-average expert is still fully processed.
+    static const bool mmid_fit_J = getenv("GGML_CUDA_MMQ_MMID_J_FIT") != nullptr;
+    if (mmid_fit_J && args.ids_dst != nullptr && args.nchannels_x > 1) {
+        const int64_t per_expert = std::max<int64_t>(1, (args.ncols_dst + args.nchannels_x - 1) / args.nchannels_x);
+
+        int J_wide = 0;   // widest configured tile, which is what the batch-sized rule picks
+        int J_fit  = 0;   // narrowest configured tile that still holds an expert's share
+        for (int J = 8; J <= 128; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+            if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+                continue;
+            }
+            J_wide = J;
+            if (J_fit == 0 && J >= per_expert) {
+                J_fit = J;
+            }
+        }
+        if (J_fit == 0) {
+            J_fit = J_wide;
+        }
+
+        // Only override where the mismatch is real.  A narrower tile also means more
+        // tiles, so it pays only when the batch-sized one is at least twice the
+        // expert's share -- at a large share the wide tile is the better choice and
+        // measurably so.
+        if (J_fit > 0 && J_wide >= 2*J_fit) {
+            switch (J_fit) {
+                case   8: launch_mul_mat_q<type,   8, fallback>(ctx, args, stream); return;
+                case  16: launch_mul_mat_q<type,  16, fallback>(ctx, args, stream); return;
+                case  24: launch_mul_mat_q<type,  24, fallback>(ctx, args, stream); return;
+                case  32: launch_mul_mat_q<type,  32, fallback>(ctx, args, stream); return;
+                case  40: launch_mul_mat_q<type,  40, fallback>(ctx, args, stream); return;
+                case  48: launch_mul_mat_q<type,  48, fallback>(ctx, args, stream); return;
+                case  64: launch_mul_mat_q<type,  64, fallback>(ctx, args, stream); return;
+                default: break;
+            }
+        }
+    }
+
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
