@@ -902,3 +902,36 @@ Unrelated defect found and not fixed: FLASH_ATTN_EXT with max_bias 8.0 and a
 sparse mask hint aborts the Tesla backend with an unspecified launch failure. It
 reproduces on the libraries deployed before this session. This model uses no
 ALiBi.
+
+### Two candidates that the long tests refused
+
+Both looked good on the 5k benchmark and both failed the acceptance protocol on
+the long half. Neither is deployed; both remain opt-in.
+
+**Pipeline slots run out of memory.** `GGML_SCHED_N_COPIES=2` gains 0.5% of
+prefill and 1.2% of generation at 5k, and takes 142 MiB more on device 0 at load
+-- 15836/15124/30195/30380 MiB against 15694/14922/30001/30174. That is enough to
+abort with an out-of-memory during a 30k prompt, killing the server. This also
+explains the upstream fallback: on a split this tight, turning pipelining off is
+the correct decision, not a defect. Two slots are viable here only after the
+memory savings that R4/R5/R7/R9 were supposed to provide, and R4 and R5 are now
+retired for lack of value.
+
+**Fitting the MMQ tile is a Pareto tradeoff, not a win.** With
+`GGML_CUDA_MMQ_MMID_J_FIT=1`, prefill gains 1.9% at 30k (660.7 -> 673.0) and 3.2%
+at 100k (441.1 -> 455.3), growing with prompt length as expected, and memory is
+unchanged to the byte. Generation after a 50k prefix loses 2.3%: 41.73 +- 0.02
+against 40.76 +- 0.12 over six warm samples each, interleaved both ways, ranges
+far apart.
+
+The mechanism is not understood, and the obvious explanation is wrong: decode
+batches one or two tokens and leaves through MMVQ, well below the 64 the rule
+requires, so the fitted tile is never chosen during generation. The route census
+confirms it -- 2.7 tokens per MUL_MAT_ID call at decode, all mmvq. The remaining
+suspect is the CUDA memory pool: different tile widths leave different scratch
+sizes behind, and the indexer's per-token top-k allocations then land in a
+differently shaped pool. That is a guess and is labelled as one.
+
+Until it is understood or the tradeoff is chosen deliberately, the default stays
+off. A deployment that wants long-prompt throughput more than steady-state
+generation can set the variable; one that wants the reverse should not.
