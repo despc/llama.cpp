@@ -122,6 +122,16 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+
+    // Compacting the mask costs one pass over the whole cache regardless of how many
+    // queries there are, so it is repaid by the queries that then skip the unselected
+    // positions.  At one or two queries -- decode, and speculative verification --
+    // it is not repaid: measured on a 50k prefix, letting decode take this path costs
+    // 2.5% of generation.  Leave those to the dense kernels.
+    if (Q->ne[1] < 16) {
+        return false;
+    }
+
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
