@@ -780,3 +780,125 @@ MiB at ubatch 512 against 15612/14842/29957/30122 MiB at 640.
 
 Evidence, including source revision and binary hashes for both runtime
 directories, is in `/home/despc/llama.cpp/evidence/2026-09-06-r11.md`.
+
+## Execution log: 2026-09-06 night, where the ranking was wrong
+
+Prefill on the fixed reference configuration went from 478 to 811 tokens/s at a
+5k prompt over this session, 412 to 661 at 30k and 310 to 441 at 100k, with
+generation unchanged throughout and greedy output byte-identical at every step.
+None of it came from the candidates the ranking put first.
+
+### What actually paid, and why the ranking missed it
+
+Both wins were dispatch mistakes on Volta, not missing capability.
+
+The first (R3) was already described above: the MMQ batch-size rule rejects any
+batch of 64 or more on hardware with FP16 tensor cores but no Turing MMA, which
+sent every prefill expert projection into a host-synchronising fallback --
+284199 individual kernel launches on the two Teslas over a single 5000-token
+prefill.
+
+The second was not in the ranking at all. The MMQ tile table is chosen by
+architecture, and the first branch a compute capability of 700 satisfies is
+`>= VOLTA`, which hands it the Ampere table: 128-wide tiles, occupancy one,
+stream-k on. Volta does not run that layout -- without Turing MMA the kernel
+takes the DP4A path, the one `pascal_dp4a` was written for, with 64-wide tiles
+and occupancy two. It never reached that table because the Volta branch is tested
+before the DP4A branch. Raising the Ampere branch to `>= TURING` was worth 32%.
+
+The lesson is not about these two lines. It is that the ranking was built from
+source reading plus one 5k profile, and the largest items in it were structural
+projects while the actual defects were in three-line predicates that no amount of
+ranking would surface. A cheap route census -- which route each dispatch took,
+how many launches it spent -- found both in minutes.
+
+### R1, sparse attention: blocked by fragment shapes, not by a flag
+
+The chain is fully implemented in the backend. Three things kept this model off
+it. The graph passed `n_kv_max = 0` behind a TODO: fixed. The eligibility list
+lacked 256/256: added, at the grouping of 8 that is the only one configured for
+that head size.
+
+The third cannot be fixed here. Volta's MMA fragments exist only at `I == 32`;
+`tile::supported()` traps for anything narrower, surfacing as an unspecified
+launch failure. The sparse path needs one query column per block, so at this
+model's GQA ratio of 12 it can never reach 32 columns. The `ncols1*ncols2 < 32`
+guard is a correctness bound, not the compile-time prune it resembles. Sparse
+attention on Volta needs new fragment shapes; that is the whole project, and its
+ceiling is attention's 17% share at 30k.
+
+Enabling it for the two Blackwells that can take it is neutral end to end --
+754.3 against 752.8 tokens/s at 5k -- because they hold about a sixth of the GPU
+time and attention is 8.4% of theirs. Committed as correct, not as faster.
+
+### R3 second stage: the premise was wrong, the fix was elsewhere
+
+The plan proposed dequantising to FP16 and using Volta's tensor cores for roughly
+twice the arithmetic. Measurement says arithmetic was never the constraint: over
+the expert shapes, an eightfold increase in tokens costs 1.25x the time. What it
+did reveal is that the expert path achieved 136 GB/s where a dense matmul reading
+the same 450 MiB with the same ten columns reaches 374.
+
+The cause was padding, not bandwidth. `mul_mat_q_switch_J` sizes the column tile
+from `ncols_max`, which for MUL_MAT_ID is the batch, but the tile is spent per
+expert -- and 512 experts with 10 chosen per token leave each expert about ten
+columns of a 64-wide tile. Fitting the tile to the expert's share: Q4_K gate/up
+3644 -> 1627 us at 512 tokens, Q5_1 down 4305 -> 2708.
+
+### The critical path is not where op profiles put it
+
+That change removes 13% of the Teslas' GPU time and gains 1.3% of prefill. The
+discrepancy is the most useful result of the session, and the first explanation
+tried -- that a fifth of prefill was host overhead -- was wrong, arrived at by
+summing per-operation GPU times, which is exactly what this document warns
+against: with a synchronise after every operation each measurement carries its
+own launch latency, and on thousands of small nodes that dominates the sum.
+
+`LLAMA_UBATCH_PROFILE` measures the host timeline instead. On the same 30k
+prefill: build 417 ms, set_inputs 252 ms, apply 9 ms -- under 1.5% together --
+against 90.5% inside `graph_compute` and 8% in the trailing synchronise.
+
+Two consequences. R4 is dead: preparing the indexer's block bias on the GPU can
+save at most the 0.6% that all input preparation costs. And the graph was reused
+once in 125 ubatches, because the indexer input shape follows the cache length,
+so CUDA graphs are unavailable for prefill without bucketing it (R16).
+
+### R2, pipeline parallelism: the slots were the easy half
+
+The reserve fails at every startup -- 1882.99 MiB on device 0 -- and the
+scheduler then retries with pipelining off entirely, so this deployment has never
+pipelined. `GGML_SCHED_N_COPIES` makes the count a runtime choice; at two slots
+the reserve succeeds and pipelining stays on.
+
+It buys 0.5% of prefill and 1.2% of generation. As this document predicted,
+removing the allocation fallback does not produce overlap: `process_ubatch` still
+synchronises the scheduler before overwriting reused graph inputs. Three slots
+configure and start, then fail during inference, so the override accepts only
+powers of two.
+
+### Revised standing
+
+At 30k on the Teslas, after both dispatch fixes: MUL_MAT_ID 48.0%, FLASH_ATTN_EXT
+17.0%, MUL_MAT 16.9%, GATED_DELTA_NET 4.0%, TOP_K 2.7%. Scaling from 5k to 30k,
+experts grow 6.4x with the token count while attention grows 30x and top-k 42x,
+so the two regimes need different work: experts up to about 50k, attention near
+the context limit.
+
+Ranked by what the measurements now support:
+
+1. Volta MMA fragment shapes narrower than 32 columns. Unblocks R1, and R1 is the
+   only candidate whose value grows with context, which is where this deployment
+   is weakest (441 tokens/s at 100k against 811 at 5k).
+2. Graph reuse across ubatches (R16), which would also make CUDA graphs available
+   for prefill. Needs the indexer input bucketed by cache length; this document's
+   warning about bucket padding and memory stands.
+3. Real pipeline overlap (R2 second half), now that the slots fit.
+
+Not worth pursuing on this evidence: R4 (host bias, 0.6% ceiling), R5 (the
+indexer score matmul is 94.9 ms, 0.3%), R12 (top-k is 2.7%), and dequantised FP16
+experts (the expert path is not arithmetic-bound).
+
+Unrelated defect found and not fixed: FLASH_ATTN_EXT with max_bias 8.0 and a
+sparse mask hint aborts the Tesla backend with an unspecified launch failure. It
+reproduces on the libraries deployed before this session. This model uses no
+ALiBi.
