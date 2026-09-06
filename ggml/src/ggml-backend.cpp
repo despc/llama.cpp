@@ -1873,7 +1873,25 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+
+    // Pipeline parallelism duplicates the graph inputs once per copy slot, and on a
+    // memory-tight split that is what makes the reserve fail -- after which the
+    // scheduler retries with no pipelining at all, which is worse than fewer slots.
+    // GGML_SCHED_N_COPIES trades slots for the reserve fitting; it is clamped to the
+    // compiled maximum because the event array is sized by it.
+    int n_copies = GGML_SCHED_MAX_COPIES;
+    if (const char * env = getenv("GGML_SCHED_N_COPIES")) {
+        const int requested = atoi(env);
+        // powers of two only: other counts break the copy indexing and a request
+        // for 3 fails at inference time rather than at startup
+        if (requested >= 1 && requested <= GGML_SCHED_MAX_COPIES && (requested & (requested - 1)) == 0) {
+            n_copies = requested;
+        } else {
+            GGML_LOG_WARN("%s: GGML_SCHED_N_COPIES must be a power of two between 1 and %d, ignoring '%s'\n",
+                          __func__, GGML_SCHED_MAX_COPIES, env);
+        }
+    }
+    sched->n_copies = parallel ? n_copies : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
