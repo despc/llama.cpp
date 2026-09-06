@@ -91,6 +91,7 @@
 #include <cstdlib>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -2292,6 +2293,108 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
+// [TAG_MUL_MAT_ID_MMQ_PREFILL]
+// Volta has FP16 tensor cores but not the Turing MMA that MMQ is tuned for, so
+// ggml_cuda_should_use_mmq() rejects any batch of MMQ_DP4A_MAX_BATCH_SIZE tokens
+// or more on it.  For a 512-expert MoE that sends every prefill expert
+// projection into the fallback at the bottom of ggml_cuda_mul_mat_id(): the ids
+// are copied to the host, the stream is synchronised twice, a host loop walks
+// experts x tokens x selected experts, and each populated expert costs its own
+// ggml_cuda_mul_mat() launch -- and the graph is disqualified from CUDA capture.
+// This takes the grouped MMQ path instead.
+//
+// Opt-in and diagnostic: the batch-size rule is a tuning heuristic, and whether
+// grouped MMQ actually beats the fallback on this hardware is what we are
+// measuring.  Decode and speculative verification are untouched; they leave
+// through the MMVQ path above, far below this batch size.
+static bool ggml_cuda_mmid_prefill_mmq(const ggml_tensor * src0, const int cc, const int64_t ne11) {
+    static const bool enabled = std::getenv("GGML_CUDA_MMID_MMQ_PREFILL") != nullptr;
+
+    if (!enabled || !ggml_is_quantized(src0->type)) {
+        return false;
+    }
+
+    // only where it was the batch-size rule that rejected MMQ, not the architecture
+    if (turing_mma_available(cc) || !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    // ask the normal predicate everything except that rule: ne11 = 1 clears the
+    // batch-size test while still checking quantisation type and shared memory
+    return ggml_cuda_should_use_mmq(src0->type, cc, /*ne11 =*/ 1, /*n_experts =*/ src0->ne[2]);
+}
+
+// Which route each MUL_MAT_ID takes, opt-in via GGML_CUDA_MMID_ROUTE_PROFILE.
+// The fallback at the bottom of ggml_cuda_mul_mat_id() is expensive and easy to
+// enter without noticing, so this counts routes rather than guessing from the
+// dispatch source, and reports the fallback's per-expert launch count -- the
+// figure that decides whether grouping is worth it.
+enum ggml_cuda_mmid_route {
+    GGML_CUDA_MMID_ROUTE_MMVQ = 0,
+    GGML_CUDA_MMID_ROUTE_MMVF,
+    GGML_CUDA_MMID_ROUTE_MMQ,
+    GGML_CUDA_MMID_ROUTE_MMQ_PREFILL,
+    GGML_CUDA_MMID_ROUTE_MMF,
+    GGML_CUDA_MMID_ROUTE_FALLBACK,
+    GGML_CUDA_MMID_ROUTE_COUNT,
+};
+
+static const char * ggml_cuda_mmid_route_name(ggml_cuda_mmid_route route) {
+    switch (route) {
+        case GGML_CUDA_MMID_ROUTE_MMVQ:        return "mmvq";
+        case GGML_CUDA_MMID_ROUTE_MMVF:        return "mmvf";
+        case GGML_CUDA_MMID_ROUTE_MMQ:         return "mmq";
+        case GGML_CUDA_MMID_ROUTE_MMQ_PREFILL: return "mmq-prefill";
+        case GGML_CUDA_MMID_ROUTE_MMF:         return "mmf";
+        case GGML_CUDA_MMID_ROUTE_FALLBACK:    return "fallback";
+        default:                               return "?";
+    }
+}
+
+struct ggml_cuda_mmid_route_stat {
+    int64_t calls = 0;
+    int64_t tokens = 0;
+    int64_t inner_launches = 0; // fallback only: one ggml_cuda_mul_mat per populated expert
+};
+
+struct ggml_cuda_mmid_route_table {
+    std::mutex mutex;
+    // keyed by device, route and quantisation type of the expert weights
+    std::map<std::tuple<int, int, int>, ggml_cuda_mmid_route_stat> stats;
+
+    void add(int device, ggml_cuda_mmid_route route, ggml_type type, int64_t tokens, int64_t inner = 0) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ggml_cuda_mmid_route_stat & stat = stats[{ device, (int) route, (int) type }];
+        stat.calls          += 1;
+        stat.tokens         += tokens;
+        stat.inner_launches += inner;
+    }
+
+    ~ggml_cuda_mmid_route_table() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto & [key, stat] : stats) {
+            const auto [device, route, type] = key;
+            GGML_LOG_WARN("cuda_mmid_route backend=%s device=%d route=%-11s type=%-8s calls=%-8" PRId64 " mean_tokens=%7.1f inner_launches=%" PRId64 "\n",
+                          GGML_CUDA_NAME, device, ggml_cuda_mmid_route_name((ggml_cuda_mmid_route) route),
+                          ggml_type_name((ggml_type) type), stat.calls,
+                          stat.calls ? (double) stat.tokens / stat.calls : 0.0, stat.inner_launches);
+        }
+    }
+};
+
+static ggml_cuda_mmid_route_table g_cuda_mmid_routes;
+
+static bool ggml_cuda_mmid_route_profile_enabled() {
+    static const bool enabled = std::getenv("GGML_CUDA_MMID_ROUTE_PROFILE") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_mmid_route_record(int device, ggml_cuda_mmid_route route, ggml_type type, int64_t tokens, int64_t inner = 0) {
+    if (ggml_cuda_mmid_route_profile_enabled()) {
+        g_cuda_mmid_routes.add(device, route, type, tokens, inner);
+    }
+}
+
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
@@ -2309,6 +2412,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
             return false;
         }
+    }
+
+    if (ggml_cuda_mmid_prefill_mmq(src0, cc, src1->ne[2])) {
+        return false;
     }
 
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
@@ -2341,23 +2448,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_MMVQ, src0->type, ne12);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_MMVF, src0->type, ne12);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        const bool mmq_prefill = ggml_cuda_mmid_prefill_mmq(src0, cc, ne12);
+        if (mmq_prefill || ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_mmid_route_record(ctx.device,
+                mmq_prefill ? GGML_CUDA_MMID_ROUTE_MMQ_PREFILL : GGML_CUDA_MMID_ROUTE_MMQ, src0->type, ne12);
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_MMF, src0->type, ne12);
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2426,6 +2539,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
+    int64_t populated_experts = 0;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
@@ -2468,10 +2582,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
         CUDA_CHECK(cudaGetLastError());
+        populated_experts++;
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
     }
+    ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_FALLBACK, src0->type, ne12, populated_experts);
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
@@ -4668,6 +4784,113 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// Per-operation event timing, opt-in via GGML_CUDA_OP_PROFILE.
+//
+// Strictly diagnostic.  It synchronises after every node and disables CUDA
+// graphs, so its wall time is not this backend's production latency, and the
+// per-op totals below overlap host time and must never be summed into a
+// critical path.  Use it to find which operations are expensive relative to
+// each other, then confirm the conclusion against an uninstrumented run.
+//
+// Each CUDA runtime in this build carries its own copy of these statics, so the
+// two driver stacks report separately -- GGML_CUDA_NAME says which is speaking.
+static bool ggml_cuda_op_profile_enabled() {
+    static const bool enabled = std::getenv("GGML_CUDA_OP_PROFILE") != nullptr;
+    return enabled;
+}
+
+struct ggml_cuda_op_profile_key {
+    int device;
+    ggml_op op;
+    std::string name;
+
+    bool operator<(const ggml_cuda_op_profile_key & other) const {
+        return std::tie(device, op, name) < std::tie(other.device, other.op, other.name);
+    }
+};
+
+struct ggml_cuda_op_profile_stat {
+    int64_t calls = 0;
+    double gpu_ms = 0.0;
+    double cpu_ms = 0.0;
+};
+
+// Aggregating rather than logging each node: a 5k prefill executes hundreds of
+// thousands of them, and a per-node log costs more than the thing being measured.
+struct ggml_cuda_op_profile_table {
+    std::mutex mutex;
+    std::map<ggml_cuda_op_profile_key, ggml_cuda_op_profile_stat> stats;
+
+    void add(int device, const ggml_tensor * node, double gpu_ms, double cpu_ms) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ggml_cuda_op_profile_stat & stat = stats[{ device, node->op, node->name }];
+        stat.calls  += 1;
+        stat.gpu_ms += gpu_ms;
+        stat.cpu_ms += cpu_ms;
+    }
+
+    // printed once at teardown; no CUDA calls here, so it is safe that late
+    ~ggml_cuda_op_profile_table() {
+        if (stats.empty()) {
+            return;
+        }
+        std::vector<std::pair<ggml_cuda_op_profile_key, ggml_cuda_op_profile_stat>> rows(stats.begin(), stats.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+            return a.second.gpu_ms > b.second.gpu_ms;
+        });
+
+        double total_gpu = 0.0;
+        for (const auto & row : rows) {
+            total_gpu += row.second.gpu_ms;
+        }
+
+        GGML_LOG_WARN("cuda_op_profile backend=%s total_gpu_ms=%.1f distinct=%zu (diagnostic: synchronised, graphs off)\n",
+                      GGML_CUDA_NAME, total_gpu, rows.size());
+        for (const auto & row : rows) {
+            GGML_LOG_WARN("cuda_op_profile backend=%s device=%d op=%-16s name=%-32s calls=%-8" PRId64 " gpu_ms=%10.2f gpu_pct=%5.1f cpu_ms=%10.2f\n",
+                          GGML_CUDA_NAME, row.first.device, ggml_op_name(row.first.op), row.first.name.c_str(),
+                          row.second.calls, row.second.gpu_ms,
+                          total_gpu > 0.0 ? 100.0 * row.second.gpu_ms / total_gpu : 0.0,
+                          row.second.cpu_ms);
+        }
+    }
+};
+
+static ggml_cuda_op_profile_table g_cuda_op_profile;
+
+struct ggml_cuda_op_profile {
+    ggml_backend_cuda_context & ctx;
+    const ggml_tensor * node;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    int64_t cpu_start = 0;
+
+    ggml_cuda_op_profile(ggml_backend_cuda_context & ctx, const ggml_tensor * node) : ctx(ctx), node(node) {
+        if (!ggml_cuda_op_profile_enabled()) {
+            return;
+        }
+        stream = ctx.stream();
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start, stream));
+        cpu_start = ggml_time_us();
+    }
+
+    ~ggml_cuda_op_profile() {
+        if (!start) {
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        g_cuda_op_profile.add(ctx.device, node, ms, (ggml_time_us() - cpu_start)/1000.0);
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
+};
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4808,6 +5031,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_op_profile op_profile(*cuda_ctx, node);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4946,6 +5170,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (ggml_cuda_op_profile_enabled()) {
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

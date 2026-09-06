@@ -9765,6 +9765,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Prefill-sized MoE batches at the expert quantisations qwen4exp actually
+    // ships: Q4_K gate/up, Q5_1 down, plus Q5_K and Q8_0 shards.  The sweeps
+    // above run those types only up to 32 tokens, which is below every
+    // batch-size branch in the MUL_MAT_ID dispatch, so a route that engages only
+    // for large batches -- [TAG_MUL_MAT_ID_MMQ_PREFILL] -- would go untested.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+        for (int n : {64, 129, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 4, false, 640, n, 2560));
+        }
+    }
+
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
