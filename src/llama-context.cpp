@@ -1369,11 +1369,53 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+
+// Coarse host-side phase accounting for a ubatch, opt-in via LLAMA_UBATCH_PROFILE.
+//
+// Kernel time is only part of a prefill: the rest is graph construction, input
+// preparation and waiting.  Per-operation GPU profilers cannot see any of that,
+// so this measures the host timeline around them and prints one summary at exit.
+// The phases are wall-clock and sequential, so unlike GPU op times they may be
+// added -- "compute" is only the submit, and the waiting shows up in "sync".
+namespace {
+struct ubatch_phase_profile {
+    bool     enabled = getenv("LLAMA_UBATCH_PROFILE") != nullptr;
+    int64_t  calls   = 0;
+    int64_t  reused  = 0;
+    double   build_ms = 0, alloc_ms = 0, inputs_ms = 0, compute_ms = 0, sync_ms = 0, apply_ms = 0;
+
+    ~ubatch_phase_profile() {
+        if (!enabled || calls == 0) {
+            return;
+        }
+        const double total = apply_ms + build_ms + alloc_ms + inputs_ms + compute_ms + sync_ms;
+        LLAMA_LOG_WARN("ubatch_profile calls=%" PRId64 " reused=%" PRId64 " total=%.0f ms"
+                       " | apply=%.0f build=%.0f alloc=%.0f set_inputs=%.0f submit=%.0f sync=%.0f\n",
+                       calls, reused, total, apply_ms, build_ms, alloc_ms, inputs_ms, compute_ms, sync_ms);
+        LLAMA_LOG_WARN("ubatch_profile shares: apply=%.1f%% build=%.1f%% alloc=%.1f%% set_inputs=%.1f%% submit=%.1f%% sync=%.1f%%\n",
+                       100*apply_ms/total, 100*build_ms/total, 100*alloc_ms/total,
+                       100*inputs_ms/total, 100*compute_ms/total, 100*sync_ms/total);
+    }
+};
+ubatch_phase_profile g_ubatch_profile;
+
+struct phase_timer {
+    double * sink;
+    int64_t  t0;
+    phase_timer(double * sink) : sink(sink), t0(g_ubatch_profile.enabled ? ggml_time_us() : 0) {}
+    ~phase_timer() { if (g_ubatch_profile.enabled) { *sink += (ggml_time_us() - t0)/1000.0; } }
+};
+} // namespace
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+    g_ubatch_profile.calls++;
+    {
+        phase_timer t(&g_ubatch_profile.apply_ms);
+        if (mctx && !mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     auto * res = gf_res_prev.get();
@@ -1394,7 +1436,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        g_ubatch_profile.reused++;
     } else {
+        phase_timer t(&g_ubatch_profile.build_ms);
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1424,12 +1468,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        phase_timer t(&g_ubatch_profile.inputs_ms);
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    ggml_status status;
+    {
+        phase_timer t(&g_ubatch_profile.compute_ms);
+        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1878,6 +1927,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        { phase_timer t(&g_ubatch_profile.sync_ms); synchronize(); }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
