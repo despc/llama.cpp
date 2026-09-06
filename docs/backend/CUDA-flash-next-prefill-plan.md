@@ -935,3 +935,47 @@ differently shaped pool. That is a guess and is labelled as one.
 Until it is understood or the tradeoff is chosen deliberately, the default stays
 off. A deployment that wants long-prompt throughput more than steady-state
 generation can set the variable; one that wants the reverse should not.
+
+### Correction: what the generation regression was, and was not
+
+The Pareto tradeoff recorded above for `GGML_CUDA_MMQ_MMID_J_FIT` was wrong. The
+2.3% loss of generation after a 50k prefix belonged to the binary, not the rule:
+the same build measures 40.76 with the rule on and 40.73 with it off. The
+comparison that produced it set one environment variable but changed two things,
+because the candidate binary also carried the sparse-attention commit.
+
+The tile rule is therefore a clean gain where it applies -- 1.9% of prefill at
+30k and 3.2% at 100k, memory unchanged to the byte, greedy output identical, and
+never selected at decode, where the batch of one or two tokens leaves through
+MMVQ. It stays opt-in only because its end-to-end effect is small relative to the
+2.2x it produces in the kernel, which is itself the evidence that the expert
+matmuls are no longer the critical path.
+
+Attribution then took two more wrong turns worth recording, because each looked
+convincing:
+
+- **Sparse attention at decode.** Once a prefix passes 4096 positions the
+  eligibility test is satisfied for one or two queries as well, so decode was
+  taking a path meant for many queries. Gating on query count fixed that and
+  changed nothing: 40.58 before and after, verified with the launch profiler,
+  which shows sparse launches only at 512 and 464 queries.
+- **Naming tensors.** Removing the six `cb()` calls appeared to recover half the
+  gap in a single run and to restore the memory footprint. Interleaved, it did
+  not: 40.69 against 41.62. The commit was reverted anyway, on the separate
+  evidence that it changed memory at all.
+
+What remained was sparse attention running during prefill, which is neutral there
+and costs 2.2% of generation through the pool state it leaves behind. Withdrawing
+the 256/256 eligibility removes the cost and restores the memory footprint
+exactly.
+
+A residual 1.3% still separates a fresh build of this tree from the deployed
+binaries. Every source change was tested and excluded, including reverting the
+n_kv_max parameter. It is most likely build-to-build variation in a tight decode
+loop, but that is not established, so it is written down rather than dismissed --
+and it is the reason the deployed binaries were left alone.
+
+The general lesson, twice over in one session: a candidate directory accumulates
+changes, and an A/B that toggles one variable between two such directories is not
+a controlled experiment. Toggle the variable within one binary, or rebuild the
+control.
