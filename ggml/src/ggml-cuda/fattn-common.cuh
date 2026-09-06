@@ -1222,6 +1222,13 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+        static const bool launch_profile = getenv("GGML_CUDA_FATTN_LAUNCH_PROFILE") != nullptr;
+        if (launch_profile) {
+            GGML_LOG_WARN("fattn_launch sparse=%d ncols1=%d ncols2=%d nwarps=%d smem=%zu grid=%u,%u,%u block=%u,%u ntiles_x=%d ntiles_z_gqa=%d ntiles_KV=%d parallel_blocks=%d Qne1=%lld Kne1=%lld n_kv_max=%d\n",
+                          (int) use_sparse, ncols1, ncols2, nwarps, nbytes_shared,
+                          blocks_num.x, blocks_num.y, blocks_num.z, block_dim.x, block_dim.y,
+                          ntiles_x, ntiles_z_gqa, ntiles_KV, parallel_blocks, (long long) Q->ne[1], (long long) K->ne[1], n_kv_max);
+        }
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,

@@ -196,6 +196,21 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // The sparse path puts one query column in each block, so its grouping is the
+    // only thing left to choose, and 8 is the only 256/256 grouping any tile table
+    // configures.  Volta's rule below would pick 4, which has no configuration at
+    // all.  Volta cannot reach the sparse path anyway -- its MMA fragments are
+    // fixed at 32 columns -- but keeping the choice here means the grouping is
+    // decided in one place if that ever changes.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, 8)) {
+        if (use_gqa_opt && gqa_ratio > 4 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            return;
+        }
+    }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {

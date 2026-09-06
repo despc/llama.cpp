@@ -1758,7 +1758,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
-           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
+           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
+           // qwen4exp: 256/256 heads, selected by its own indexer
+           (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
@@ -1812,6 +1814,10 @@ static __global__ void flash_attn_ext_f16(
         return;
     }
 #ifdef VOLTA_MMA_AVAILABLE
+    // Volta's MMA fragments only exist at I == 32, so a narrower tile traps in
+    // tile::supported().  This is a correctness bound, not a compile-time prune:
+    // the sparse path wants one query column per block and therefore cannot run
+    // here until Volta gains narrower fragment shapes.
     if (ncols1*ncols2 < 32) {
         NO_DEVICE_CODE;
         return;
