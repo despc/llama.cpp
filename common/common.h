@@ -680,6 +680,10 @@ struct common_params {
     bool endpoint_props   = false; // only control POST requests, not GET
     bool endpoint_metrics = false;
 
+    // reject a request whose "model" field is neither the loaded model nor one of its aliases,
+    // instead of ignoring the field (see --check-model-name)
+    bool check_model_name = false;
+
     // enable built-in tools
     std::vector<std::string> server_tools;
     std::string server_tools_runtime;

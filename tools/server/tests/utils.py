@@ -62,6 +62,7 @@ class ServerProcess:
     # custom options
     model_alias: str | None = None
     model_tags: str | None = None
+    check_model_name: bool | None = None
     model_url: str | None = None
     model_file: str | None = None
     model_draft: str | None = None
@@ -214,6 +215,8 @@ class ServerProcess:
             server_args.extend(["--alias", self.model_alias])
         if self.model_tags:
             server_args.extend(["--tags", self.model_tags])
+        if self.check_model_name:
+            server_args.append("--check-model-name")
         if self.n_ctx:
             server_args.extend(["--ctx-size", self.n_ctx])
         if self.n_slots:

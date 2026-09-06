@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -4246,6 +4247,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task_response_type res_type) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
+    // note: `data` may be a converted body (Anthropic, Responses, transcriptions), so check the
+    //       request as the client actually sent it
+    if (auto rejected = reject_unknown_model(req)) {
+        return rejected;
+    }
+
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
     auto & rd = res->rd;
@@ -4517,11 +4524,42 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           queue_results(ctx_server.impl->queue_results) {
     init_routes();
 
+    // A router child must not second-guess the name it is handed: the router proxies the client body
+    // verbatim, and it routes by its own registry key, which need not be one of this process' aliases.
+    // The router already answers 404 for a model it does not know. (cf. server_child::is_child())
+    check_model_name = params.check_model_name && std::getenv("LLAMA_SERVER_ROUTER_PORT") == nullptr;
+
     // note: this must be registered before load_model()
     //       so that on sleep phase, the callback is called before ctx is destroyed
     queue_tasks.on_sleeping_state([this](bool is_sleeping) {
         update_cached_responses(is_sleeping);
     });
+}
+
+std::unique_ptr<server_res_generator> server_routes::reject_unknown_model(const server_http_req & req) {
+    if (!check_model_name || !meta) {
+        return nullptr;
+    }
+
+    std::string requested;
+    try {
+        requested = json_value(json::parse(req.body), "model", std::string());
+    } catch (const std::exception &) {
+        // a body we cannot parse is not our error to report; let the handler say what is wrong with it
+        return nullptr;
+    }
+
+    // an omitted or empty name is how most clients ask for "whatever this server has loaded"
+    if (requested.empty() || requested == meta->model_name || meta->model_aliases.count(requested)) {
+        return nullptr;
+    }
+
+    // bypass_sleep: waking the model up only to refuse the request would defeat the purpose
+    auto res = create_response(true);
+    res->error(format_error_response(
+        "model '" + requested + "' is not loaded by this server, it serves '" + meta->model_name + "'",
+        ERROR_TYPE_NOT_FOUND));
+    return res;
 }
 
 static json get_res_model_info(const server_context_meta & meta) {
@@ -5042,6 +5080,10 @@ void server_routes::init_routes() {
 
     // same with handle_chat_completions, but without inference part
     this->post_apply_template = [this](const server_http_req & req) {
+        if (auto rejected = reject_unknown_model(req)) {
+            return rejected;
+        }
+
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy, unused
         json body = json::parse(req.body);
@@ -5129,6 +5171,10 @@ void server_routes::init_routes() {
     };
 
     this->post_rerank = [this](const server_http_req & req) {
+        if (auto rejected = reject_unknown_model(req)) {
+            return rejected;
+        }
+
         auto res = create_response();
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
             res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
@@ -5372,6 +5418,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
+    if (auto rejected = reject_unknown_model(req)) {
+        return rejected;
+    }
+
     auto res = create_response();
     if (!params.embedding) {
         res->error(format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
@@ -5470,6 +5520,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type) {
+    if (auto rejected = reject_unknown_model(req)) {
+        return rejected;
+    }
+
     auto res = create_response();
     std::vector<raw_buffer> files;
     json body = json::parse(req.body);

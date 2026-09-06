@@ -3121,6 +3121,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TAGS"));
     add_opt(common_arg(
+        {"--check-model-name"},
+        "reject a request whose \"model\" field is neither the model name nor one of its aliases, with 404 "
+        "(default: the field is ignored and every request is served by the loaded model)",
+        [](common_params & params) {
+            params.check_model_name = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHECK_MODEL_NAME"));
+    add_opt(common_arg(
         {"-m", "--model"}, "FNAME",
         ex == LLAMA_EXAMPLE_EXPORT_LORA
             ? "model path from which to load base model"

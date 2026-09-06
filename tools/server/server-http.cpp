@@ -143,7 +143,9 @@ bool server_http_context::init(const common_params & params) {
     });
 
     srv->set_error_handler([](const httplib::Request &, httplib::Response & res) {
-        if (res.status == 404) {
+        // only fill in a body for a 404 that has none, i.e. one that came from routing rather than
+        // from a handler -- a handler's own res->error() already says which thing was not found
+        if (res.status == 404 && res.body.empty()) {
             res.set_content(
                 safe_json_to_str(json {
                     {"error", {
