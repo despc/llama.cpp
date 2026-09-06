@@ -328,8 +328,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
+    cb(lo, "hc_down", il);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
+    ggml_tensor * gate_pre = build_lora_mm(w_up, lo);
+    cb(gate_pre, "hc_up", il);
+    ggml_tensor * gate = ggml_sigmoid(ctx0, gate_pre);
     cb(gate, "hc_gate", il);
 
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
@@ -837,6 +840,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
+    cb(k_raw, "indexer_k_proj", il);
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
 
@@ -885,6 +889,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
             ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+    // named before the reshape as well: this matmul scores every compressed block
+    // against every query and is the indexer's dominant cost, so it needs to be
+    // separable in a profile rather than landing in the unnamed pile
+    cb(score, "indexer_score_raw", il);
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
 
@@ -1125,6 +1133,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    cb(beta, "ssm_beta_proj", il);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
@@ -1132,6 +1141,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    cb(alpha, "ssm_alpha_proj", il);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
