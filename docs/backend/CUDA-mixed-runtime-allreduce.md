@@ -1123,3 +1123,5 @@ The practical rule for this architecture: any change to the memory balance --
 split, context, draft, quant -- has to be re-checked with a prompt long enough
 to fill a real fraction of the context. `bench/prompt30k.json` and
 `bench/prompt100k.json` exist for that.
+
+The [2026-09-06 Flash-Next prefill plan](CUDA-flash-next-prefill-plan.md) records the opt-in bounded sort workspace experiment, its successful 150k prompt run, the deployment stop point, and further optimization options for the four-GPU layer-split configuration. The earlier 27B tensor-parallel AllReduce findings are a different workload.
