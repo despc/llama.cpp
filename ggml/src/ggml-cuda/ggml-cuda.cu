@@ -724,7 +724,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             auto & scratch = fattn_prep_scratch[i][j];
             if (scratch.union_idx || scratch.union_len || scratch.gathered ||
                 scratch.bitmap || scratch.prefix || scratch.qmask ||
-                scratch.cmask || scratch.out) {
+                scratch.cmask || scratch.out || scratch.pq_ready) {
                 ggml_cuda_set_device(i);
                 // Scratch can still be in use when the diagnostic timers are disabled.
                 if (streams[i][j] != nullptr) {
@@ -738,6 +738,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 if (scratch.qmask)     { CUDA_CHECK(cudaFree(scratch.qmask)); }
                 if (scratch.cmask)     { CUDA_CHECK(cudaFree(scratch.cmask)); }
                 if (scratch.out)       { CUDA_CHECK(cudaFree(scratch.out)); }
+                if (scratch.pq_indices)   { CUDA_CHECK(cudaFree(scratch.pq_indices)); }
+                if (scratch.pq_union_idx) { CUDA_CHECK(cudaFree(scratch.pq_union_idx)); }
+                if (scratch.pq_union_len) { CUDA_CHECK(cudaFree(scratch.pq_union_len)); }
+                if (scratch.pq_gathered)  { CUDA_CHECK(cudaFree(scratch.pq_gathered)); }
+                if (scratch.pq_cmask)     { CUDA_CHECK(cudaFree(scratch.pq_cmask)); }
+                if (scratch.pq_out)       { CUDA_CHECK(cudaFree(scratch.pq_out)); }
             }
             if (streams[i][j] != nullptr) {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));

@@ -2426,3 +2426,77 @@ above are not read as more settled than they are.
   is an optimisation with a correctness cost to re-establish.
 - **Generation quality above the threshold is unmeasured**, exactly as for
   prefill, and now it matters more: this regime changes generation directly.
+
+### Review of f8a35540e: three defects, one of them structural
+
+A static review of the decode commit found three problems. All three were real,
+and the first was the kind that a benchmark cannot see.
+
+**Scratch lifetime against CUDA graphs.** The `capturing` check refused to
+*allocate* during a capture, which is necessary and does nothing for addresses
+already baked into a graph captured earlier. Capture a graph, let an uncaptured
+call grow the shared scratch -- freeing the old buffer -- and replaying that graph
+reads memory that no longer belongs to it. The graph-update check inspects
+tensors, not these internal buffers, so nothing catches it.
+
+The first thing this needed was a fact rather than an argument: the section above
+listed "CUDA graph capture is argued, not confirmed" as owed work precisely
+because capture succeeding and capture never happening look identical from
+outside. A one-line observation settled it -- `capturing=1` appears for the
+per-query regime -- so the hazard was live, not theoretical.
+
+The fix is structural rather than a guard. With the per-query regime engaged,
+`union_n` is a model constant: the regime only runs when `n_kv` exceeds twice it,
+so `n_kv` is always past `n_kv_max` and the compact size is always
+`PAD(n_kv_max, 256)`. Nothing it needs is proportional to the cache. So:
+
+- the per-query regime has its own buffers, sharing nothing with the tiled one
+  that grows with the cache;
+- they are allocated once, on a call that is not being captured, sized by what
+  that first call needs rather than by the regime's ceiling, which does not fit
+  beside the model on a 16 GiB card;
+- a later call needing more tiles, or a different compact size, **declines** to
+  the dense path. There is no path that reallocates.
+
+Removing the cache-proportional buffers meant removing the bitmap, the scan and
+the compaction, which for a single query were never needed: the extraction kernel
+already emits an ascending, front-packed list, so one query's list *is* its union.
+That closes the "the union kernel does avoidable work at decode" item as a
+consequence of fixing the lifetime, not as a separate optimisation.
+
+**The verifier could synchronise inside a capture.** It copies to the host and
+calls `cudaStreamSynchronize`, both forbidden while capturing, and its budget of
+four calls per regime could easily still be unspent by the time capture began. It
+now requires `!capturing`, and skipping does not spend the budget -- otherwise a
+few captured calls would silently consume the whole check.
+
+**The verifier accepted NaN as a match.** With a NaN in the result, `nmse` is NaN,
+`nmse > 5e-4` is false, and the check printed "matches dense". `se == 0` does not
+catch it. Non-finite values now fail explicitly.
+
+#### What the fix broke, and what caught it
+
+The rewrite introduced a defect of its own: `fattn_sparse_gather_rows` and the
+compact-mask kernel both used `n_kv` as the stride between tiles in the index
+array, which is right for the tiled regime and wrong for the per-query one, whose
+rows are compact. Tiles past the first read far outside their data.
+
+The verifier reported `nmse 0.5743` and an illegal access followed. That is the
+whole argument for having written it: the path had already produced a plausible
++31.8%, the model still generated coherent text, and nothing about the timings
+would have suggested the result was wrong. The stride is now an explicit
+parameter.
+
+#### After the fixes
+
+| | short | pp 50k | decode after 50k |
+| --- | --- | ---: | --- |
+| decode path off | 54.79, sha be217e31a490 | 698.1 | 35.94, sha fb8a08c85c7a |
+| decode path on | 56.53, sha be217e31a490 | 698.2 | **46.45**, sha b0a5e2e5fa19 |
+| on, with verify | 56.69, sha be217e31a490 | 698.4 | 46.96, sha b0a5e2e5fa19 |
+
+**+29.2% after 50k**, which is also the controlled 50k comparison the previous
+section listed as owed. Prefill is untouched, short-prefix output is identical in
+all three, there are no CUDA errors, and `capturing=1` confirms the regime now
+runs inside captured graphs with buffers that cannot move under them.
+Verification: per-query nmse 1.88e-06 and 5.46e-07.

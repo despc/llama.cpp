@@ -1433,6 +1433,20 @@ struct ggml_cuda_fattn_prep_scratch {
     size_t qmask_capacity = 0;
     size_t cmask_capacity = 0;
     size_t out_capacity = 0;
+
+    // The per-query regime keeps its own buffers, sized once from model constants
+    // and never resized.  They must not share storage with the tiled regime above,
+    // whose buffers grow with the cache: a captured graph holds these addresses,
+    // and freeing one to grow it would leave that graph pointing at nothing.
+    int32_t * pq_indices   = nullptr;
+    int32_t * pq_union_idx = nullptr;
+    int32_t * pq_union_len = nullptr;
+    char    * pq_gathered  = nullptr;
+    half    * pq_cmask     = nullptr;
+    float   * pq_out       = nullptr;
+    bool      pq_ready     = false;
+    int       pq_tiles     = 0;   // tiles the one allocation covers; more declines, never regrows
+    int       pq_union_n   = 0;
 };
 
 struct ggml_backend_cuda_context {

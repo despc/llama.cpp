@@ -1,6 +1,7 @@
 #include <mutex>
 #include "common.cuh"
 #include <cinttypes>
+#include <cmath>
 #include <vector>
 #include <set>
 #include "fattn-common.cuh"
@@ -236,10 +237,12 @@ static __global__ void fattn_sparse_gather_rows(
         const int32_t * __restrict__ union_idx, const int32_t * __restrict__ union_len,
         int n_kv, size_t row_bytes_k, size_t src_stride_k, size_t head_stride_k,
         size_t row_bytes_v, size_t src_stride_v, size_t head_stride_v,
-        int n_head_kv, int union_stride) {
+        int n_head_kv, int union_stride, int idx_stride) {
     const int tile = blockIdx.y;
     const int len  = min(union_len[tile], union_stride);
-    const int32_t * idx = union_idx + (size_t) tile * n_kv;
+    // The stride between tiles in the index array is not n_kv: the per-query regime
+    // keeps a compact row per tile, the tiled one a cache-sized row.
+    const int32_t * idx = union_idx + (size_t) tile * idx_stride;
 
     for (int r = blockIdx.x; r < len; r += gridDim.x) {
         const int32_t pos = idx[r];
@@ -295,6 +298,46 @@ static __global__ void fattn_sparse_identity_union(
     }
 }
 
+// One query's selections are already its union: the extraction kernel emits them
+// ascending, packed from the front, with -1 after the last.  So this copies the
+// list and counts it, and the bitmap, the scan and the compaction the tiled path
+// needs are all absent -- along with the cache-sized buffers they require, which
+// is what lets the per-query scratch be a fixed size and so survive a capture.
+static __global__ void fattn_sparse_query_list(
+        const int32_t * __restrict__ indices, int32_t * __restrict__ union_idx,
+        int32_t * __restrict__ union_len, int n_kv, int n_kv_max, int stride, int rows) {
+    __shared__ int cnt;
+    const int r = blockIdx.x;
+
+    if (threadIdx.x == 0) {
+        cnt = 0;
+    }
+    __syncthreads();
+
+    const int32_t * src = indices + (size_t) r * n_kv_max;
+    int32_t       * dst = union_idx + (size_t) r * stride;
+    const int       lim = min(n_kv_max, stride);
+
+    for (int i = threadIdx.x; i < stride; i += blockDim.x) {
+        int32_t v = -1;
+        if (i < lim && r < rows) {
+            v = src[i];
+        }
+        const bool ok = v >= 0 && v < n_kv;
+        // Slots past the count are masked out later; keep them in range so a gather
+        // that reads them cannot leave the cache.
+        dst[i] = ok ? v : 0;
+        if (ok) {
+            atomicMax(&cnt, i + 1);
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        union_len[r] = cnt;
+    }
+}
+
 // The mask over the compact buffer is the real mask read at the union's
 // positions.  Taking the value rather than synthesising a zero is both simpler
 // and exact: whatever the model puts in an allowed entry travels with it, and a
@@ -305,7 +348,7 @@ static __global__ void fattn_sparse_compact_mask(
         const half * __restrict__ src, const int32_t * __restrict__ union_idx,
         const int32_t * __restrict__ union_len, half * __restrict__ out,
         int n_kv, int row0, int tile, int union_n, int mask_rows, int rows,
-        int src_rows, int64_t s31) {
+        int src_rows, int64_t s31, int idx_stride) {
     const int b = blockIdx.x;
     const int r = blockIdx.y;
 
@@ -314,7 +357,7 @@ static __global__ void fattn_sparse_compact_mask(
     const int  row  = row0 + b*tile + r;
     const bool live = r < tile && b*tile + r < rows && row < src_rows;
     const half    * in  = src + (size_t) row * s31;
-    const int32_t * idx = union_idx + (size_t) b * n_kv;
+    const int32_t * idx = union_idx + (size_t) b * idx_stride;
 
     for (int j = threadIdx.x; j < union_n; j += blockDim.x) {
         dst[j] = (live && j < len) ? in[idx[j]] : __float2half(-INFINITY);
@@ -552,7 +595,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
                         scratch.union_idx, scratch.union_len, n_kv,
                         row_bytes,   K->nb[1], K->nb[2],
                         row_bytes_v, V->nb[1], V->nb[2],
-                        n_head_kv, union_cap);
+                        n_head_kv, union_cap, n_kv);
                     fattn_sparse_prep_check("prep_gather", stream, !fattn_stage_profile::enabled());
 
                     // The compact buffer has to hold the bytes of the rows the union
@@ -667,7 +710,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
                         fattn_sparse_compact_mask<<<grid, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS, 0, stream>>>(
                             (const half *) mask->data, scratch.union_idx, scratch.union_len, scratch.cmask,
                             n_kv, t0*tile, tile, union_n, mask_rows, rows - t0*tile,
-                            int(mask->ne[1]), s31);
+                            int(mask->ne[1]), s31, n_kv);
                         fattn_sparse_prep_check("prep_cmask", stream, !fattn_stage_profile::enabled());
                     }
 
@@ -1731,8 +1774,16 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
     const bool capturing = capture != cudaStreamCaptureStatusNone;
-    if (capturing && !per_query) {
-        return false;
+    {
+        // Whether decode graphs are captured with this path in them decides how its
+        // scratch must be owned, and it cannot be inferred from the speedup: capture
+        // succeeding and capture never happening look the same from outside.
+        static bool seen[2][2] = { { false, false }, { false, false } };
+        if (!seen[per_query][capturing]) {
+            seen[per_query][capturing] = true;
+            GGML_LOG_WARN("fattn compact: mode=%s capturing=%d n_q=%d n_kv=%d\n",
+                          per_query ? "per-query" : "tiled", int(capturing), n_q, n_kv);
+        }
     }
 
     const int    n_head      = int(Q->ne[2]);
@@ -1769,58 +1820,132 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
     // With one query per tile the selection count is bounded by the indexer's own
     // top-k, so the compact size is known here and the worth-doing test can be made
     // before any work.  A tile of sixteen has to build its union first.
-    int union_n = per_query ? std::min<int>(GGML_PAD(std::min(n_kv, n_kv_max), 256), n_kv) : 0;
-    if (per_query && union_n * 2 >= n_kv) {
+    // For the per-query regime this is a model constant, not a per-call value: the
+    // regime only engages when n_kv exceeds twice it, so n_kv is always past
+    // n_kv_max and the compact size is always PAD(n_kv_max, 256).  That is what
+    // lets its buffers be a fixed size.
+    const int PQ_TILES_MAX = 16;   // the regime is defined by n_q < 16
+    const int PQ_ROWS_MAX  = 64;   // mask rows a decode microbatch is padded to
+    const int union_n_max  = GGML_PAD(n_kv_max, 256);
+    int union_n = per_query ? union_n_max : 0;
+    if (per_query && (union_n * 2 >= n_kv || n_tiles > PQ_TILES_MAX ||
+                      mask->ne[1] > PQ_ROWS_MAX || mask->ne[3] != 1)) {
         return false;
     }
 
+    const int mask_rows = 64;   // kernels may read past the queries a tile holds
+
+    // Buffers.  The two regimes must not share any: the tiled one grows its scratch
+    // with the cache, and a free-and-grow there would pull the ground out from under
+    // a graph the per-query regime had already been captured into.  So the per-query
+    // regime gets its own set, sized once from model constants no later call can
+    // exceed, and never resized.
+    int32_t * b_indices   = nullptr;
+    int32_t * b_union_idx = nullptr;
+    int32_t * b_union_len = nullptr;
+    char    * b_gathered  = nullptr;
+    half    * b_cmask     = nullptr;
+    float   * b_out       = nullptr;
+    int       alloc_tiles = 0;
+
+    ggml_cuda_pool_alloc<int32_t> indices_pool(ctx.pool());
+
+    if (per_query) {
+        if (scratch.pq_ready) {
+            // Never regrow: a captured graph holds these addresses.  A call needing
+            // more than the first one did goes to the dense path instead.
+            if (n_tiles > scratch.pq_tiles || union_n != scratch.pq_union_n) {
+                return false;
+            }
+        }
+        alloc_tiles = scratch.pq_ready ? scratch.pq_tiles : n_tiles;
+        if (!scratch.pq_ready) {
+            // One allocation, on a call that is not being captured.  Every size here
+            // is bounded by n_kv_max, the head counts and the head sizes; none by n_kv.
+            if (capturing) {
+                return false;
+            }
+            // Sized by what this first call needs, not by the regime's ceiling: on a
+            // 16 GiB card the ceiling does not fit beside the model, and decode's
+            // query count is stable in practice.
+            const int nt_a = alloc_tiles;
+            const size_t sz_idx  = size_t(PQ_ROWS_MAX) * n_kv_max * sizeof(int32_t);
+            const size_t sz_uidx = size_t(nt_a) * union_n_max * sizeof(int32_t);
+            const size_t sz_ulen = size_t(nt_a) * sizeof(int32_t);
+            const size_t sz_gath = size_t(nt_a) * union_n_max * n_head_kv * (row_bytes + row_bytes_v);
+            const size_t sz_cm   = size_t(nt_a) * mask_rows * union_n_max * sizeof(half);
+            const size_t sz_out  = GGML_PAD(size_t(DV) * n_head * nt_a * sizeof(float), 128)
+                + GGML_PAD(size_t(K->ne[0]) * union_n_max * n_head_kv * nt_a * sizeof(half), 128)
+                + GGML_PAD(size_t(DV)       * union_n_max * n_head_kv * nt_a * sizeof(half), 128);
+            CUDA_CHECK(cudaMalloc(&scratch.pq_indices,   sz_idx));
+            CUDA_CHECK(cudaMalloc(&scratch.pq_union_idx, sz_uidx));
+            CUDA_CHECK(cudaMalloc(&scratch.pq_union_len, sz_ulen));
+            CUDA_CHECK(cudaMalloc(&scratch.pq_gathered,  sz_gath));
+            CUDA_CHECK(cudaMalloc(&scratch.pq_cmask,     sz_cm));
+            CUDA_CHECK(cudaMalloc(&scratch.pq_out,       sz_out));
+            // Rows past a query's selection are masked out, but a stale quantisation
+            // scale could still be a NaN that survives the mask.
+            CUDA_CHECK(cudaMemsetAsync(scratch.pq_gathered, 0, sz_gath, stream));
+            scratch.pq_ready   = true;
+            scratch.pq_tiles   = nt_a;
+            scratch.pq_union_n = union_n;
+        }
+        b_indices   = scratch.pq_indices;
+        b_union_idx = scratch.pq_union_idx;
+        b_union_len = scratch.pq_union_len;
+        b_gathered  = scratch.pq_gathered;
+        b_cmask     = scratch.pq_cmask;
+        b_out       = scratch.pq_out;
+    } else {
+        if (capturing) {
+            return false;   // the tiled regime reads lengths back to the host anyway
+        }
+        const size_t need_idx = size_t(n_tiles) * n_kv * sizeof(int32_t);
+        const size_t need_bm  = size_t(n_tiles) * words * sizeof(uint32_t);
+        const size_t need_len = size_t(n_tiles) * sizeof(int32_t);
+        if (need_idx > scratch.union_idx_capacity) {
+            if (scratch.union_idx) { CUDA_CHECK(cudaFree(scratch.union_idx)); }
+            CUDA_CHECK(cudaMalloc(&scratch.union_idx, need_idx));
+            scratch.union_idx_capacity = need_idx;
+        }
+        if (need_len > scratch.union_len_capacity) {
+            if (scratch.union_len) { CUDA_CHECK(cudaFree(scratch.union_len)); }
+            CUDA_CHECK(cudaMalloc(&scratch.union_len, need_len));
+            scratch.union_len_capacity = need_len;
+        }
+        if (need_bm > scratch.bitmap_capacity) {
+            if (scratch.bitmap) { CUDA_CHECK(cudaFree(scratch.bitmap)); }
+            if (scratch.prefix) { CUDA_CHECK(cudaFree(scratch.prefix)); }
+            CUDA_CHECK(cudaMalloc(&scratch.bitmap, need_bm));
+            CUDA_CHECK(cudaMalloc(&scratch.prefix, need_bm));
+            scratch.bitmap_capacity = need_bm;
+        }
+        indices_pool.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
+        b_indices   = indices_pool.ptr;
+        b_union_idx = scratch.union_idx;
+        b_union_len = scratch.union_len;
+    }
+
     // Selections, one padded list per mask row.
-    ggml_cuda_pool_alloc<int32_t> indices(ctx.pool());
-    indices.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
     {
         const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
         const ggml_cuda_kernel_launch_params lp(blocks_num, dim3(256, 1, 1), 0, stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, lp,
-            (const half *) mask->data, indices.ptr, n_kv, n_kv_max, s31, s33);
+            (const half *) mask->data, b_indices, n_kv, n_kv_max, s31, s33);
         CUDA_CHECK(cudaGetLastError());
-    }
-
-    // Unions for every tile at once, so the lengths come back in one transfer
-    // rather than one per group.
-    const size_t need_idx = size_t(n_tiles) * n_kv * sizeof(int32_t);
-    const size_t need_bm  = size_t(n_tiles) * words * sizeof(uint32_t);
-    const size_t need_len = size_t(n_tiles) * sizeof(int32_t);
-    // Growing the scratch means cudaMalloc, which a capture cannot express.  Leave
-    // this operation to the dense path and take the compact one on a later capture,
-    // once an uncaptured call has sized the buffers.
-    if (capturing && (need_idx > scratch.union_idx_capacity || need_bm > scratch.bitmap_capacity ||
-                      need_len > scratch.union_len_capacity)) {
-        return false;
-    }
-    if (need_idx > scratch.union_idx_capacity) {
-        if (scratch.union_idx) { CUDA_CHECK(cudaFree(scratch.union_idx)); }
-        CUDA_CHECK(cudaMalloc(&scratch.union_idx, need_idx));
-        scratch.union_idx_capacity = need_idx;
-    }
-    if (size_t(n_tiles) * sizeof(int32_t) > scratch.union_len_capacity) {
-        if (scratch.union_len) { CUDA_CHECK(cudaFree(scratch.union_len)); }
-        CUDA_CHECK(cudaMalloc(&scratch.union_len, size_t(n_tiles) * sizeof(int32_t)));
-        scratch.union_len_capacity = size_t(n_tiles) * sizeof(int32_t);
-    }
-    if (need_bm > scratch.bitmap_capacity) {
-        if (scratch.bitmap) { CUDA_CHECK(cudaFree(scratch.bitmap)); }
-        if (scratch.prefix) { CUDA_CHECK(cudaFree(scratch.prefix)); }
-        CUDA_CHECK(cudaMalloc(&scratch.bitmap, need_bm));
-        CUDA_CHECK(cudaMalloc(&scratch.prefix, need_bm));
-        scratch.bitmap_capacity = need_bm;
     }
 
     {
         fattn_stage_timer t("compact_union", device, n_q, stream);
-        fattn_sparse_union<<<n_tiles, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS,
-                             size_t(words)*sizeof(uint32_t), stream>>>(
-            indices.ptr, scratch.union_idx, scratch.union_len, scratch.bitmap, scratch.prefix,
-            n_kv, n_kv_max, tile, n_q);
+        if (per_query) {
+            fattn_sparse_query_list<<<n_tiles, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS, 0, stream>>>(
+                b_indices, b_union_idx, b_union_len, n_kv, n_kv_max, union_n, n_q);
+        } else {
+            fattn_sparse_union<<<n_tiles, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS,
+                                 size_t(words)*sizeof(uint32_t), stream>>>(
+                b_indices, b_union_idx, b_union_len, scratch.bitmap, scratch.prefix,
+                n_kv, n_kv_max, tile, n_q);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1829,7 +1954,7 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
         // on how many rows the widest union holds, and with more than one query per
         // tile that is only known on the device.
         std::vector<int32_t> h_len(n_tiles);
-        CUDA_CHECK(cudaMemcpyAsync(h_len.data(), scratch.union_len,
+        CUDA_CHECK(cudaMemcpyAsync(h_len.data(), b_union_len,
             h_len.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -1850,42 +1975,50 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
         }
     }
 
-    // Tiles per launch, bounded by what the gathered cache may occupy.
+    // Tiles per launch, bounded by what the gathered cache may occupy.  The
+    // per-query regime takes all its tiles at once: its buffers were sized for the
+    // maximum and must be addressed at that stride whatever this call needs.
     const int64_t budget_rows = 32768;
-    const int group = std::max(1, std::min<int>(n_tiles, int(budget_rows / std::max(1, union_n))));
+    const int group = per_query ? n_tiles
+        : std::max(1, std::min<int>(n_tiles, int(budget_rows / std::max(1, union_n))));
 
-    const int    mask_rows = 64;   // kernels may read past the queries a tile holds
-    const size_t need_gath = size_t(group) * union_n * n_head_kv * (row_bytes + row_bytes_v);
-    const size_t need_cm   = size_t(group) * mask_rows * union_n * sizeof(half);
-    const size_t need_out  = GGML_PAD(size_t(DV) * n_head * tile * group * sizeof(float), 128)
-        + GGML_PAD(size_t(K->ne[0]) * union_n * n_head_kv * group * sizeof(half), 128)
-        + GGML_PAD(size_t(DV)       * union_n * n_head_kv * group * sizeof(half), 128);
+    if (!per_query) {
+        alloc_tiles = group;
+        const size_t need_gath = size_t(group) * union_n * n_head_kv * (row_bytes + row_bytes_v);
+        const size_t need_cm   = size_t(group) * mask_rows * union_n * sizeof(half);
+        const size_t need_out  = GGML_PAD(size_t(DV) * n_head * tile * group * sizeof(float), 128)
+            + GGML_PAD(size_t(K->ne[0]) * union_n * n_head_kv * group * sizeof(half), 128)
+            + GGML_PAD(size_t(DV)       * union_n * n_head_kv * group * sizeof(half), 128);
 
-    if (capturing && (need_gath > scratch.gathered_capacity || need_cm > scratch.cmask_capacity ||
-                      need_out > scratch.out_capacity)) {
-        return false;
-    }
-    if (need_gath > scratch.gathered_capacity) {
-        if (scratch.gathered) { CUDA_CHECK(cudaFree(scratch.gathered)); }
-        CUDA_CHECK(cudaMalloc(&scratch.gathered, need_gath));
-        // Rows past a tile's union are masked out, but a stale quantisation scale
-        // could still be a NaN that survives the mask.
-        CUDA_CHECK(cudaMemsetAsync(scratch.gathered, 0, need_gath, stream));
-        scratch.gathered_capacity = need_gath;
-    }
-    if (need_cm > scratch.cmask_capacity) {
-        if (scratch.cmask) { CUDA_CHECK(cudaFree(scratch.cmask)); }
-        CUDA_CHECK(cudaMalloc(&scratch.cmask, need_cm));
-        scratch.cmask_capacity = need_cm;
-    }
-    if (need_out > scratch.out_capacity) {
-        if (scratch.out) { CUDA_CHECK(cudaFree(scratch.out)); }
-        CUDA_CHECK(cudaMalloc(&scratch.out, need_out));
-        scratch.out_capacity = need_out;
+        if (need_gath > scratch.gathered_capacity) {
+            if (scratch.gathered) { CUDA_CHECK(cudaFree(scratch.gathered)); }
+            CUDA_CHECK(cudaMalloc(&scratch.gathered, need_gath));
+            // Rows past a tile's union are masked out, but a stale quantisation scale
+            // could still be a NaN that survives the mask.
+            CUDA_CHECK(cudaMemsetAsync(scratch.gathered, 0, need_gath, stream));
+            scratch.gathered_capacity = need_gath;
+        }
+        if (need_cm > scratch.cmask_capacity) {
+            if (scratch.cmask) { CUDA_CHECK(cudaFree(scratch.cmask)); }
+            CUDA_CHECK(cudaMalloc(&scratch.cmask, need_cm));
+            scratch.cmask_capacity = need_cm;
+        }
+        if (need_out > scratch.out_capacity) {
+            if (scratch.out) { CUDA_CHECK(cudaFree(scratch.out)); }
+            CUDA_CHECK(cudaMalloc(&scratch.out, need_out));
+            scratch.out_capacity = need_out;
+        }
+        b_gathered = scratch.gathered;
+        b_cmask    = scratch.cmask;
+        b_out      = scratch.out;
     }
 
-    char * gK = scratch.gathered;
-    char * gV = gK + size_t(group) * union_n * n_head_kv * row_bytes;
+    // The union_idx stride differs by regime: the tiled one keeps a cache-sized row
+    // per tile, the per-query one a compact-sized row.
+    const size_t uidx_stride = per_query ? size_t(union_n) : size_t(n_kv);
+
+    char * gK = b_gathered;
+    char * gV = gK + size_t(alloc_tiles) * union_n * n_head_kv * row_bytes;
 
     for (int t0 = 0; t0 < n_tiles; t0 += group) {
         const int nt = std::min(group, n_tiles - t0);
@@ -1895,18 +2028,18 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
             const dim3 grid(256, nt, 1);
             fattn_sparse_gather_rows<<<grid, 64, 0, stream>>>(
                 (const char *) K->data, gK, (const char *) V->data, gV,
-                scratch.union_idx + (size_t) t0 * n_kv, scratch.union_len + t0, n_kv,
+                b_union_idx + (size_t) t0 * uidx_stride, b_union_len + t0, n_kv,
                 row_bytes, K->nb[1], K->nb[2], row_bytes_v, V->nb[1], V->nb[2],
-                n_head_kv, union_n);
+                n_head_kv, union_n, int(uidx_stride));
             CUDA_CHECK(cudaGetLastError());
         }
         {
             fattn_stage_timer t("compact_mask", device, n_q, stream);
             const dim3 grid(nt, mask_rows, 1);
             fattn_sparse_compact_mask<<<grid, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS, 0, stream>>>(
-                (const half *) mask->data, scratch.union_idx + (size_t) t0 * n_kv,
-                scratch.union_len + t0, scratch.cmask, n_kv, t0*tile, tile, union_n,
-                mask_rows, n_q - t0*tile, int(mask->ne[1]), s31);
+                (const half *) mask->data, b_union_idx + (size_t) t0 * uidx_stride,
+                b_union_len + t0, b_cmask, n_kv, t0*tile, tile, union_n,
+                mask_rows, n_q - t0*tile, int(mask->ne[1]), s31, int(uidx_stride));
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -1936,7 +2069,7 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
         Mc.nb[1] = size_t(union_n) * sizeof(half);
         Mc.nb[2] = size_t(mask_rows) * Mc.nb[1];
         Mc.nb[3] = Mc.nb[2];
-        Mc.data  = scratch.cmask; Mc.view_src = nullptr; Mc.buffer = nullptr;
+        Mc.data  = b_cmask; Mc.view_src = nullptr; Mc.buffer = nullptr;
 
         ggml_tensor Dc = *dst;
         Dc.ne[0] = DV; Dc.ne[1] = n_head; Dc.ne[2] = tile; Dc.ne[3] = nt;
@@ -1944,7 +2077,7 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
         Dc.nb[1] = Dc.ne[0] * Dc.nb[0];
         Dc.nb[2] = Dc.ne[1] * Dc.nb[1];
         Dc.nb[3] = Dc.ne[2] * Dc.nb[2];
-        Dc.data  = scratch.out; Dc.view_src = nullptr; Dc.buffer = nullptr;
+        Dc.data  = b_out; Dc.view_src = nullptr; Dc.buffer = nullptr;
         Dc.src[0] = &Qc; Dc.src[1] = &Kc; Dc.src[2] = &Vc; Dc.src[3] = &Mc; Dc.src[4] = nullptr;
         ggml_set_op_params_i32(&Dc, 4, 0);   // keeps the inner dispatch dense
 
@@ -1965,8 +2098,11 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
         // a long prefix does not fit beside the model.  A handful of calls per mode
         // establishes agreement; running it on every layer of every token does not
         // establish more, and does run out of memory.
+        // Never inside a capture: this branch copies to the host and synchronises the
+        // stream, both forbidden while capturing.  Skipping must not spend the budget,
+        // or a few captured calls would silently consume the whole check.
         static int verify_left[2] = { 4, 4 };
-        if (verify_on && verify_left[per_query] > 0) {
+        if (verify_on && !capturing && verify_left[per_query] > 0) {
             verify_left[per_query]--;
             static bool said[2] = { false, false };
             const int    nq_g  = nt * tile;
@@ -2014,7 +2150,7 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
             g_fattn_in_compact = outer;
 
             std::vector<float> a(n_out), e(n_out);
-            CUDA_CHECK(cudaMemcpyAsync(a.data(), scratch.out, n_out*sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(a.data(), b_out, n_out*sizeof(float), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaMemcpyAsync(e.data(), ro,          n_out*sizeof(float), cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -2028,6 +2164,13 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
                 GGML_ABORT("compact verification is not measuring anything");
             }
             const double nmse = sd/se;
+            // A NaN makes every comparison false, so `nmse > threshold` would pass it
+            // and report a match.  Non-finite has to fail explicitly.
+            if (!std::isfinite(sd) || !std::isfinite(se) || !std::isfinite(nmse)) {
+                GGML_LOG_ERROR("compact_verify %s: non-finite result (sd=%g se=%g) at n_q=%d n_kv=%d union_n=%d\n",
+                               per_query ? "per-query" : "tiled", sd, se, n_q, n_kv, union_n);
+                GGML_ABORT("compact attention produced a non-finite result");
+            }
             if (nmse > 5e-4) {
                 GGML_LOG_ERROR("compact_verify %s: nmse %.4g at n_q=%d n_kv=%d union_n=%d\n",
                                per_query ? "per-query" : "tiled", nmse, n_q, n_kv, union_n);
@@ -2043,7 +2186,7 @@ static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx
         // The compact output is contiguous over (dim, head, query) for this group's
         // queries, and so is the destination, so one run copies it.
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size_t(t0) * tile * dst->nb[2],
-            scratch.out, size_t(nt) * tile * n_head * DV * sizeof(float),
+            b_out, size_t(nt) * tile * n_head * DV * sizeof(float),
             cudaMemcpyDeviceToDevice, stream));
     }
 
