@@ -1673,3 +1673,62 @@ Still not established, and the last of these is now the largest unknown:
 
 The next step is a small operator-level prototype that includes union
 construction and masking, not an integrated kernel.
+
+### The long-context profile, 2026-09-07
+
+The 30k shares could not be used to size long-context work, since attention and
+selection grow with the square of the prompt while the expert matmuls grow with
+its length. Profiled at a 100k prefill; uninstrumented reference 473.8 tokens/s,
+instrumented 452.9, so the profiler costs 4.4% here.
+
+Teslas, 148878 ms against 28637 ms at 30k:
+
+| Operation | ms at 100k | share at 100k | share at 30k | growth |
+| --- | ---: | ---: | ---: | ---: |
+| FLASH_ATTN_EXT | 61459 | 41.3% | 19.7% | 10.9x |
+| MUL_MAT_ID | 38629 | 25.9% | 40.0% | 3.4x |
+| MUL_MAT | 18892 | 12.7% | 19.6% | 3.4x |
+| TOP_K | 11070 | 7.4% | 3.1% | 12.3x |
+| GATED_DELTA_NET | 4444 | 3.0% | 4.7% | 3.3x |
+
+Blackwells, 27680 ms: MUL_MAT_ID 37.6%, FLASH_ATTN_EXT 20.8%, MUL_MAT 12.7%,
+TOP_K 9.2%. The Teslas are 84.3% of summed GPU time.
+
+The growth rates are a check on the earlier scaling claim rather than a new
+result. The pair count between these two prompts grows 11.1x; attention grew
+10.9x and top-k 12.3x, while everything proportional to token count grew about
+3.4x. Attention time tracking positions now has two independent confirmations.
+
+Three consequences.
+
+**Attention is the largest single item at long context**, 41.3% against 19.7% at
+30k, and it was second there. The ranking that put experts first was a ranking
+for short prefills.
+
+**The expert matmuls fall to 25.9%.** The two dispatch fixes already deployed
+addressed what dominates a short prefill; they are worth proportionally less as
+the context grows, which is consistent with prefill gains of 90% at 5k against
+54% at 100k.
+
+**TOP_K is 7.4% and growing faster than anything else**, 12.3x between these
+prompts. R12 was retired on its 2.7% share at 30k. That retirement was wrong for
+the regime that matters, exactly as the review warned when it said a 30k share is
+"not a universal wall-time ceiling or a measurement at 150k/decode". Attention
+and selection together are 48.7% of Tesla time at 100k -- half of it.
+
+### What sparse attention would be worth, with the assumptions stated
+
+At a 100k prefill the mean cache is about 50k, where the measured union ratio
+lies between 4.91x at 37120 and 8.51x at 74496; taking roughly 6x, a kernel
+visiting the union instead of the whole cache removes about five sixths of the
+attention work. That is 34.4% of Tesla time and, at the Teslas' 84.3% share, about
+29% of summed GPU time -- against the 11% the 30k data supported.
+
+The assumptions are load-bearing and none of them is verified: that the union can
+be gathered at the cost of a contiguous read, that building it and masking within
+it are free, and that a gather kernel meets no limit the streaming one avoids.
+Those three are what a prototype exists to measure, and they can only reduce the
+figure.
+
+TOP_K's 7.4% is not addressed by any of this. It is the indexer's own selection,
+and it grows at the same rate as the attention it feeds.
