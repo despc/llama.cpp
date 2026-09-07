@@ -1474,11 +1474,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // Label the submission so a backend profiler can separate the trunk from the
+    // draft and prefill from verification.  The label carries the two facts that
+    // distinguish them -- how many layers this context's model has and how many
+    // tokens are in flight -- rather than an interpretation of those facts: MTP
+    // verification submits two tokens, which any "more than one means prefill"
+    // rule would file as prefill, and the draft head does not report a small
+    // layer count.
+    {
+        static thread_local char tag[32];
+        const uint32_t nt = ubatch.n_tokens;
+        snprintf(tag, sizeof(tag), "L%u-t%s", model.hparams.n_layer(),
+                 nt == 1 ? "1" : nt == 2 ? "2" : nt <= 8 ? "3-8" : nt <= 64 ? "9-64" : "many");
+        ggml_profile_tag_set(tag);
+    }
+
     ggml_status status;
     {
         phase_timer t(&g_ubatch_profile.compute_ms);
         status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     }
+    ggml_profile_tag_set("");
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

@@ -739,6 +739,13 @@ extern "C" {
     // presence makes "FLAG=0" turn a feature on, which silently turns a control run
     // into a candidate run.
     GGML_API bool ggml_env_flag_enabled(const char * name);
+
+    // A label for whatever is currently being computed, for diagnostic profilers
+    // that live in a backend and cannot see who called them.  Set by the caller
+    // right before submitting a graph; read by profilers when they attribute a
+    // node.  Both CUDA runtimes link ggml-base, so both see the same label.
+    GGML_API void         ggml_profile_tag_set(const char * tag);
+    GGML_API const char * ggml_profile_tag_get(void);
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);
 

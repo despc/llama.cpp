@@ -4802,10 +4802,11 @@ static bool ggml_cuda_op_profile_enabled() {
 struct ggml_cuda_op_profile_key {
     int device;
     ggml_op op;
+    std::string tag;
     std::string name;
 
     bool operator<(const ggml_cuda_op_profile_key & other) const {
-        return std::tie(device, op, name) < std::tie(other.device, other.op, other.name);
+        return std::tie(device, op, tag, name) < std::tie(other.device, other.op, other.tag, other.name);
     }
 };
 
@@ -4823,7 +4824,7 @@ struct ggml_cuda_op_profile_table {
 
     void add(int device, const ggml_tensor * node, double gpu_ms, double cpu_ms) {
         std::lock_guard<std::mutex> lock(mutex);
-        ggml_cuda_op_profile_stat & stat = stats[{ device, node->op, node->name }];
+        ggml_cuda_op_profile_stat & stat = stats[{ device, node->op, ggml_profile_tag_get(), node->name }];
         stat.calls  += 1;
         stat.gpu_ms += gpu_ms;
         stat.cpu_ms += cpu_ms;
@@ -4847,8 +4848,8 @@ struct ggml_cuda_op_profile_table {
         GGML_LOG_WARN("cuda_op_profile backend=%s total_gpu_ms=%.1f distinct=%zu (diagnostic: synchronised, graphs off)\n",
                       GGML_CUDA_NAME, total_gpu, rows.size());
         for (const auto & row : rows) {
-            GGML_LOG_WARN("cuda_op_profile backend=%s device=%d op=%-16s name=%-32s calls=%-8" PRId64 " gpu_ms=%10.2f gpu_pct=%5.1f cpu_ms=%10.2f\n",
-                          GGML_CUDA_NAME, row.first.device, ggml_op_name(row.first.op), row.first.name.c_str(),
+            GGML_LOG_WARN("cuda_op_profile backend=%s device=%d tag=%-14s op=%-16s name=%-32s calls=%-8" PRId64 " gpu_ms=%10.2f gpu_pct=%5.1f cpu_ms=%10.2f\n",
+                          GGML_CUDA_NAME, row.first.device, row.first.tag.c_str(), ggml_op_name(row.first.op), row.first.name.c_str(),
                           row.second.calls, row.second.gpu_ms,
                           total_gpu > 0.0 ? 100.0 * row.second.gpu_ms / total_gpu : 0.0,
                           row.second.cpu_ms);

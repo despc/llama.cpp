@@ -571,6 +571,16 @@ int64_t ggml_time_us(void) {
 }
 #endif
 
+static const char * g_profile_tag = "";
+
+void ggml_profile_tag_set(const char * tag) {
+    g_profile_tag = tag ? tag : "";
+}
+
+const char * ggml_profile_tag_get(void) {
+    return g_profile_tag;
+}
+
 bool ggml_env_flag_enabled(const char * name) {
     const char * value = getenv(name);
     if (!value || !value[0]) {
