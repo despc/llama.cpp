@@ -5172,7 +5172,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
-    if (ggml_cuda_op_profile_enabled()) {
+    // Both profilers synchronise on events recorded on the compute stream, which
+    // is not permitted inside a graph capture.
+    static const bool fattn_stage_profile = ggml_env_flag_enabled("GGML_CUDA_FATTN_STAGE_PROFILE");
+    if (ggml_cuda_op_profile_enabled() || fattn_stage_profile) {
         use_cuda_graph = false;
         cuda_graph_update_required = false;
     }

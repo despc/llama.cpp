@@ -1,5 +1,10 @@
 #pragma once
 
+#include <string>
+#include <vector>
+#include <tuple>
+#include <mutex>
+#include <map>
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
@@ -972,6 +977,75 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Where the time in one attention operation goes, opt-in via
+// GGML_CUDA_FATTN_STAGE_PROFILE.  launch_fattn does three separable things --
+// convert the quantised K/V view to FP16, run the attention kernel, and combine
+// partial results.  A single figure for the whole operation cannot be compared
+// against a matmul peak, because two of the three are not matmuls.  Events are
+// recorded on the compute stream and collected at process exit.
+struct fattn_stage_profile {
+    std::mutex mutex;
+    std::map<std::tuple<std::string, int, int>, std::pair<int64_t, double>> stats;
+
+    static bool enabled() {
+        static const bool on = ggml_env_flag_enabled("GGML_CUDA_FATTN_STAGE_PROFILE");
+        return on;
+    }
+
+    void add(const char * stage, int device, int nq, double ms) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto & acc = stats[{ std::string(stage), device, nq }];
+        acc.first  += 1;
+        acc.second += ms;
+    }
+
+    ~fattn_stage_profile() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto & kv : stats) {
+            GGML_LOG_WARN("fattn_stage backend=%s device=%d stage=%-11s queries=%-5d calls=%-7lld total_ms=%9.2f\n",
+                          GGML_CUDA_NAME, std::get<1>(kv.first), std::get<0>(kv.first).c_str(),
+                          std::get<2>(kv.first), (long long) kv.second.first, kv.second.second);
+        }
+    }
+};
+
+static fattn_stage_profile g_fattn_stages;
+
+// One timed region.  Explicit begin/end rather than a scope, so that it never
+// spans more of a function than intended.
+struct fattn_stage_timer {
+    const char * stage; int device; int nq; cudaStream_t stream;
+    cudaEvent_t a = nullptr, b = nullptr;
+
+    fattn_stage_timer(const char * stage, int device, int nq, cudaStream_t stream)
+            : stage(stage), device(device), nq(nq), stream(stream) {
+        if (fattn_stage_profile::enabled()) {
+            CUDA_CHECK(cudaEventCreate(&a));
+            CUDA_CHECK(cudaEventCreate(&b));
+            CUDA_CHECK(cudaEventRecord(a, stream));
+        }
+    }
+
+    // Read immediately rather than at exit: deferring meant synchronising after
+    // the context was gone, which fails silently.  This serialises the stage, so
+    // the figures are for attributing one operation's parts against each other,
+    // not for production latency.
+    ~fattn_stage_timer() {
+        if (!a) {
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(b, stream));
+        CUDA_CHECK(cudaEventSynchronize(b));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
+        g_fattn_stages.add(stage, device, nq, ms);
+        CUDA_CHECK(cudaEventDestroy(a));
+        CUDA_CHECK(cudaEventDestroy(b));
+    }
+};
+
+
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1023,6 +1097,8 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
+    {
+    fattn_stage_timer t_conv("convert_kv", ggml_cuda_get_device(), int(Q->ne[1]), main_stream);
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
@@ -1086,6 +1162,7 @@ void launch_fattn(
             V_data = (char *) V_f16;
         }
     }
+    }   // convert_kv
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
@@ -1230,6 +1307,7 @@ void launch_fattn(
                           ntiles_x, ntiles_z_gqa, ntiles_KV, parallel_blocks, (long long) Q->ne[1], (long long) K->ne[1], n_kv_max);
         }
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+        fattn_stage_timer t_attn("attention", ggml_cuda_get_device(), int(Q->ne[1]), main_stream);
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
@@ -1289,6 +1367,7 @@ void launch_fattn(
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+        fattn_stage_timer t_comb("combine", ggml_cuda_get_device(), int(Q->ne[1]), main_stream);
         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }

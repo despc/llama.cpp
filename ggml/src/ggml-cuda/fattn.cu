@@ -219,6 +219,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
+    static const int ncols1_forced = getenv("GGML_CUDA_FATTN_NCOLS1") ? atoi(getenv("GGML_CUDA_FATTN_NCOLS1")) : 0;
+    if (ncols1_forced) {
+        switch (ncols1_forced) {
+            case  8: if constexpr (8*ncols2  <= 64) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV,  8, ncols2>(ctx, dst); return; } break;
+            case 16: if constexpr (16*ncols2 <= 64) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16, ncols2>(ctx, dst); return; } break;
+            case 32: if constexpr (32*ncols2 <= 64) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, ncols2>(ctx, dst); return; } break;
+            default: break;
+        }
+    }
+
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
@@ -265,6 +275,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // Diagnostic override: the tile geometry is chosen by a fixed rule, and whether
+    // that rule is right for these shapes on Volta has never been measured.  These
+    // select among already-compiled instantiations, so the sweep costs no build.
+    static const int ncols2_forced = getenv("GGML_CUDA_FATTN_NCOLS2") ? atoi(getenv("GGML_CUDA_FATTN_NCOLS2")) : 0;
+
     // The sparse path puts one query column in each block, so its grouping is the
     // only thing left to choose, and 8 is the only 256/256 grouping any tile table
     // configures.  Volta's rule below would pick 4, which has no configuration at
@@ -282,6 +297,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
+        if (use_gqa_opt && ncols2_forced) {
+            switch (ncols2_forced) {
+                case  1: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  1>(ctx, dst); return;
+                case  2: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  2>(ctx, dst); return;
+                case  4: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  4>(ctx, dst); return;
+                case  8: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  8>(ctx, dst); return;
+                default: break;
+            }
+        }
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
@@ -302,6 +326,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             return;
         } else {
             GGML_ABORT("fatal error");
+        }
+    }
+
+    if (use_gqa_opt && ncols2_forced) {
+        switch (ncols2_forced) {
+            case  1: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  1>(ctx, dst); return;
+            case  2: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  2>(ctx, dst); return;
+            case  4: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  4>(ctx, dst); return;
+            case  8: ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV,  8>(ctx, dst); return;
+            default: break;
         }
     }
 
