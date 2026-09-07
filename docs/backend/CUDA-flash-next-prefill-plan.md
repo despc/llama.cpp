@@ -1,10 +1,12 @@
 # Flash-Next four-GPU prefill and generation: status and optimization plan
 
-Date: 2026-09-06, with an outcome section and execution logs added 2026-09-07. The ranking below was written against baseline `f3aacb2f7`; what was then measured and deployed is summarised immediately after it and detailed in the execution logs at the end. Where the two disagree, the logs win -- several of the rankings here were refuted by measurement. This is a local deployment plan, not a claim about upstream performance.
+Date: 2026-09-06, with an outcome section, execution logs, and recheck priorities added 2026-09-07. The original ranking was written against baseline `f3aacb2f7`; later measurements refuted several priorities. Use the current outcome and P0-P6 order below; explicit later corrections supersede earlier log interpretations. This is a local deployment plan, not a claim about upstream performance.
 
 Reading guide: **[outcome](#outcome-what-shipped-what-did-not-and-why)** first if you only want the result, then [prefill ranking](#optimization-options), [detailed prefill code review](#deeper-review-ranked-candidates-and-implementation-details), [actual hardware audit](#hardware-audit-and-generation-extension), [generation ranking](#generation-ranking-for-this-machine), and [combined execution plan](#combined-execution-plan-and-measurement-contract). The hardware/generation extension was added after the user requested optimization of both prefill and generation on the existing equipment.
 
 Follow-up: [review of the executed experiments and alternative implementations](#review-of-executed-experiments-and-alternative-implementations) qualifies several causal explanations above and in the historical logs, and gives the next experiments. The reported measurements are preserved; proposed mechanisms and untested alternatives are not new benchmark results.
+
+Current execution order: [next priorities after the rechecks](#where-the-next-gain-has-to-come-from), updated against HEAD dbc99aee0 on 2026-09-07. This order supersedes the earlier R/G/A rankings; those sections retain implementation details and historical evidence, not an outstanding task list.
 
 ## Outcome: what shipped, what did not, and why
 
@@ -97,7 +99,7 @@ arithmetic, all padding. Confined to the DP4A layout, where padded columns are
 plain wasted dot products, it is worth 811 -> 907 t/s at 5k and holds at length:
 733.0 at 30k, 475.3 at 100k, 377.7 at 150k. Applying it on the MMA layout as well
 is a loss, which is what made it look like a 1.3% change for most of a day; see
-the correction below.
+the correction above.
 
 **Instrumentation that does not change what it measures.** The phase profiler
 had added an unconditional `synchronize()` per ubatch, costing 1.2% of generation
@@ -167,45 +169,55 @@ each time: a candidate directory accumulates changes, and toggling one
 environment variable between two such directories is not a controlled experiment.
 The generation regression was charged to the tile rule (the same binary measures
 the same with it on and off), then to sparse attention at decode (a query gate
-disproved it), then to naming tensors (interleaving disproved it). It was sparse
-attention during prefill.
+disproved it), then to naming tensors (interleaving disproved it). Sparse attention during prefill was the next suspect, but that attribution must now be retested without the profiler's unconditional synchronization.
 
 Separately, a 13% cut in Tesla GPU time producing 1.3% of prefill was first
 explained as host overhead, by summing per-operation GPU times -- the exact error
 this document warns against, since with a synchronise after every operation each
 measurement carries its own launch latency.
 
-A residual 1.3% still separates a fresh build of this tree from the deployed
-binaries, with identical memory and every source change tested and excluded. It
-is probably build-to-build variation in the decode path. It is not established,
-which is why the deployed binaries were left alone.
+The residual generation gap is now resolved: the profiler inserted an unconditional synchronization per ubatch. Commit 9ca8d44b9 makes it opt-in and restores parity. Identical-source builds agreed to 0.06%; build variation was the wrong explanation. This investigation is closed, not a prerequisite still waiting to be done.
 
 ### Where the next gain has to come from
 
-The last per-operation profile was taken before the tile fitting, so its shares
-are stale: at 30k on the Teslas it read MUL_MAT_ID 48.0%, FLASH_ATTN_EXT 17.0%,
-MUL_MAT 16.9%, GATED_DELTA_NET 4.0%, TOP_K 2.7%, and the expert share has since
-fallen. What survives is the scaling: from 5k to 30k the expert matmuls grow 6.4x
-with the token count while attention grows 30x and top-k 42x, so experts dominate
-up to roughly 50k and attention near the context limit -- which is where this
-deployment is weakest, 475 t/s at 100k and 378 at 150k against 907 at 5k.
+#### Next priorities after the rechecks, 2026-09-07
 
-1. Sparse attention for the Teslas. Its value grows with context, which is where
-   this deployment is weakest. New narrower MMA fragments are one route and the
-   most expensive; an index-native SIMT kernel that never uses MMA, or the twelve
-   useful heads placed in a legal 32-column tile with masked padding, are cheaper
-   ones to try first.
-2. Graph reuse across ubatches (R16). The graph was reused once in 125, because
-   the indexer input shape follows the cache length, so CUDA graphs are
-   unavailable for prefill.
-3. Real pipeline overlap, which needs memory freed first. R4 and R5 are retired
-   as direct speed targets -- 0.6% and 0.3% respectively -- but not as memory
-   enablers: neither figure measures the peak held by the expanded score and mask
-   intermediates they would remove.
+This is the current execution order, based on the rechecks recorded through dbc99aee0 and the deployed launcher's documented settings. This update is a planning review, not another benchmark run. Keep the fixed model and Q8 KV, four-device placement, context 160072, ubatch 512, and MTP depth 1 as the control.
 
-Before any of it, remeasure the sparse-attention generation cost on binaries
-without the profiler's synchronisation, and re-profile: every share above was
-taken on the old dispatch.
+Closed work: grouped Volta MMQ, the correct DP4A tile table, DP4A-only J_FIT enabled by default, and the unconditional profiler-sync defect. J_FIT now gives 810.9 -> 907.1 tokens/s at 5k, not a marginal unexplained gain. The Blackwell tile regression explains the earlier discrepancy; empty CTAs remain an independent optimization hypothesis, not its established cause. Do not repeat the completed build-variation investigation or spend another cycle deciding whether to enable J_FIT.
+
+The current recorded prefill reference is 907.1 / 733.0 / 475.3 / 377.7 tokens/s at 5k / 30k / 100k / 150k. The latest J_FIT recheck explicitly reports generation parity after short and 50k prefixes; a 150k prefill pass is not by itself a matched 150k-prefix generation comparison. Include that comparison in acceptance for the next candidate, reserving room for its continuation within the unchanged context limit.
+
+The pre-J_FIT Tesla shares (48% experts, 17% attention, 16.9% other matmuls, 4% recurrence, 2.7% top-k at 30k) are stale. Historical scaling suggests long-context attention/indexer work deserves priority, but does not establish a current crossover at 50k or prove which operation dominates at 150k.
+
+| Priority | Next work | Why now | Decision / deliverable |
+| --- | --- | --- | --- |
+| P0 | Refresh attribution and repeat the sparse control on the corrected runtime | Both kernel dispatch and synchronization changed; the old sparse generation penalty is confounded | A current per-device, target/draft, prefill/decode breakdown and a clean sparse on/off result. |
+| P1 | Index-native sparse attention for the two V100s (A2/R1), initially prefill-only | Strongest plausible long-context compute opportunity; the tested implementation, not the whole idea, is blocked | Correct selected-index SIMT prototype at actual shapes; promote only after request-level and generation gates. |
+| P2 | A bounded generation probe selected from G2/G5/G1/G4 | Generation must not become an afterthought; recent fixes show that dispatch and synchronization deserve inspection before new kernels | Test one measured cost: supported target backend sampling, a redundant handoff, tiny expert dispatch, or long-prefix dense draft attention. |
+| P3 | Remove the measured peak-live buffer with R4/R5/R7 | These can enable overlap without promising a large direct CPU speedup | Per-device late-prefix headroom sufficient for a specified two-slot allocation, or a direct speed gain. |
+| P4 | Two-slot pipeline after P3 (A5/R2) | Current implementation OOMs at 30k and has not demonstrated useful overlap | Full-context fit plus a timeline showing actual overlap, followed by unchanged generation. |
+| P5 | Stable-subgraph capture before full shape bucketing (A6/R16) | Potential launch savings are not yet quantified; bucketing can consume scarce memory | Promote ahead of P3/P4 only if P0 shows material exposed launch gaps and reusable subgraphs. |
+| P6 | Compact expert work queue, ubatch 640, generic top-k, new MMA fragments / FP16 experts | No new evidence puts these ahead of the above; some are costly or have a recorded generation tradeoff | Reopen on an explicit bottleneck measurement, not the now-resolved J_FIT discrepancy. |
+
+**P0 is a bounded measurement pass, not an open-ended instrumentation project.** Use the existing owned-process harnesses under /home/despc/llama.cpp/bench and a separate runtime directory/port; preserve the deployed server. Archive executable and loaded-library identities, effective flags, and raw results. The corrected flag parser makes J_FIT=0 a real disabled control, while an unset J_FIT uses its new enabled default.
+
+The separate port does not create VRAM headroom: schedule an exclusive GPU test window rather than loading a second full model beside an active deployment. Do not stop an unrelated/user-owned server to obtain that window; preserve deployment files and arrange service interruption explicitly if required.
+
+1. Record uninstrumented PP at 5k/30k/100k/150k and generation after short/50k/150k prefixes with matched continuations. Use interleaved repeats for comparisons and record memory peaks, clocks, and MTP accepted/proposed tokens. Reuse current archived reference samples where their exact runtime/settings match; do not rerun the entire historical matrix.
+2. Take separate diagnostic traces at representative short and long prefixes on all four devices. Split target trunk from draft catch-up, and steady-state verification from draft generation. Attribute attention, KV conversion, indexer/selection, experts, copies, host gaps, and allocation waits. Record GGML graph reuse separately from backend CUDA capture/replay.
+3. Do not benchmark pipeline overlap with LLAMA_UBATCH_PROFILE enabled: its explicit attribution synchronization still serializes execution when enabled. Likewise, per-operation synchronized timings are diagnostic, not production latency or critical-path evidence. Prefer existing non-serializing timeline tools for overlap; add only missing labels/counters.
+4. In one corrected candidate build, restore the Blackwell 256/256 prefill sparse path behind an explicit toggle, retaining the query-count gate and Volta safety guard. Compare on/off with all throughput profilers disabled. Never subtract 1.2% from the historical 2.2% and call the remainder a measured sparse penalty. If the loss disappears, retire that regression theory; if it repeats, use A3's allocation-versus-state controls. If sparse remains prefill-neutral, leave it off and do not make a complete pool investigation a prerequisite for the Volta prototype.
+
+**P1 implementation order:** direct selected-index SIMT/Q8 loads first; a legal padded MMA specialization only if the first prototype is correct but too slow; new Volta fragment mappings last. Include index preparation and KV conversion in the operator comparison, not only the attention loop. Keep target selection/causality exact and draft semantics unchanged. Sparse prefill and one/two-query sparse decode require separate dispatch and validation. If P0 finds dense draft attention or another branch dominates the long-prefix path instead, move that measured branch ahead of the target sparse implementation.
+
+**P2 is one cheap probe, not a parallel rewrite of the sampler and MMVQ.** Choose using the same P0 decode trace. If full logits cross to the CPU and the current greedy verifier supports backend sampling, test the existing option with exact output and MTP checks. If waits dominate, inspect the actual dependency before removing a synchronization. If GPU execution dominates, compare existing shape/device dispatch and fusion before writing a new kernel. Stop a neutral probe and return to P1/P3; do not increase draft depth as a substitute for this measurement.
+
+**P3/P4 form one dependent project.** Identify the exact failed allocation and overlapping lifetimes before writing a fusion. Start with the smallest change that removes the blocking live buffer; then test two slots at ubatch 512. More slots without stable independent inputs and event-safe reuse do not provide overlap. Keep copy routes and model placement unchanged until a trace demonstrates a reason to change them.
+
+**P5 is evidence-gated, not an automatic second major project.** One high-level graph reuse in 125 historical calls does not prove every backend subgraph lacks capture. If P0 shows a substantial avoidable launch/wait fraction, advance stable-subgraph capture; otherwise postpone prefix bucketing, since extra padded attention/masks and retained captures compete directly with P3's headroom.
+
+The next concrete action is P0, followed by the P1 operator prototype if the refreshed long-context trace supports it. Success means faster complete requests at the same settings, no repeatable generation regression outside the measured noise band, and retained long-context stability. No additive percentage forecast is justified by the current data.
 
 ## Scope and stop point
 
@@ -847,6 +859,8 @@ No multi-GPU bandwidth-sum speedup is promised. Advance one of these designs onl
 
 ## Combined execution plan and measurement contract
 
+Historical sequence written before the dispatch and harness fixes. Use the current P0-P6 order above for outstanding work; keep the measurement contract below. Harness ownership and R11 correctness are completed, not new prerequisites.
+
 1. **Freeze evidence:** archive hardware queries, source patch/build hashes, model tensor metadata, script environment, and actual integer placement. Before using `bench/cycle_flash.sh` again, replace its broad `pgrep -x llama-server` kill and first-PID selection with ownership of the exact launched process and a dedicated port. The current harness can affect unrelated servers; do not use it unchanged in a shared session.
 2. **Validate existing candidate:** finish R11 correctness tests and paired throughput tests in a separate runtime directory. Do not silently promote patched libraries or change the working launcher.
 3. **Measure the right cycles:** complete R0 four-device/host profiling; collect one-token draft, two-row verification, accepted/rejected cycles, pure decode reference as a diagnostic, and short/long prefill. Diagnostic profiling that synchronizes operations cannot establish production latency or overlap.
@@ -1193,6 +1207,8 @@ control.
 
 Reviewed 2026-09-07 against source HEAD b71521912, the outcome and execution logs above, the R11 evidence note, and the available benchmark/profiling logs. This review changes documentation only: no new performance measurements, runtime changes, or promotion of candidate binaries were performed. The model, its stored precision, the four GPUs, and the no-generation-regression requirement remain fixed.
 
+Historical review: the following evidence table describes the pre-recheck state. The latest outcome and P0-P6 priorities supersede its J_FIT, binary-gap, and sparse-regression conclusions. A0/A1/A3 below now carry explicit recheck status; other A sections remain implementation references.
+
 ### What the results establish, and what they do not
 
 The two shipped dispatch fixes are the strongest result: the recorded 5k gain is 478.0 -> 811.3 tokens/s, with gains also at 30k and 100k and unchanged measured generation. Removing the per-expert host-synchronous fallback and selecting a tile table compatible with the actual Volta instruction path addresses demonstrated implementation problems. Keep this deployed baseline while investigating candidates.
@@ -1215,7 +1231,7 @@ The historical statements that R1 is the only context-growing opportunity, that 
 
 ### Revised order: expected value versus maximum potential
 
-This order considers implementation cost and the generation constraint as well as potential prefill gain; it is not a forecast of additive speedups.
+Historical order from the review at b71521912, superseded by P0-P6 above after the rechecks. The residual binary gap is resolved and DP4A-only J_FIT is deployed. This table records the earlier decisions; it is not the current work queue.
 
 | Execution order | Work item | Potential and uncertainty | Entry / exit condition |
 | ---: | --- | --- | --- |
@@ -1234,6 +1250,8 @@ By maximum architectural upside rather than effort, Volta sparse attention and g
 
 Source anchors: src/llama-context.cpp, ggml/src/ggml-backend.cpp, and ggml/src/ggml-cuda/ggml-cuda.cu.
 
+Status after recheck: 9ca8d44b9 fixed the unconditional synchronization, separated allocation timing, and added reuse_wait timing. The findings below describe the old profiler. Remaining work is P0's refreshed attribution, with the explicit synchronization still enabled only in diagnostic phase-profile runs.
+
 The 30k phase profile reports 45056 ms total, 417 ms build, 252 ms set_inputs, 40792 ms submit, and 3586 ms sync. These are useful observations, but their labels are not a CPU/GPU utilization breakdown:
 
 - The build timer also encloses graph reset and scheduler graph allocation. The alloc_ms field has no separate timed allocation scope here; zero does not establish free allocation.
@@ -1244,17 +1262,17 @@ The 30k phase profile reports 45056 ms total, 417 ms build, 252 ms set_inputs, 4
 
 Next instrumentation should label request, target/draft, phase, device, layer, ubatch size, and prefix length. Split allocation/reserve from graph construction; count scheduler reallocations, input reuse waits, foreign-copy waits, and CUDA graph capture/replay/fallback by backend graph key. Use a timeline without per-op synchronization for overlap, and separate instrumented attribution runs from uninstrumented speed runs. Measure useful operator time, bytes, and dependency stalls rather than optimizing the largest host timer name.
 
-Resolve the residual 1.3% fresh-build generation loss before replacing deployed binaries. Record executable and loaded backend-library hashes, source revision, CMake cache, CUDA/host compiler versions, architecture flags, and runtime environment. Rebuild the same source twice under the same settings, compare deployed/control/candidate in interleaved runs, and inspect changed hot-kernel code/resource usage only if the gap survives. Build variation is a possible explanation, not a license to accept the regression.
+The residual gap investigation is completed: identical-source builds agreed to 0.06%, and removing the unintended per-ubatch synchronization restored parity. Preserve runtime/build identities for subsequent controls; do not keep build variation in the active hypothesis list for this resolved loss.
 
 ### A1. J_FIT: keep the measured win, investigate empty work separately
 
 Source anchors: ggml/src/ggml-cuda/mmq.cuh, especially mul_mat_q_switch_J, launch_mul_mat_q, and expert-bound handling in mul_mat_q.
 
-First evaluate J_FIT in an otherwise isolated candidate. For this option the code tests getenv presence, so unset it for the control; setting it to 0 still enables it. The current gate is not intrinsically Volta-only, so log actual device/shape dispatch instead of assuming the flag changes only Tesla prefill. The observed decode uses MMVQ; retain that path and test the actual MTP verify shapes too.
+Status after recheck: 9e8b48b5f confines fitting to the DP4A layout and enables it by default; the mixed-architecture regression is resolved. GGML_CUDA_MMQ_MMID_J_FIT=0 now disables it, and an unset variable enables it. The observed decode uses MMVQ. The compact-work proposal below remains an independent, lower-priority hypothesis (P6), not required to explain or deploy the measured +11.9% at 5k.
 
 A concrete additional opportunity is the non-Stream-K launch grid. It uses ceil(ncols_max / J) for every expert, although the expert's actual column count comes from expert_bounds. Empty column tiles return early only after being launched. With ncols_max=512, changing J from 64 to 16 changes eight column slots per expert into 32, even when that expert has only about ten useful columns. This reduces padded arithmetic in a useful tile but can increase empty CTA scheduling work. Confirm the actual Stream-K/XY branch before assigning this cost.
 
-This is a source-backed hypothesis, not an explanation already proved by the microbenchmark: the microbenchmark also launches a grid. Different real routing distributions, dimensions, overlap, and the fraction of calls affected must explain any difference between microbenchmark and request gains.
+This is a source-backed opportunity, not an explanation of the earlier small request gain: that discrepancy was traced to narrowing Blackwell MMA tiles. The microbenchmark also launches a grid, so measure actual wasted work and dispatch before building a compact queue.
 
 Alternative implementation:
 
@@ -1263,7 +1281,7 @@ Alternative implementation:
 3. Keep work discovery/counts on device. Reading the dynamic work count back to the CPU would recreate the synchronization problem the shipped grouped MMQ fix removed.
 4. Choose J using measured routing/skew and launch-plus-compute cost, not only mean assignments per expert. Benchmark zero experts, one hot expert, uneven tails, gate/up and down quantizations, and the real layer shapes.
 
-Acceptance: backend correctness on all four GPUs, no out-of-bounds expert/tail access, unchanged intended quantization, fewer wasted launches or better measured kernel time, and a paired end-to-end win with unchanged generation. Stop at the existing small J_FIT win if compact scheduling overhead cancels its savings. A small positive request gain is still useful; explaining why it is not 2x is not by itself a reason to call it a failure.
+Acceptance for any additional compact scheduling: backend correctness on all four GPUs, no out-of-bounds expert/tail access, unchanged intended quantization, fewer wasted launches or better measured kernel time, and a paired end-to-end win with unchanged generation. Keep the deployed DP4A-only J_FIT if queue overhead cancels further savings.
 
 ### A2. Volta sparse attention without removing the safety guard
 
@@ -1287,7 +1305,7 @@ Measure index construction, selected loads/dequantization, attention, and total 
 
 Source anchor: CUDA pool implementations and new_pool_for_device in ggml/src/ggml-cuda/ggml-cuda.cu.
 
-The prefill-only sparse path is implicated by the recorded experiments, but the mechanism remains unisolated. Prefill can change subsequent generation through at least two routes: allocation/capture state, or floating-point differences in cached/recurrent target and draft state that affect routing and MTP acceptance. Identical greedy text alone does not establish identical hidden state, expert routes, or accepted-token statistics.
+The old sparse regression measurements are confounded by the profiler synchronization. First reproduce a loss on a corrected same-binary control as specified in P0; neither its size nor a pool cause is currently established. If a loss repeats, prefill can change subsequent generation through at least two routes: allocation/capture state, or floating-point differences in cached/recurrent target and draft state that affect routing and MTP acceptance. Identical greedy text alone does not establish identical hidden state, expert routes, or accepted-token statistics.
 
 Do not assume ordinary heap fragmentation. This backend can select a VMM pool or a legacy cached allocator. The VMM pool is an aligned bump allocation with LIFO free assertions, so an allocation that is properly freed does not simply leave an arbitrary hole. High-water growth, physical mappings, graph-owned buffers, and later addresses can still differ. Establish which allocator each runtime/device actually uses.
 
