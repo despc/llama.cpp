@@ -4,6 +4,9 @@
 
 #include <climits>
 #include <cstdint>
+#include <tuple>
+#include <mutex>
+#include <map>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
@@ -1467,6 +1470,48 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
+// Which column tile each MUL_MAT_ID actually got, opt-in via
+// GGML_CUDA_MMQ_MMID_J_PROFILE.  The fitting rule is not written to be
+// Volta-only -- it fires wherever the batch-sized tile is at least twice the
+// expert's share -- so which devices and shapes it changes is a measurement,
+// not an assumption.
+struct ggml_cuda_mmq_J_stat {
+    int64_t calls = 0;
+    int64_t tokens = 0;
+};
+
+struct ggml_cuda_mmq_J_table {
+    std::mutex mutex;
+    // device, quantisation, tile width, whether the fitting rule chose it
+    std::map<std::tuple<int, int, int, int>, ggml_cuda_mmq_J_stat> stats;
+
+    void add(int device, ggml_type type, int J, bool fitted, int64_t tokens) {
+        std::lock_guard<std::mutex> lock(mutex);
+        ggml_cuda_mmq_J_stat & stat = stats[{ device, (int) type, J, fitted ? 1 : 0 }];
+        stat.calls  += 1;
+        stat.tokens += tokens;
+    }
+
+    ~ggml_cuda_mmq_J_table() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto & [key, stat] : stats) {
+            const auto [device, type, J, fitted] = key;
+            GGML_LOG_WARN("cuda_mmq_J backend=%s device=%d type=%-8s J=%-4d fitted=%d calls=%-8lld mean_tokens=%.1f\n",
+                          GGML_CUDA_NAME, device, ggml_type_name((ggml_type) type), J, fitted,
+                          (long long) stat.calls, stat.calls ? (double) stat.tokens / stat.calls : 0.0);
+        }
+    }
+};
+
+static ggml_cuda_mmq_J_table g_cuda_mmq_J;
+
+static void ggml_cuda_mmq_J_record(ggml_type type, int J, bool fitted, int64_t tokens) {
+    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_MMQ_MMID_J_PROFILE");
+    if (enabled) {
+        g_cuda_mmq_J.add(ggml_cuda_get_device(), type, J, fitted, tokens);
+    }
+}
+
 template <ggml_type type, bool fallback>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id    = ggml_cuda_get_device();
@@ -1479,7 +1524,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     // at J = 64 for ~10 real columns that is six times the arithmetic.  Size the tile
     // to the expert's share instead.  The grid still covers ceil(ncols_max/J) tiles
     // per expert, so a busier-than-average expert is still fully processed.
-    static const bool mmid_fit_J = ggml_env_flag_enabled("GGML_CUDA_MMQ_MMID_J_FIT");
+    // On by default now that it is confined to the layout it was derived for;
+    // GGML_CUDA_MMQ_MMID_J_FIT=0 restores the batch-sized tile.
+    static const bool mmid_fit_J = !getenv("GGML_CUDA_MMQ_MMID_J_FIT") ||
+                                    ggml_env_flag_enabled("GGML_CUDA_MMQ_MMID_J_FIT");
     if (mmid_fit_J && args.ids_dst != nullptr && args.nchannels_x > 1) {
         const int64_t per_expert = std::max<int64_t>(1, (args.ncols_dst + args.nchannels_x - 1) / args.nchannels_x);
 
@@ -1499,11 +1547,21 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             J_fit = J_wide;
         }
 
+        // Only on the DP4A layout.  There the padded columns are plain wasted dot
+        // products, so narrowing the tile removes real work.  On the MMA layout the
+        // tile is the unit the hardware operates on and a narrow one costs more than
+        // the padding saves: measured on Blackwell at 512 tokens, fitting takes Q5_1
+        // down projections from 2185 to 3999 us, and it gets worse with the batch.
+        // Applying this everywhere sped the Teslas up 2.2x and slowed the Blackwells
+        // down by nearly as much, which is why it was barely visible end to end.
+        const bool mma_layout = ggml_cuda_mmq_get_config(type, J_fit, fallback, cc).use_mma_data_layout(cc);
+
         // Only override where the mismatch is real.  A narrower tile also means more
         // tiles, so it pays only when the batch-sized one is at least twice the
         // expert's share -- at a large share the wide tile is the better choice and
         // measurably so.
-        if (J_fit > 0 && J_wide >= 2*J_fit) {
+        if (J_fit > 0 && J_wide >= 2*J_fit && !mma_layout) {
+            ggml_cuda_mmq_J_record(type, J_fit, /*fitted =*/ true, args.ncols_max);
             switch (J_fit) {
                 case   8: launch_mul_mat_q<type,   8, fallback>(ctx, args, stream); return;
                 case  16: launch_mul_mat_q<type,  16, fallback>(ctx, args, stream); return;
@@ -1537,6 +1595,8 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             ntiles_J_best = ntiles_x;
         }
     }
+
+    ggml_cuda_mmq_J_record(type, J_best, /*fitted =*/ false, args.ncols_max);
 
     switch (J_best) {
         case   8:
