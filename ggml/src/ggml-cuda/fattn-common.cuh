@@ -725,7 +725,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 }
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const ggml_tensor * K, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1035,8 +1035,15 @@ struct fattn_stage_timer {
         if (!a) {
             return;
         }
-        CUDA_CHECK(cudaEventRecord(b, stream));
-        CUDA_CHECK(cudaEventSynchronize(b));
+        cudaError_t status = cudaEventRecord(b, stream);
+        if (status == cudaSuccess) {
+            status = cudaEventSynchronize(b);
+        }
+        if (status != cudaSuccess) {
+            // The accumulated profile is printed only at normal exit; identify the failed stage before aborting.
+            GGML_LOG_ERROR("fattn stage failed: stage=%s device=%d queries=%d: %s\n", stage, device, nq, cudaGetErrorString(status));
+        }
+        CUDA_CHECK(status);
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
         g_fattn_stages.add(stage, device, nq, ms);
@@ -1177,7 +1184,7 @@ void launch_fattn(
         const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max) * mask_rows);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, main_stream);
+        ggml_cuda_flash_attn_ext_compact_mask(ctx, mask, K, KV_max.ptr, n_kv_max, main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
@@ -1310,8 +1317,8 @@ void launch_fattn(
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
         // Scoped to the launch alone.  Declared at function scope it outlived the
         // stream-k fixups below and counted them as attention.
-        std::unique_ptr<fattn_stage_timer> t_attn(
-            new fattn_stage_timer("attention", ggml_cuda_get_device(), int(Q->ne[1]), main_stream));
+        {
+        fattn_stage_timer t_attn("attention", ggml_cuda_get_device(), int(Q->ne[1]), main_stream);
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
@@ -1328,7 +1335,7 @@ void launch_fattn(
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
-    t_attn.reset();   // the kernel is timed; the fixups below are not part of it
+    }   // the kernel is timed; the fixups below are not part of it
 
     if (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {

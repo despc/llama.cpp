@@ -93,10 +93,104 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+// ---------------------------------------------------------------------------
+// Sparse preparation, opt-in via GGML_CUDA_FATTN_SPARSE_PREP.
+//
+// A sparse attention that keeps the existing compute has to first turn the
+// per-query index lists into something a dense kernel can consume: the union of
+// a tile's selections, the K/V rows at those positions gathered into a compact
+// buffer, and a mask saying which of them each query actually chose.  Whether
+// that preparation costs less than the positions it removes is the whole
+// question, and it is measured here at real shapes before any kernel is written
+// to consume the result.  Nothing downstream uses the output yet.
+// ---------------------------------------------------------------------------
+
+// One block per tile of queries.  Marks the tile's selections in a bitmap over
+// the cache, then compacts the set bits into a sorted index list.
+static __global__ void fattn_sparse_union(
+        const int32_t * __restrict__ indices, int32_t * __restrict__ union_idx,
+        int32_t * __restrict__ union_len, int n_kv, int n_kv_max, int tile, int rows) {
+    extern __shared__ uint32_t bitmap[];
+
+    const int t0    = blockIdx.x * tile;
+    const int words = (n_kv + 31) / 32;
+
+    for (int i = threadIdx.x; i < words; i += blockDim.x) {
+        bitmap[i] = 0;
+    }
+    __syncthreads();
+
+    for (int r = t0; r < t0 + tile && r < rows; ++r) {
+        const int32_t * row = indices + (size_t) r * n_kv_max;
+        for (int i = threadIdx.x; i < n_kv_max; i += blockDim.x) {
+            const int32_t v = row[i];
+            if (v >= 0 && v < n_kv) {
+                atomicOr(&bitmap[v >> 5], 1u << (v & 31));
+            }
+        }
+    }
+    __syncthreads();
+
+    // serial compaction by one thread: this is the part a real implementation
+    // would parallelise, and it is measured separately for that reason
+    if (threadIdx.x == 0) {
+        int n = 0;
+        int32_t * out = union_idx + (size_t) blockIdx.x * n_kv;
+        for (int w = 0; w < words && n < n_kv; ++w) {
+            uint32_t m = bitmap[w];
+            while (m && n < n_kv) {
+                const int b = __ffs(m) - 1;
+                const int p = (w << 5) + b;
+                if (p < n_kv) {
+                    out[n++] = p;
+                }
+                m &= m - 1;
+            }
+        }
+        union_len[blockIdx.x] = n;
+    }
+}
+
+// Copies the K (or V) rows named by a tile's union into a compact buffer.
+static __global__ void fattn_sparse_gather_rows(
+        const char * __restrict__ src, char * __restrict__ dst,
+        const int32_t * __restrict__ union_idx, const int32_t * __restrict__ union_len,
+        int n_kv, size_t row_bytes, size_t src_stride, int n_head_kv, size_t head_stride,
+        int union_cap) {
+    const int tile = blockIdx.y;
+    const int len  = min(union_len[tile], union_cap);
+    const int32_t * idx = union_idx + (size_t) tile * n_kv;
+
+    for (int r = blockIdx.x; r < len; r += gridDim.x) {
+        const int32_t pos = idx[r];
+        if (pos < 0 || pos >= n_kv) {
+            continue;
+        }
+        for (int h = 0; h < n_head_kv; ++h) {
+            const char * s = src + h*head_stride + (size_t) pos * src_stride;
+            char       * d = dst + (((size_t) tile * union_cap + r) * n_head_kv + h) * row_bytes;
+            for (size_t i = threadIdx.x*sizeof(int4); i + sizeof(int4) <= row_bytes; i += blockDim.x*sizeof(int4)) {
+                *(int4 *)(d + i) = *(const int4 *)(s + i);
+            }
+        }
+    }
+}
+
+static void fattn_sparse_prep_check(const char * stage, cudaStream_t stream, bool synchronize) {
+    cudaError_t status = cudaGetLastError();
+    if (status == cudaSuccess && synchronize) {
+        status = cudaStreamSynchronize(stream);
+    }
+    if (status != cudaSuccess) {
+        GGML_LOG_ERROR("sparse preparation failed: stage=%s device=%d: %s\n", stage, ggml_cuda_get_device(), cudaGetErrorString(status));
+    }
+    CUDA_CHECK(status);
+}
+
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const ggml_tensor * K, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
+    GGML_UNUSED_VARS(ctx, mask, K, indices, n_kv_max, stream);
     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
@@ -107,6 +201,85 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
+
+    // Cost of turning the per-query lists into something a dense kernel could
+    // consume.  Measured here and consumed by nobody: the point is to learn
+    // whether preparation costs less than the positions it would remove, before
+    // committing to the kernel that would use it. Scratch belongs to this context,
+    // device and stream, outside the graph pool. It still consumes device memory.
+    static const bool prep_measure = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP");
+    if (prep_measure && K) {
+        const int device = ggml_cuda_get_device();
+        GGML_ASSERT(device == ctx.device);
+        GGML_ASSERT(stream == ctx.stream());
+        GGML_ASSERT(n_kv_max > 0 && mask->ne[0] > 0);
+        GGML_ASSERT(mask->ne[0] == K->ne[1]);
+        // This probe has no sequence offset in its gather addresses yet.
+        GGML_ASSERT(mask->ne[3] == 1 && K->ne[3] == 1);
+        auto & scratch = ctx.fattn_prep_scratch[device][ctx.curr_stream_no];
+        // Finish the producer first so a compaction fault is not reported as a union fault.
+        fattn_sparse_prep_check("compact_mask", stream, true);
+
+        const int    rows      = int(mask->ne[1] * mask->ne[3]);
+        const int    n_kv      = int(mask->ne[0]);
+        const int    tile      = 16;                 // the dense path's ncols1
+        const int    n_tiles   = (rows + tile - 1) / tile;
+        // A union can contain every entry of all 16 lists. Truncation would undermeasure preparation and drop selected keys.
+        const int    union_cap = int(std::min<int64_t>(n_kv, int64_t(tile) * n_kv_max));
+        GGML_ASSERT(union_cap <= 4 * 16384);
+        // Keep the previous 4 * 16384 gathered-row budget by processing fewer tiles when unions are larger.
+        const int    group     = std::max(1, std::min(4, (4 * 16384) / union_cap));
+        const int    words     = (n_kv + 31) / 32;
+        const size_t smem      = size_t(words) * sizeof(uint32_t);
+        const size_t row_bytes = ggml_row_size(K->type, K->ne[0]);
+        const int    n_head_kv = int(K->ne[2]);
+        static const bool prep_gather_on = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_GATHER");
+
+        const size_t need_idx  = size_t(group) * n_kv * sizeof(int32_t);
+        const size_t need_gath = size_t(group) * union_cap * n_head_kv * row_bytes;
+
+        if (smem <= 48*1024) {
+            if (need_idx > scratch.union_idx_capacity) {
+                if (scratch.union_idx) { CUDA_CHECK(cudaFree(scratch.union_idx)); }
+                CUDA_CHECK(cudaMalloc(&scratch.union_idx, need_idx));
+                scratch.union_idx_capacity = need_idx;
+            }
+            if (!scratch.union_len) {
+                CUDA_CHECK(cudaMalloc(&scratch.union_len, 4 * sizeof(int32_t)));
+            }
+            if (prep_gather_on) {
+                // int4 loads require aligned rows; do not silently omit a short byte tail.
+                GGML_ASSERT(reinterpret_cast<uintptr_t>(K->data) % alignof(int4) == 0);
+                GGML_ASSERT(K->nb[1] % alignof(int4) == 0 && K->nb[2] % alignof(int4) == 0);
+                GGML_ASSERT(row_bytes % sizeof(int4) == 0);
+                if (need_gath > scratch.gathered_capacity) {
+                    if (scratch.gathered) { CUDA_CHECK(cudaFree(scratch.gathered)); }
+                    CUDA_CHECK(cudaMalloc(&scratch.gathered, need_gath));
+                    scratch.gathered_capacity = need_gath;
+                }
+            }
+
+            for (int t0 = 0; t0 < n_tiles; t0 += group) {
+                const int nt = std::min(group, n_tiles - t0);
+                {
+                    fattn_stage_timer t("prep_union", ggml_cuda_get_device(), rows, stream);
+                    fattn_sparse_union<<<nt, 256, smem, stream>>>(
+                        indices + (size_t) t0 * tile * n_kv_max, scratch.union_idx, scratch.union_len,
+                        n_kv, n_kv_max, tile, rows - t0*tile);
+                    fattn_sparse_prep_check("prep_union", stream, !fattn_stage_profile::enabled());
+                }
+                if (prep_gather_on) {
+                    fattn_stage_timer t("prep_gather", ggml_cuda_get_device(), rows, stream);
+                    const dim3 grid(256, nt, 1);
+                    fattn_sparse_gather_rows<<<grid, 64, 0, stream>>>(
+                        (const char *) K->data, scratch.gathered, scratch.union_idx, scratch.union_len,
+                        n_kv, row_bytes, K->nb[1], n_head_kv, K->nb[2], union_cap);
+                    fattn_sparse_prep_check("prep_gather", stream, !fattn_stage_profile::enabled());
+                }
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
 
     // How much do neighbouring queries select in common?  A sparse attention that
     // gives every query its own index list cannot amortise a K or V row across a

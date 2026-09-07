@@ -1413,6 +1413,14 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_fattn_prep_scratch {
+    int32_t * union_idx = nullptr;
+    int32_t * union_len = nullptr;
+    char * gathered = nullptr;
+    size_t union_idx_capacity = 0;
+    size_t gathered_capacity = 0;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1434,6 +1442,10 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    // cudaMalloc pointers belong to one device; reusing a function-static cache on the next GPU can cause illegal accesses.
+    // Separate streams also need separate scratch until their queued kernels finish. Keep diagnostic allocations outside the graph pool.
+    ggml_cuda_fattn_prep_scratch fattn_prep_scratch[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
 #ifdef USE_CUDA_GRAPH
     // Map from graph key to cuda_graph - allows multiple graphs per context when the

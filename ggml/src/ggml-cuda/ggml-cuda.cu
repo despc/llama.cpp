@@ -721,6 +721,17 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            auto & scratch = fattn_prep_scratch[i][j];
+            if (scratch.union_idx || scratch.union_len || scratch.gathered) {
+                ggml_cuda_set_device(i);
+                // Scratch can still be in use when the diagnostic timers are disabled.
+                if (streams[i][j] != nullptr) {
+                    CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
+                }
+                if (scratch.union_idx) { CUDA_CHECK(cudaFree(scratch.union_idx)); }
+                if (scratch.union_len) { CUDA_CHECK(cudaFree(scratch.union_len)); }
+                if (scratch.gathered)  { CUDA_CHECK(cudaFree(scratch.gathered)); }
+            }
             if (streams[i][j] != nullptr) {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
@@ -5175,7 +5186,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // Both profilers synchronise on events recorded on the compute stream, which
     // is not permitted inside a graph capture.
     static const bool fattn_stage_profile = ggml_env_flag_enabled("GGML_CUDA_FATTN_STAGE_PROFILE");
-    if (ggml_cuda_op_profile_enabled() || fattn_stage_profile) {
+    static const bool fattn_sparse_prep = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP");
+    // The preparation probe grows scratch and checks its stages synchronously, even without stage timing.
+    if (ggml_cuda_op_profile_enabled() || fattn_stage_profile || fattn_sparse_prep) {
         use_cuda_graph = false;
         cuda_graph_update_required = false;
     }
