@@ -1413,42 +1413,6 @@ struct ggml_cuda_stream_context {
     }
 };
 
-struct ggml_cuda_fattn_prep_scratch {
-    int32_t * union_idx = nullptr;
-    int32_t * union_len = nullptr;
-    char * gathered = nullptr;
-    // The union's bitmap and its word-level prefix sums outlive the kernel that
-    // builds them: compaction needs the prefix to know where each word's bits
-    // land, and the membership mask needs both to map a cache position to its
-    // slot in the compact buffer.
-    uint32_t * bitmap = nullptr;
-    int32_t  * prefix = nullptr;
-    uint32_t * qmask  = nullptr;
-    half     * cmask  = nullptr;   // dense F16 mask over the compact buffer
-    float    * out    = nullptr;   // prototype output, plus the F16 K/V tail launch_fattn expects after it
-    size_t union_idx_capacity = 0;
-    size_t union_len_capacity = 0;
-    size_t gathered_capacity = 0;
-    size_t bitmap_capacity = 0;
-    size_t qmask_capacity = 0;
-    size_t cmask_capacity = 0;
-    size_t out_capacity = 0;
-
-    // The per-query regime keeps its own buffers, sized once from model constants
-    // and never resized.  They must not share storage with the tiled regime above,
-    // whose buffers grow with the cache: a captured graph holds these addresses,
-    // and freeing one to grow it would leave that graph pointing at nothing.
-    int32_t * pq_indices   = nullptr;
-    int32_t * pq_union_idx = nullptr;
-    int32_t * pq_union_len = nullptr;
-    char    * pq_gathered  = nullptr;
-    half    * pq_cmask     = nullptr;
-    float   * pq_out       = nullptr;
-    bool      pq_ready     = false;
-    int       pq_tiles     = 0;   // tiles the one allocation covers; more declines, never regrows
-    int       pq_union_n   = 0;
-};
-
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1470,10 +1434,6 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
-
-    // cudaMalloc pointers belong to one device; reusing a function-static cache on the next GPU can cause illegal accesses.
-    // Separate streams also need separate scratch until their queued kernels finish. Keep diagnostic allocations outside the graph pool.
-    ggml_cuda_fattn_prep_scratch fattn_prep_scratch[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
 #ifdef USE_CUDA_GRAPH
     // Map from graph key to cuda_graph - allows multiple graphs per context when the

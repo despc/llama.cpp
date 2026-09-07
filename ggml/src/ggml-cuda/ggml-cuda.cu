@@ -721,30 +721,6 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
-            auto & scratch = fattn_prep_scratch[i][j];
-            if (scratch.union_idx || scratch.union_len || scratch.gathered ||
-                scratch.bitmap || scratch.prefix || scratch.qmask ||
-                scratch.cmask || scratch.out || scratch.pq_ready) {
-                ggml_cuda_set_device(i);
-                // Scratch can still be in use when the diagnostic timers are disabled.
-                if (streams[i][j] != nullptr) {
-                    CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
-                }
-                if (scratch.union_idx) { CUDA_CHECK(cudaFree(scratch.union_idx)); }
-                if (scratch.union_len) { CUDA_CHECK(cudaFree(scratch.union_len)); }
-                if (scratch.gathered)  { CUDA_CHECK(cudaFree(scratch.gathered)); }
-                if (scratch.bitmap)    { CUDA_CHECK(cudaFree(scratch.bitmap)); }
-                if (scratch.prefix)    { CUDA_CHECK(cudaFree(scratch.prefix)); }
-                if (scratch.qmask)     { CUDA_CHECK(cudaFree(scratch.qmask)); }
-                if (scratch.cmask)     { CUDA_CHECK(cudaFree(scratch.cmask)); }
-                if (scratch.out)       { CUDA_CHECK(cudaFree(scratch.out)); }
-                if (scratch.pq_indices)   { CUDA_CHECK(cudaFree(scratch.pq_indices)); }
-                if (scratch.pq_union_idx) { CUDA_CHECK(cudaFree(scratch.pq_union_idx)); }
-                if (scratch.pq_union_len) { CUDA_CHECK(cudaFree(scratch.pq_union_len)); }
-                if (scratch.pq_gathered)  { CUDA_CHECK(cudaFree(scratch.pq_gathered)); }
-                if (scratch.pq_cmask)     { CUDA_CHECK(cudaFree(scratch.pq_cmask)); }
-                if (scratch.pq_out)       { CUDA_CHECK(cudaFree(scratch.pq_out)); }
-            }
             if (streams[i][j] != nullptr) {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
@@ -5196,15 +5172,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
-    // Both profilers synchronise on events recorded on the compute stream, which
-    // is not permitted inside a graph capture.
-    static const bool fattn_stage_profile = ggml_env_flag_enabled("GGML_CUDA_FATTN_STAGE_PROFILE");
-    static const bool fattn_sparse_prep = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP");
-    // The compact attention path declines inside a capture rather than being
-    // switched off here: disabling graphs wholesale costs generation the ones it
-    // does use, and that path never runs at decode's query counts anyway.
-    // The preparation probe grows scratch and checks its stages synchronously, even without stage timing.
-    if (ggml_cuda_op_profile_enabled() || fattn_stage_profile || fattn_sparse_prep) {
+    if (ggml_cuda_op_profile_enabled()) {
         use_cuda_graph = false;
         cuda_graph_update_required = false;
     }

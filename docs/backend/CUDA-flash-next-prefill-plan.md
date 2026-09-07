@@ -2762,3 +2762,69 @@ rather than the order they are summed in, and that is a different kind of error.
    indexer's top-k is exactly a selection. It is **off by default** and the
    deployment does not set it, so this is a hazard of a path nobody is on rather
    than a live one.
+
+## Compact attention: removed, 2026-09-07
+
+Removed from the fork and from every launcher, prefill and decode both. The
+switches are gone rather than defaulted off, and the code with them.
+
+### The standing rule this sets
+
+**An optimisation that can even theoretically degrade accuracy is not a candidate
+here.** Not "is measured not to", not "is within tolerance" -- not a candidate.
+That rule is now the acceptance criterion for this deployment and it is worth
+more than any figure this document reports.
+
+Compact attention fails it plainly. It changes the order of summation, which
+changes greedy output above roughly 20k of context, and the quality bound for the
+decode regime rests on twenty-four predictions -- weak enough to exclude only a
+large regression. Whatever the throughput was, the trade was not on offer.
+
+### What is honestly on the record
+
+The measurements do not show the model getting worse: perplexity was 2.8943 dense
+against 2.8929 compact, a difference of 0.048% with the sign favouring the
+compact path, and the greedy flips occurred only where the top two candidates
+were within a tenth of each other. That is recorded because deleting the
+inconvenient half of a result is how a document stops being usable.
+
+But "not shown to be worse" is not "shown not to be worse", and under the rule
+above the distinction is the whole point. The per-query bound in particular was
+loose, and a bound that loose against a path that changes generation directly is
+not a basis for shipping. The removal is right on its own terms.
+
+### What was kept, and why it does not fall under the same rule
+
+The three Volta dispatch fixes stay: grouped MMQ for `MUL_MAT_ID`, the DP4A tile
+tables, and the per-expert column tile. They can reorder arithmetic in principle,
+and they were checked token for token against the previous deployment and did
+not. They also correct a misdispatch -- the kernels were being selected as though
+the cards were newer -- rather than substituting an approximation for an exact
+computation, which is the distinction that matters: they compute the same thing
+by a correctly chosen kernel, where compact attention computes the same thing in
+a deliberately different order.
+
+If the rule is meant to reach them too, they come out and prefill at 100k returns
+from 475 to 310 t/s. That is a decision, not an oversight, and it has not been
+taken.
+
+### Where the prefill numbers stand after the removal
+
+| Prompt | Now | Was, with compact attention |
+| ---: | ---: | ---: |
+| 30 001 | 741.7 | 765.4 |
+| 49 999 | 640.3 | 699.0 |
+| 100 001 | 475.0 | 584.8 |
+| 150 001 | 377.1 | 506.2 |
+
+Generation returns to the dense figures at every length. Everything above the
+dispatch fixes is given up.
+
+### What survives of the work
+
+The measurements, which cost more than the code did and remain true: the union
+sizes, the decode profile that put attention at 25.6% and TOP_K at 17.7%, the
+scaling sweeps, and the record of nine wrong turns and what caught each. R12 /
+TOP_K remains the largest single item and does not involve reordering anything --
+it is a selection, and a faster selection that returns the same set changes no
+arithmetic at all. That is the shape of candidate this rule leaves open.
