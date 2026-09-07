@@ -2114,3 +2114,15 @@ An earlier reading of a 12% generation regression here was wrong: it came from
 comparing generation speed across two runs that had produced different text after
 a divergent prefill, which changes the MTP draft acceptance rate. Measured on a
 prefix where the path does not engage, generation is unchanged.
+
+### Deployed
+
+The compact path is deployed and on by default. Thirteen binaries were replaced
+in `fork_v100`, each kept alongside as `.pre-compact`, and all three launchers
+carry the switch: `FATTN_COMPACT=0` restores the dense path,
+`FATTN_COMPACT_MIN_KV` moves the threshold. A smoke test through the launcher
+with no environment overrides reproduces 758.1 t/s at 30k and 583.8 t/s at 100k,
+engages the path at n_kv 13312, and returns byte-identical decode output.
+
+The launcher scripts live outside this repository, in `~/llama.cpp`, so they are
+not covered by this commit.
