@@ -2527,3 +2527,33 @@ there (first observed at n_kv 10240). Divergence is not an automatic consequence
 of the reassociation; it appears only once the accumulated difference is enough to
 flip a token. That bounds the behavioural change more tightly than "greedy output
 changes above the threshold" did.
+
+## Quality, 2026-09-07
+
+The measurement this document had been owing since the compact path was first
+deployed. NMSE established that the numerical difference is small; it never
+established that the model predicts as well, and those are different claims.
+
+### Perplexity
+
+Same corpus (730 KB of this repository's own documentation, about 180k tokens),
+same settings, context 32768 so the path engages, one arm each:
+
+| | PPL | per chunk |
+| --- | ---: | --- |
+| dense | 2.8943 ± 0.01836 | 8.4825, 6.4205, 4.5460, 3.8830, 3.3684, 2.8943 |
+| compact | 2.8929 ± 0.01835 | 8.4815, 6.4125, 4.5390, 3.8812, 3.3657, 2.8929 |
+
+A difference of 0.048%, thirteen times smaller than one standard error. The
+compact path is nominally *lower*, and lower in all six chunks -- the sign
+pointing away from degradation is itself evidence that this is reassociation
+noise rather than damage.
+
+**No measurable quality loss.** That is as far as this goes: it bounds the effect
+below the resolution of the measurement, which is what a quality measurement can
+do, and it is a great deal more than the NMSE figure supported.
+
+One limit, stated because it would otherwise be overclaimed: perplexity runs the
+corpus in batches, so it exercises the tiled regime -- the deployed one -- and
+barely touches the per-query regime, which needs one or two queries. The decode
+regime is measured separately below.
