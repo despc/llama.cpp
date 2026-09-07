@@ -2248,3 +2248,64 @@ would remove; the threshold, which is set at 8192 by argument rather than by a
 measured break-even on the real chain; and R12/TOP_K, which was 7.4% of the 100k
 profile and grows at the same rate as the attention it feeds -- now the largest
 single remaining item, since attention no longer is.
+
+## The decode profile at 150k, 2026-09-07
+
+The debt P0 left open. Decode had never been profiled per operation at a long
+prefix, so the G ranking was ordered by argument. Microbatches are tagged by
+token count, so decode (`t1`, `t2`) separates from prefill (`tmany`) in the same
+run.
+
+Decode, both backends, 6266 ms of GPU time over the generation:
+
+| op | gpu_ms | share |
+| --- | ---: | ---: |
+| FLASH_ATTN_EXT | 1602.5 | **25.6%** |
+| TOP_K | 1108.8 | **17.7%** |
+| MUL_MAT | 1093.7 | 17.5% |
+| GET_ROWS | 762.7 | 12.2% |
+| ADD | 351.4 | 5.6% |
+| MUL_MAT_ID | 329.2 | 5.3% |
+
+The Teslas hold 4722 ms of that against the Blackwells' 1544, and on them the two
+context-scaling operations are level: attention 21.4%, TOP_K 19.3%.
+
+`TOP_K` here is the indexer selecting 2051 positions from the cache, not the
+expert router -- the router is the separate `ARGSORT` row, 3575 calls for 76.7 ms,
+which is fixed work over 512 experts and does not grow with context. TOP_K is 947
+calls, one node per layer, and its cost tracks the prefix.
+
+Two caveats on these figures. The profiler disables CUDA graphs and synchronises
+after every operation, so absolute milliseconds are inflated -- the instrumented
+run generated at 12.47 tokens/s against 21.43 uninstrumented -- and the many
+small launch-bound rows are overstated relative to a graph-enabled run. Both
+distortions understate the two large kernels, so 43.3% is a floor, not a ceiling.
+
+It agrees with the independent estimate from the clean decode curve. Generation
+costs 16.99 ms per token on a short prefix and 46.66 ms after 150k, so 29.7 ms is
+context-dependent; 43.3% of the profiled decode time is about 20 ms, and the
+remainder is the indexer's own scoring matmuls inside MUL_MAT.
+
+### What this decides
+
+**G3 first, then R12, and they are not alternatives.** Sparse decode attention
+cannot remove TOP_K -- it consumes what TOP_K produces. The two together are the
+whole context-dependent half of decode and have to be taken separately.
+
+G3 is also easier than the prefill path that is already deployed, for a reason
+worth stating plainly: the union exists only to amortise a gather across a tile
+of queries. At decode there is one query, so there is no union, no tile width to
+choose, and no membership mask -- just that query's own 2051 positions. Against a
+150k cache that is 73x fewer rows read, where prefill's compact path manages
+about 6x. Per layer it is 1.1 MiB instead of 81.6 MiB.
+
+The machinery is built and verified: index extraction from the mask, the gather,
+and the compact dispatch all exist. What has to change is the eligibility gate,
+which currently demands sixteen queries. That threshold is not a general truth --
+it was set because building a *union* does not repay itself below sixteen
+queries. With no union to build, the condition is different and has to be
+measured rather than inherited.
+
+R12/TOP_K is then the largest single remaining item in the whole document, at
+17.7% of decode and 13.9% of prefill, and unlike attention nothing has yet been
+tried against it.
