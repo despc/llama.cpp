@@ -1381,3 +1381,112 @@ Store the next experiment artifacts under a durable evidence directory, not only
 Use one candidate change at a time, same-binary toggles when implemented, and at least several interleaved warm control/candidate samples in both orders. Measure prefill at 5k/30k/100k/full supported context and generation after matching short/long/full prefixes, with identical output length and MTP settings. Separate cold TTFT from warm prefill if initialization/capture is involved. Log clocks, power/thermal state, and competing activity without changing hardware settings as an unrecorded second variable.
 
 Promotion requires correctness, full-context stability and memory headroom, a reproducible prefill or accepted-generation benefit, and no reproducible generation loss outside the measured noise band at any required prefix. An unresolved binary gap blocks promotion, not read-only investigation or isolated development. No speedup percentages from overlapping candidates should be summed in advance.
+
+## P0 and P1 measurements, 2026-09-07
+
+Everything below is measured on the deployed build unless stated otherwise, at a
+30k prompt, on the fixed reference configuration. Where two arms are compared
+they are one binary with one variable moved and interleaved both ways.
+
+### P0.4 -- the Blackwell sparse path costs nothing
+
+Restored behind `GGML_CUDA_FATTN_SPARSE_256`, query-count gate and Volta guard
+retained, all throughput profilers off:
+
+| | prefill 30k | generation after a 30k prefix | VRAM |
+| --- | ---: | ---: | --- |
+| off | 732.7 t/s | 43.73 +- 0.28 | 15668/14896/29977/30150 MiB |
+| on | 732.2 t/s | 43.79 +- 0.25 | 15672/14900/29989/30160 MiB |
+
+The 2.2% previously charged to this path was the phase profiler's unconditional
+per-ubatch synchronisation. That regression theory is retired, and with it the
+pool-state mechanism proposed for it. The path stays off: neutral does not
+justify 12 MiB here.
+
+### P0.1 -- refreshed attribution
+
+Uninstrumented reference at 30k: 732.9 t/s. The host timeline costs 0.5%, the
+per-operation profiler 6.3%; both are diagnostic and their absolute times are not
+production latency.
+
+Per-operation, Teslas, 28637 ms total (down 14% from before the tile fitting):
+
+| Operation | Share | Before |
+| --- | ---: | ---: |
+| MUL_MAT_ID | 40.0% | 48.0% |
+| FLASH_ATTN_EXT | 19.7% | 17.0% |
+| MUL_MAT | 19.6% | 16.9% |
+| GATED_DELTA_NET | 4.7% | 4.0% |
+| TOP_K | 3.1% | 2.7% |
+
+The Blackwells are unchanged at 6356 ms, which independently confirms the tile
+fitting no longer reaches them. Host timeline, with allocation separated from
+graph construction for the first time: build 52 ms, alloc 362 ms, set_inputs
+251 ms, submit 89.9%, sync 8.4%. The 417 ms previously reported as graph build
+was 52 ms of building and 362 ms of allocation.
+
+### P0.2 -- the phases separated
+
+`ggml_profile_tag_set` labels each submission with the layer count of the model
+and the number of tokens in flight. Those two facts are what distinguish the
+phases; an earlier attempt to label them "target-prefill" and "draft-decode"
+directly got both wrong, because MTP verification submits two tokens and the
+draft head does not report a small layer count.
+
+30k prefill followed by 128 generated tokens:
+
+| Label | GPU time | Share | Devices |
+| --- | ---: | ---: | --- |
+| L48-tmany (prefill) | 34799 ms | 91.2% | all four |
+| L48-t2 (MTP verification) | 3177 ms | 8.3% | all four |
+| L48-t1 (draft) | 139 ms | 0.4% | V100_CUDA1 only |
+| L48-t3-8 | 57 ms | 0.1% | all four |
+
+Within verification: MUL_MAT 31.0%, FLASH_ATTN_EXT 10.5%, MUL_MAT_ID 10.0%,
+TOP_K 8.5%.
+
+Two consequences. The draft costs 4% of what verification costs, so long-prefix
+dense draft attention is not a generation target and leaves P2's candidate list.
+And no draft work appears during prefill at all, so the target-side sparse
+attention P1 proposes is aimed at the right place.
+
+### P1 -- what sparsity is actually worth here
+
+A sparse attention with a per-query index list cannot amortise a K or V row over
+a tile of queries. The dense kernel does, so the comparison that matters is not
+"2051 selected against n_kv" but "the union of a tile's selections against n_kv",
+at equal tile width. Measured with `GGML_CUDA_FATTN_SPARSE_OVERLAP`, mean union
+size over tiles of neighbouring queries:
+
+| Cache length | tile 1 | tile 8 | tile 16 | tile 32 | tile 64 | dense reads |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 608 | 2051 | 3252 | 3692 | 4068 | 4280 | 4608 |
+| 9 216 | 2051 | — | 4873 | 6148 | 7640 | 9216 |
+| 18 432 | 2051 | — | 6189 | 8888 | 12958 | 18432 |
+
+Rows read per microbatch of 512 queries, sparse against dense at the same tile
+width of 64: 1.08x fewer at 4608, 1.21x at 9216, 1.42x at 18432. The union grows
+with roughly the 0.85 power of the cache length, which extrapolates to about 1.7x
+at the 75k mean cache length of a 150k prefill.
+
+At a narrower tile sparsity loses outright: 32 tiles of 16 queries read
+32 x 6189 = 198048 rows at an 18432 cache, against 8 x 18432 = 147456 for dense
+tiles of 64.
+
+So the traffic argument for P1 is 1.4x at 30k and perhaps 1.7x at 150k, not the
+7x or 73x that "2051 of n_kv" suggests. Attention is 19.7% of Tesla time, so a
+kernel that read the union instead of the whole cache and lost nothing to
+scattered access would save about 5.9% of Tesla time at 30k -- and scattered
+access does lose something, against a dense path that streams contiguously.
+
+The arithmetic argument is different and unresolved: sparsity does 9x fewer dot
+products at an 18432 cache. Which of the two bounds applies depends on what
+limits the current kernel, and neither does: at 30k the attention kernels run at
+about 13% of Volta's FP16 peak while reading far too little to be
+bandwidth-limited. Until that is explained -- occupancy, the full Q8 to FP16
+conversion `launch_fattn` performs before each MMA call, or something else -- a
+gather-based kernel may well meet the same limit and return nothing.
+
+That is the same mistake the FP16 expert proposal made: a large rewrite justified
+by an unverified assumption about the bottleneck. The next step for P1 is the
+cheap probe, not the kernel.
