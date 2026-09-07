@@ -2041,3 +2041,68 @@ also shrinks the F16 conversion. Attention's share of prefill is what converts
 this into an end-to-end figure, and that share is measured, not assumed: about
 15% at 30k under this profiler and 41.3% in the 100k census. The next step is to
 stop projecting and substitute the path.
+
+## Integration: the compact path in production, behind a switch
+
+`GGML_CUDA_FATTN_SPARSE_COMPACT=1` makes the compact chain replace dense
+attention. Clearing it restores the dense path exactly: nothing outside
+`ggml_cuda_flash_attn_ext_compact_run` changes behaviour, and that function
+returns false on every case it does not handle. `GGML_CUDA_FATTN_SPARSE_COMPACT_MIN_KV`
+(default 8192) is Step 4's length threshold.
+
+Three things had to change from the prototype.
+
+**The host synchronisation moved out of the loop.** Unions for every tile are
+built in one launch, so their lengths return in a single transfer per attention
+operation rather than one per group.
+
+**The eligibility test had to be the measured union, not an a-priori bound.** The
+first version refused whenever sixteen queries could between them select the
+whole cache -- `tile * n_kv_max >= n_kv` -- which is true below n_kv 32816 and
+kept the path off for the entire 30k prompt. But sixteen neighbouring queries
+overlap so heavily that their union is a third of that bound at long context. The
+test is now `union_n * 2 >= n_kv` on the union actually built. Paying for a union
+and then declining costs 1.2% of attention; refusing on a bound that is wrong by
+three times costs the whole optimisation.
+
+**CUDA graphs are declined per operation, not disabled globally.** Adding the
+flag to the global graph-disable list cost generation 5%, because decode does use
+graphs and this path never runs at decode's query counts. The path now checks
+`cudaStreamIsCapturing` and defers to dense inside a capture.
+
+### Results
+
+| | dense | compact | change |
+|---|---|---|---|
+| prefill 30k | 735.9 t/s | 758.6 t/s | +3.1% |
+| prefill 50k | 642.7 t/s | 699.5 t/s | +8.8% |
+| decode (short prefix) | 61.77 t/s | 62.06 t/s | unchanged |
+| decode output | — | — | byte-identical |
+
+The gain grows with context because the path only engages where the union is less
+than half the cache, which at these union sizes means n_kv above roughly 13k --
+so on a 30k prompt most of the prefill is still dense.
+
+Decode is unaffected by construction as well as by measurement: the path requires
+at least sixteen queries, and returns before touching anything below that. The
+short-prefix comparison confirms identical output and identical speed.
+
+### The one real cost: greedy output changes at long context
+
+At 30k the first greedy token differs between the two paths. This is not a defect
+in the sense the verification would catch -- NMSE against a dense reference is
+4e-07, three orders inside ggml's own tolerance for the operator -- but greedy
+decoding is chaotic, and a difference of one ulp in a logit is enough to pick a
+different token. Below the threshold the output is byte-identical, as the
+short-prompt comparison shows.
+
+Every previously deployed optimisation in this document was validated as
+byte-identical greedy output. This one cannot be, because it changes the order of
+summation rather than the dispatch of an identical computation. That is a
+judgement call about acceptable behaviour, not a measurement, and it belongs to
+whoever runs the deployment. The switch exists so that it can be made either way.
+
+An earlier reading of a 12% generation regression here was wrong: it came from
+comparing generation speed across two runs that had produced different text after
+a divergent prefill, which changes the MTP draft acceptance rate. Measured on a
+prefix where the path does not engage, generation is unchanged.

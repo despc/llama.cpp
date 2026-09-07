@@ -399,8 +399,11 @@ void ggml_cuda_flash_attn_ext_compact_mask(
                 CUDA_CHECK(cudaMalloc(&scratch.union_idx, need_idx));
                 scratch.union_idx_capacity = need_idx;
             }
-            if (!scratch.union_len) {
-                CUDA_CHECK(cudaMalloc(&scratch.union_len, 4 * sizeof(int32_t)));
+            const size_t need_len = std::max<size_t>(group, 4) * sizeof(int32_t);
+            if (need_len > scratch.union_len_capacity) {
+                if (scratch.union_len) { CUDA_CHECK(cudaFree(scratch.union_len)); }
+                CUDA_CHECK(cudaMalloc(&scratch.union_len, need_len));
+                scratch.union_len_capacity = need_len;
             }
             // The bitmap and its prefix are written by the union and read by the
             // mask, so they are sized together and always allocated: compaction
@@ -1643,8 +1646,305 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// ---------------------------------------------------------------------------
+// The compact attention path.  Builds the union of each tile's selections,
+// gathers K and V at those positions, reads the real mask at them, and runs the
+// ordinary dense dispatch on the result -- so the attention that executes is the
+// production kernel, on a cache of a few thousand rows instead of the whole one.
+//
+// Opt-in via GGML_CUDA_FATTN_SPARSE_COMPACT; clearing it restores the dense path
+// exactly, since nothing outside this function changes behaviour.
+// GGML_CUDA_FATTN_SPARSE_COMPACT_MIN_KV is the cache length below which the
+// dense path is left alone: the preparation is a fixed cost per tile and the
+// union is not much smaller than a short cache, so below it this loses.
+// ---------------------------------------------------------------------------
+static bool ggml_cuda_flash_attn_ext_compact_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#else
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (mask == nullptr || dst->src[4] != nullptr) {
+        return false;
+    }
+    // The sparse marker: llama sets it on the layers whose mask carries a selection.
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    if (n_kv_max <= 0) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mask->ne[0] != K->ne[1] || K->ne[3] != 1 || V->ne[3] != 1) {
+        return false;
+    }
+
+    const int tile  = 16;
+    const int n_q   = int(Q->ne[1]);
+    const int n_kv  = int(mask->ne[0]);
+    // A partial tile would make the query view read past Q; those microbatches are
+    // small and the dense path handles them.
+    if (n_q < tile || n_q % tile != 0) {
+        return false;
+    }
+    if (mask->ne[1] < n_q) {
+        return false;
+    }
+
+    static const int min_kv = [] {
+        const char * e = getenv("GGML_CUDA_FATTN_SPARSE_COMPACT_MIN_KV");
+        return e ? atoi(e) : 8192;
+    }();
+    if (n_kv < min_kv) {
+        return false;
+    }
+    // A capture cannot express a host read-back, and this path shapes its launches
+    // from union lengths.  Decline rather than disabling graphs globally, which
+    // costs generation the graphs it does use.
+    {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            return false;
+        }
+    }
+
+    const int    n_head      = int(Q->ne[2]);
+    const int    n_head_kv   = int(K->ne[2]);
+    const int    DV          = int(V->ne[0]);
+    const size_t row_bytes   = ggml_row_size(K->type, K->ne[0]);
+    const size_t row_bytes_v = ggml_row_size(V->type, V->ne[0]);
+
+    // The gather moves whole int4s and the output is copied as one flat run.
+    if (row_bytes % sizeof(int4) || row_bytes_v % sizeof(int4) ||
+        K->nb[1] % alignof(int4) || K->nb[2] % alignof(int4) ||
+        V->nb[1] % alignof(int4) || V->nb[2] % alignof(int4) ||
+        reinterpret_cast<uintptr_t>(K->data) % alignof(int4) ||
+        reinterpret_cast<uintptr_t>(V->data) % alignof(int4)) {
+        return false;
+    }
+    if (dst->nb[0] != sizeof(float) || dst->nb[1] != size_t(DV)*sizeof(float) ||
+        dst->nb[2] != size_t(DV)*n_head*sizeof(float)) {
+        return false;
+    }
+
+    const int words = (n_kv + 31) / 32;
+    if (size_t(words) * sizeof(uint32_t) > 48*1024) {   // the union's bitmap is in shared memory
+        return false;
+    }
+
+    const int          device = ctx.device;
+    cudaStream_t       stream = ctx.stream();
+    auto &             scratch = ctx.fattn_prep_scratch[device][ctx.curr_stream_no];
+    const int          n_tiles = n_q / tile;
+    const int64_t      s31 = mask->nb[1] / sizeof(half);
+    const int64_t      s33 = mask->nb[3] / sizeof(half);
+
+    // Selections, one padded list per mask row.
+    ggml_cuda_pool_alloc<int32_t> indices(ctx.pool());
+    indices.alloc(size_t(n_kv_max) * mask->ne[1] * mask->ne[3]);
+    {
+        const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
+        const ggml_cuda_kernel_launch_params lp(blocks_num, dim3(256, 1, 1), 0, stream);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, lp,
+            (const half *) mask->data, indices.ptr, n_kv, n_kv_max, s31, s33);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Unions for every tile at once, so the lengths come back in one transfer
+    // rather than one per group.
+    const size_t need_idx = size_t(n_tiles) * n_kv * sizeof(int32_t);
+    const size_t need_bm  = size_t(n_tiles) * words * sizeof(uint32_t);
+    if (need_idx > scratch.union_idx_capacity) {
+        if (scratch.union_idx) { CUDA_CHECK(cudaFree(scratch.union_idx)); }
+        CUDA_CHECK(cudaMalloc(&scratch.union_idx, need_idx));
+        scratch.union_idx_capacity = need_idx;
+    }
+    if (size_t(n_tiles) * sizeof(int32_t) > scratch.union_len_capacity) {
+        if (scratch.union_len) { CUDA_CHECK(cudaFree(scratch.union_len)); }
+        CUDA_CHECK(cudaMalloc(&scratch.union_len, size_t(n_tiles) * sizeof(int32_t)));
+        scratch.union_len_capacity = size_t(n_tiles) * sizeof(int32_t);
+    }
+    if (need_bm > scratch.bitmap_capacity) {
+        if (scratch.bitmap) { CUDA_CHECK(cudaFree(scratch.bitmap)); }
+        if (scratch.prefix) { CUDA_CHECK(cudaFree(scratch.prefix)); }
+        CUDA_CHECK(cudaMalloc(&scratch.bitmap, need_bm));
+        CUDA_CHECK(cudaMalloc(&scratch.prefix, need_bm));
+        scratch.bitmap_capacity = need_bm;
+    }
+
+    {
+        fattn_stage_timer t("compact_union", device, n_q, stream);
+        fattn_sparse_union<<<n_tiles, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS,
+                             size_t(words)*sizeof(uint32_t), stream>>>(
+            indices.ptr, scratch.union_idx, scratch.union_len, scratch.bitmap, scratch.prefix,
+            n_kv, n_kv_max, tile, n_q);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // One synchronisation for the whole operation.  The launch geometry depends on
+    // how many rows the widest union holds, and that is only known on the device.
+    std::vector<int32_t> h_len(n_tiles);
+    CUDA_CHECK(cudaMemcpyAsync(h_len.data(), scratch.union_len,
+        h_len.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    int union_max = 0;
+    for (int b = 0; b < n_tiles; ++b) {
+        if (h_len[b] <= 0 || h_len[b] > n_kv) {
+            return false;   // nothing selected, or a length that cannot be right
+        }
+        union_max = std::max(union_max, h_len[b]);
+    }
+    const int union_n = std::min(GGML_PAD(union_max, 256), n_kv);
+    // The only honest test of whether this is worth doing: the union that was
+    // actually built.  An a-priori bound from the selection count per query is far
+    // too pessimistic -- sixteen queries selecting 2051 positions each overlap so
+    // heavily that their union is a third of that at long context.
+    if (union_n * 2 >= n_kv) {
+        return false;
+    }
+
+    // Tiles per launch, bounded by what the gathered cache may occupy.
+    const int64_t budget_rows = 32768;
+    const int group = std::max(1, std::min<int>(n_tiles, int(budget_rows / std::max(1, union_n))));
+
+    const int    mask_rows = 64;   // kernels may read past the queries a tile holds
+    const size_t need_gath = size_t(group) * union_n * n_head_kv * (row_bytes + row_bytes_v);
+    const size_t need_cm   = size_t(group) * mask_rows * union_n * sizeof(half);
+    const size_t need_out  = GGML_PAD(size_t(DV) * n_head * tile * group * sizeof(float), 128)
+        + GGML_PAD(size_t(K->ne[0]) * union_n * n_head_kv * group * sizeof(half), 128)
+        + GGML_PAD(size_t(DV)       * union_n * n_head_kv * group * sizeof(half), 128);
+
+    if (need_gath > scratch.gathered_capacity) {
+        if (scratch.gathered) { CUDA_CHECK(cudaFree(scratch.gathered)); }
+        CUDA_CHECK(cudaMalloc(&scratch.gathered, need_gath));
+        // Rows past a tile's union are masked out, but a stale quantisation scale
+        // could still be a NaN that survives the mask.
+        CUDA_CHECK(cudaMemsetAsync(scratch.gathered, 0, need_gath, stream));
+        scratch.gathered_capacity = need_gath;
+    }
+    if (need_cm > scratch.cmask_capacity) {
+        if (scratch.cmask) { CUDA_CHECK(cudaFree(scratch.cmask)); }
+        CUDA_CHECK(cudaMalloc(&scratch.cmask, need_cm));
+        scratch.cmask_capacity = need_cm;
+    }
+    if (need_out > scratch.out_capacity) {
+        if (scratch.out) { CUDA_CHECK(cudaFree(scratch.out)); }
+        CUDA_CHECK(cudaMalloc(&scratch.out, need_out));
+        scratch.out_capacity = need_out;
+    }
+
+    char * gK = scratch.gathered;
+    char * gV = gK + size_t(group) * union_n * n_head_kv * row_bytes;
+
+    for (int t0 = 0; t0 < n_tiles; t0 += group) {
+        const int nt = std::min(group, n_tiles - t0);
+
+        {
+            fattn_stage_timer t("compact_gather", device, n_q, stream);
+            const dim3 grid(256, nt, 1);
+            fattn_sparse_gather_rows<<<grid, 64, 0, stream>>>(
+                (const char *) K->data, gK, (const char *) V->data, gV,
+                scratch.union_idx + (size_t) t0 * n_kv, scratch.union_len + t0, n_kv,
+                row_bytes, K->nb[1], K->nb[2], row_bytes_v, V->nb[1], V->nb[2],
+                n_head_kv, union_n);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        {
+            fattn_stage_timer t("compact_mask", device, n_q, stream);
+            const dim3 grid(nt, mask_rows, 1);
+            fattn_sparse_compact_mask<<<grid, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS, 0, stream>>>(
+                (const half *) mask->data, scratch.union_idx + (size_t) t0 * n_kv,
+                scratch.union_len + t0, scratch.cmask, n_kv, t0*tile, tile, union_n,
+                mask_rows, n_q - t0*tile, int(mask->ne[1]), s31);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        ggml_tensor Qc = *Q;
+        Qc.ne[1] = tile; Qc.ne[3] = nt;
+        Qc.nb[3] = size_t(tile) * Q->nb[1];
+        Qc.data  = (char *) Q->data + size_t(t0) * tile * Q->nb[1];
+        Qc.view_src = nullptr; Qc.buffer = nullptr;
+
+        ggml_tensor Kc = *K;
+        Kc.ne[1] = union_n; Kc.ne[2] = n_head_kv; Kc.ne[3] = nt;
+        Kc.nb[1] = row_bytes;
+        Kc.nb[2] = size_t(union_n) * row_bytes;
+        Kc.nb[3] = size_t(n_head_kv) * union_n * row_bytes;
+        Kc.data  = gK; Kc.view_src = nullptr; Kc.buffer = nullptr;
+
+        ggml_tensor Vc = *V;
+        Vc.ne[1] = union_n; Vc.ne[2] = n_head_kv; Vc.ne[3] = nt;
+        Vc.nb[1] = row_bytes_v;
+        Vc.nb[2] = size_t(union_n) * row_bytes_v;
+        Vc.nb[3] = size_t(n_head_kv) * union_n * row_bytes_v;
+        Vc.data  = gV; Vc.view_src = nullptr; Vc.buffer = nullptr;
+
+        ggml_tensor Mc = *mask;
+        Mc.ne[0] = union_n; Mc.ne[1] = mask_rows; Mc.ne[2] = 1; Mc.ne[3] = nt;
+        Mc.nb[0] = sizeof(half);
+        Mc.nb[1] = size_t(union_n) * sizeof(half);
+        Mc.nb[2] = size_t(mask_rows) * Mc.nb[1];
+        Mc.nb[3] = Mc.nb[2];
+        Mc.data  = scratch.cmask; Mc.view_src = nullptr; Mc.buffer = nullptr;
+
+        ggml_tensor Dc = *dst;
+        Dc.ne[0] = DV; Dc.ne[1] = n_head; Dc.ne[2] = tile; Dc.ne[3] = nt;
+        Dc.nb[0] = sizeof(float);
+        Dc.nb[1] = Dc.ne[0] * Dc.nb[0];
+        Dc.nb[2] = Dc.ne[1] * Dc.nb[1];
+        Dc.nb[3] = Dc.ne[2] * Dc.nb[2];
+        Dc.data  = scratch.out; Dc.view_src = nullptr; Dc.buffer = nullptr;
+        Dc.src[0] = &Qc; Dc.src[1] = &Kc; Dc.src[2] = &Vc; Dc.src[3] = &Mc; Dc.src[4] = nullptr;
+        ggml_set_op_params_i32(&Dc, 4, 0);   // keeps the inner dispatch dense
+
+        {
+            fattn_stage_timer t("compact_attn", device, n_q, stream);
+            g_fattn_in_compact = true;
+            ggml_cuda_flash_attn_ext(ctx, &Dc);
+            g_fattn_in_compact = false;
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // The compact output is contiguous over (dim, head, query) for this group's
+        // queries, and so is the destination, so one run copies it.
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size_t(t0) * tile * dst->nb[2],
+            scratch.out, size_t(nt) * tile * n_head * DV * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream));
+    }
+
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        GGML_LOG_WARN("fattn compact path active: n_kv=%d union_n=%d tiles=%d group=%d min_kv=%d\n",
+                      n_kv, union_n, n_tiles, group, min_kv);
+    }
+    return true;
+#endif
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    static const bool compact = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_COMPACT");
+    if (compact && !g_fattn_in_compact && ggml_cuda_flash_attn_ext_compact_run(ctx, dst)) {
+        return;
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

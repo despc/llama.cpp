@@ -1427,6 +1427,7 @@ struct ggml_cuda_fattn_prep_scratch {
     half     * cmask  = nullptr;   // dense F16 mask over the compact buffer
     float    * out    = nullptr;   // prototype output, plus the F16 K/V tail launch_fattn expects after it
     size_t union_idx_capacity = 0;
+    size_t union_len_capacity = 0;
     size_t gathered_capacity = 0;
     size_t bitmap_capacity = 0;
     size_t qmask_capacity = 0;

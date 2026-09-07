@@ -5194,6 +5194,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // is not permitted inside a graph capture.
     static const bool fattn_stage_profile = ggml_env_flag_enabled("GGML_CUDA_FATTN_STAGE_PROFILE");
     static const bool fattn_sparse_prep = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP");
+    // The compact attention path declines inside a capture rather than being
+    // switched off here: disabling graphs wholesale costs generation the ones it
+    // does use, and that path never runs at decode's query counts anyway.
     // The preparation probe grows scratch and checks its stages synchronously, even without stage timing.
     if (ggml_cuda_op_profile_enabled() || fattn_stage_profile || fattn_sparse_prep) {
         use_cuda_graph = false;
