@@ -1,8 +1,139 @@
 # Flash-Next four-GPU prefill and generation: status and optimization plan
 
-Date: 2026-09-06. Source baseline: `f3aacb2f7`, branch `master`, plus local changes listed below. This is a local deployment plan, not a claim about upstream performance.
+Date: 2026-09-06, with an outcome section and execution logs added 2026-09-07. The ranking below was written against baseline `f3aacb2f7`; what was then measured and deployed is summarised immediately after it and detailed in the execution logs at the end. Where the two disagree, the logs win -- several of the rankings here were refuted by measurement. This is a local deployment plan, not a claim about upstream performance.
 
-Reading guide: [prefill ranking](#optimization-options), [detailed prefill code review](#deeper-review-ranked-candidates-and-implementation-details), [actual hardware audit](#hardware-audit-and-generation-extension), [generation ranking](#generation-ranking-for-this-machine), and [combined execution plan](#combined-execution-plan-and-measurement-contract). The hardware/generation extension was added after the user requested optimization of both prefill and generation on the existing equipment.
+Reading guide: **[outcome](#outcome-what-shipped-what-did-not-and-why)** first if you only want the result, then [prefill ranking](#optimization-options), [detailed prefill code review](#deeper-review-ranked-candidates-and-implementation-details), [actual hardware audit](#hardware-audit-and-generation-extension), [generation ranking](#generation-ranking-for-this-machine), and [combined execution plan](#combined-execution-plan-and-measurement-contract). The hardware/generation extension was added after the user requested optimization of both prefill and generation on the existing equipment.
+
+## Outcome: what shipped, what did not, and why
+
+Written 2026-09-07, after the work the execution logs below describe in the order
+it happened. This section is the scoreboard; the logs are the evidence, including
+the wrong turns, which are kept because two of them were convincing.
+
+Prefill on the fixed reference configuration, tokens/s, deployed against where
+this document started:
+
+| Prompt | Before | Deployed | |
+| ---: | ---: | ---: | ---: |
+| 5 000 | 478.0 | 811.3 | +70% |
+| 30 000 | 411.8 | 661.1 | +61% |
+| 100 000 | 309.7 | 441.1 | +42% |
+
+Generation is unchanged at every prefix length measured, memory is unchanged, and
+greedy output is byte-identical to the previous deployment.
+
+### Shipped
+
+**Grouped MMQ for quantised MUL_MAT_ID on Volta** (`GGML_CUDA_MMID_MMQ_PREFILL`,
+on by default in the launcher). The MMQ batch-size rule rejects any batch of 64
+or more on hardware with FP16 tensor cores but no Turing MMA, which is both
+Teslas. With 512 experts that sent every prefill expert projection into a
+host-synchronising fallback: 284199 individual kernel launches over one
+5000-token prefill, and no CUDA graph capture. The arithmetic was never the
+issue -- the fallback's inner calls select MMQ themselves -- so grouping removes
+launches and synchronisation, not a numerical difference. Worth 478 -> 613 t/s.
+
+**The tile table that matches Volta's execution path.** The MMQ tile table is
+chosen by architecture and the first branch a compute capability of 700 satisfies
+is `>= VOLTA`, which hands it the Ampere table. Volta does not run the Ampere
+layout: without Turing MMA the kernel takes the DP4A path, which has its own
+table, `pascal_dp4a`, that Volta never reached because its branch is tested
+first. Raising the Ampere branch to `>= TURING` is one line and was worth
+613 -> 811 t/s. This is a defect in upstream's dispatch, not a local workaround.
+
+**Benchmark harnesses that own their process.** Each began by killing every
+process matching `pgrep -x llama-server` and adopting the first PID it found on a
+fixed port. `bench/harness.sh` now owns exactly the process it started on a port
+it verified was free, plus `bench/longctx.sh`, `bench/tg50.sh`, `bench/census.sh`,
+`bench/greedy-diff.sh` and long-prefix generation fixtures -- none of which
+existed, which is why the 5k benchmark had been the whole acceptance test.
+
+### Measured, correct, and left switched off
+
+**Fitting the MMQ column tile to an expert's share**
+(`GGML_CUDA_MMQ_MMID_J_FIT`). `mul_mat_q_switch_J` sizes the tile from the batch,
+but the tile is spent per expert, and 512 experts with 10 chosen per token leave
+each expert about ten columns of a 64-wide tile -- six times the arithmetic, all
+padding. Fitting it: Q4_K gate/up 3644 -> 1627 us at 512 tokens, Q5_1 down
+4305 -> 2708; prefill +1.9% at 30k and +3.2% at 100k; memory identical; never
+selected at decode. It is correct and it is a gain. It is off because its
+end-to-end effect is a twentieth of its kernel effect, and understanding that gap
+matters more than banking 3%.
+
+**Runtime choice of pipeline copy slots** (`GGML_SCHED_N_COPIES`). The reserve
+fails at every startup and the scheduler then disables pipelining entirely, so
+this deployment has never pipelined. Two slots make the reserve succeed. They buy
+0.5% of prefill, take 142 MiB more, and abort with an out-of-memory during a 30k
+prompt. Upstream's fallback is the right decision on a split this tight.
+
+### Did not work, and why
+
+**Sparse attention (R1)** is blocked by Volta's MMA fragments, which exist only
+at 32 columns; the sparse path needs one query column per block and this model's
+GQA ratio is 12. The `ncols1*ncols2 < 32` guard is a correctness bound, not the
+compile-time prune it resembles. Enabling it for the two Blackwells that can take
+it is neutral on prefill -- they hold a sixth of the GPU time -- and costs 2.2% of
+generation through the pool state its index buffer leaves behind, so the 256/256
+eligibility was withdrawn. The plumbing, the query-count gate, the tests and the
+comment explaining the bound all stay: restoring one line re-enables it the day
+narrower Volta fragments exist.
+
+**Dequantised FP16 experts** rest on a false premise. Over the expert shapes an
+eightfold increase in tokens costs 1.25x the time, so arithmetic was never the
+constraint and tensor cores would not have helped. What looked like a bandwidth
+problem -- 136 GB/s where a dense matmul reading the same bytes reaches 374 --
+was arithmetic on padding, which the tile fix addresses.
+
+**R4, host-side bias generation**, cannot pay. `LLAMA_UBATCH_PROFILE` on a 30k
+prefill: build 417 ms, set_inputs 252 ms, apply 9 ms out of 45056 ms. All host
+input preparation is 0.6%.
+
+**R5, compressed-domain selection**, cannot pay either: the indexer's block score
+product is 94.9 ms over 504 calls, 0.3% of Tesla time.
+
+**R12, replacing the full sort**, is 2.7% of Tesla time at 30k.
+
+**R11, the bounded sort workspace**, was already in the tree credited with 5.6% of
+prefill. Isolating its two factors shows the cap contributes nothing at a fixed
+microbatch; the gain belonged entirely to ubatch 640, which costs 4% of
+generation at a full context. The cap is a memory enabler, not a speedup.
+
+### What this cost in mistakes
+
+Three attributions were wrong before one was right, and the pattern is the same
+each time: a candidate directory accumulates changes, and toggling one
+environment variable between two such directories is not a controlled experiment.
+The generation regression was charged to the tile rule (the same binary measures
+the same with it on and off), then to sparse attention at decode (a query gate
+disproved it), then to naming tensors (interleaving disproved it). It was sparse
+attention during prefill.
+
+Separately, a 13% cut in Tesla GPU time producing 1.3% of prefill was first
+explained as host overhead, by summing per-operation GPU times -- the exact error
+this document warns against, since with a synchronise after every operation each
+measurement carries its own launch latency.
+
+A residual 1.3% still separates a fresh build of this tree from the deployed
+binaries, with identical memory and every source change tested and excluded. It
+is probably build-to-build variation in the decode path. It is not established,
+which is why the deployed binaries were left alone.
+
+### Where the next gain has to come from
+
+At 30k on the Teslas after both dispatch fixes: MUL_MAT_ID 48.0%,
+FLASH_ATTN_EXT 17.0%, MUL_MAT 16.9%, GATED_DELTA_NET 4.0%, TOP_K 2.7%. From 5k to
+30k the expert matmuls grow 6.4x with the token count while attention grows 30x
+and top-k 42x, so experts dominate up to roughly 50k and attention near the
+context limit -- which is where this deployment is weakest, 441 t/s at 100k
+against 811 at 5k.
+
+1. Volta MMA fragment shapes narrower than 32 columns. Unblocks R1, the only
+   candidate whose value grows with context.
+2. Graph reuse across ubatches (R16). The graph was reused once in 125, because
+   the indexer input shape follows the cache length, so CUDA graphs are
+   unavailable for prefill.
+3. Real pipeline overlap, which needs the memory that R4, R5 and R7 were expected
+   to free -- and R4 and R5 are now retired.
 
 ## Scope and stop point
 
