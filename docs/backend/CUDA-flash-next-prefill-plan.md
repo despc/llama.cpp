@@ -36,10 +36,14 @@ The compact path contributes +0.2% at 5k, +3.2% at 30k, +9.2% at 50k, +23.1% at
 cache, so a short prompt is untouched and a 150k one is almost entirely compact.
 A 150k prefill takes 295 s against 398 s.
 
-Generation is unchanged. It cannot reach the compact path, which requires at
-least sixteen queries, and the controlled comparison -- a prefix below the
-threshold, where both builds emit the same tokens -- gives 61.77 against 62.06
-tokens/s with byte-identical output.
+Generation is unchanged **as deployed**. The deployed compact path requires at
+least sixteen queries and cannot reach decode, and the controlled comparison -- a
+prefix below the threshold, where both builds emit the same tokens -- gives 61.77
+against 62.06 tokens/s with byte-identical output.
+
+A second, per-query regime that does reach decode exists and is measured
+(+20.2% after 100k, +31.8% after 150k), but is off by default and not deployed.
+See the G3 section at the end.
 
 Greedy output is byte-identical to the previous deployment for everything except
 the compact path, which changes it above the threshold. That change is
@@ -2242,12 +2246,13 @@ the path is a throughput change whose quality effect is unmeasured, and
 ### Open work
 
 P2 through P6 in the priority table are untouched. Within this project the
-remaining items are the host synchronisation the compact path still performs once
+remaining items are the host synchronisation the *tiled* path still performs once
 per attention operation to shape its launch, which padding to a fixed granularity
-would remove; the threshold, which is set at 8192 by argument rather than by a
-measured break-even on the real chain; and R12/TOP_K, which was 7.4% of the 100k
-profile and grows at the same rate as the attention it feeds -- now the largest
-single remaining item, since attention no longer is.
+would remove -- the per-query path added later needs no such synchronisation at
+all; the threshold, which is set at 8192 by argument rather than by a measured
+break-even on the real chain; and R12/TOP_K, which was 7.4% of the 100k profile
+and grows at the same rate as the attention it feeds -- now the largest single
+remaining item, since attention no longer is.
 
 ## The decode profile at 150k, 2026-09-07
 
@@ -2291,6 +2296,9 @@ remainder is the indexer's own scoring matmuls inside MUL_MAT.
 **G3 first, then R12, and they are not alternatives.** Sparse decode attention
 cannot remove TOP_K -- it consumes what TOP_K produces. The two together are the
 whole context-dependent half of decode and have to be taken separately.
+
+*(G3 was then built and measured; the section after this one has the result. R12
+is what remains.)*
 
 G3 is also easier than the prefill path that is already deployed, for a reason
 worth stating plainly: the union exists only to amortise a gather across a tile
@@ -2379,3 +2387,42 @@ itself before it found anything else: a 64-row reference mask read past its end
 under an 80-query group, and a zero-norm reference that the first version
 reported as `nmse 0`, which reads as a perfect match and is in fact a check that
 measured nothing. The second now aborts explicitly.
+
+### The switches, in one place
+
+Everything this document added is behind an environment flag, and clearing all of
+them restores the dense paths exactly.
+
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `GGML_CUDA_FATTN_SPARSE_COMPACT` (`FATTN_COMPACT` in the launchers) | on, deployed | compact attention for microbatches of 16+ queries -- prefill |
+| `GGML_CUDA_FATTN_SPARSE_COMPACT_MIN_KV` (`FATTN_COMPACT_MIN_KV`) | 8192 | cache length below which neither regime engages |
+| `GGML_CUDA_FATTN_SPARSE_COMPACT_DECODE` | **off**, not deployed | the per-query regime -- decode |
+| `GGML_CUDA_FATTN_SPARSE_COMPACT_VERIFY` | off | dense-reference check on the live path, a few calls per regime |
+| `GGML_CUDA_FATTN_SPARSE_PREP*`, `..._OVERLAP`, `..._IDENTITY` | off | the probes the design was built on; kept because they are how any of this gets re-checked |
+
+### What G3 still owes before it could be deployed
+
+Stated so the next session does not have to reconstruct it, and so the numbers
+above are not read as more settled than they are.
+
+- **The clean A/B covers 100k and 150k only.** A 50k run with verification on
+  gave 45.33 tokens/s against a 41.40 dense figure from an earlier run, which is
+  suggestive and is not a controlled comparison. Repeat the A/B at 30k and 50k.
+- **CUDA graph capture is argued, not confirmed.** The path is written to be
+  capturable and declines inside a capture only when its scratch is short, but
+  nothing yet verifies that decode graphs are actually still being captured with
+  it on rather than silently falling back every time. Both outcomes are
+  consistent with the speedup observed, so this has to be checked directly, not
+  inferred from it. If capture is in fact failing, the win is larger than
+  measured, not smaller -- which is exactly why it should not be left to
+  inference.
+- **The threshold is inherited, not measured.** 8192 was chosen for what building
+  a *union* costs. The per-query regime builds no union, so its break-even is a
+  different number and is currently unknown; it may well pay far below 8192.
+- **The union kernel is doing unnecessary work at decode.** For one query the
+  index list is already the union, sorted, so the bitmap, scan and compaction are
+  all avoidable. They are used because they are the verified code; replacing them
+  is an optimisation with a correctness cost to re-establish.
+- **Generation quality above the threshold is unmeasured**, exactly as for
+  prefill, and now it matters more: this regime changes generation directly.
