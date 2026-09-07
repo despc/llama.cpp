@@ -226,14 +226,19 @@ static __global__ void fattn_sparse_query_mask(
     }
 }
 
-// Copies the K (or V) rows named by a tile's union into a compact buffer.
+// Copies the K and V rows named by a tile's union into compact buffers, laid
+// out exactly as the attention kernel reads a cache: row stride first, then
+// head, then the tile as the batch dimension.  That is what lets the existing
+// dense kernel run on the result without knowing anything about sparsity.
 static __global__ void fattn_sparse_gather_rows(
-        const char * __restrict__ src, char * __restrict__ dst,
+        const char * __restrict__ srcK, char * __restrict__ dstK,
+        const char * __restrict__ srcV, char * __restrict__ dstV,
         const int32_t * __restrict__ union_idx, const int32_t * __restrict__ union_len,
-        int n_kv, size_t row_bytes, size_t src_stride, int n_head_kv, size_t head_stride,
-        int union_cap) {
+        int n_kv, size_t row_bytes_k, size_t src_stride_k, size_t head_stride_k,
+        size_t row_bytes_v, size_t src_stride_v, size_t head_stride_v,
+        int n_head_kv, int union_stride) {
     const int tile = blockIdx.y;
-    const int len  = min(union_len[tile], union_cap);
+    const int len  = min(union_len[tile], union_stride);
     const int32_t * idx = union_idx + (size_t) tile * n_kv;
 
     for (int r = blockIdx.x; r < len; r += gridDim.x) {
@@ -242,12 +247,77 @@ static __global__ void fattn_sparse_gather_rows(
             continue;
         }
         for (int h = 0; h < n_head_kv; ++h) {
-            const char * s = src + h*head_stride + (size_t) pos * src_stride;
-            char       * d = dst + (((size_t) tile * union_cap + r) * n_head_kv + h) * row_bytes;
-            for (size_t i = threadIdx.x*sizeof(int4); i + sizeof(int4) <= row_bytes; i += blockDim.x*sizeof(int4)) {
-                *(int4 *)(d + i) = *(const int4 *)(s + i);
+            const size_t slot = ((size_t) tile * n_head_kv + h) * union_stride + r;
+            {
+                const char * s = srcK + h*head_stride_k + (size_t) pos * src_stride_k;
+                char       * d = dstK + slot * row_bytes_k;
+                for (size_t i = threadIdx.x*sizeof(int4); i + sizeof(int4) <= row_bytes_k; i += blockDim.x*sizeof(int4)) {
+                    *(int4 *)(d + i) = *(const int4 *)(s + i);
+                }
+            }
+            if (dstV) {
+                const char * s = srcV + h*head_stride_v + (size_t) pos * src_stride_v;
+                char       * d = dstV + slot * row_bytes_v;
+                for (size_t i = threadIdx.x*sizeof(int4); i + sizeof(int4) <= row_bytes_v; i += blockDim.x*sizeof(int4)) {
+                    *(int4 *)(d + i) = *(const int4 *)(s + i);
+                }
             }
         }
+    }
+}
+
+// The reference mask for one tile: the real mask's rows for those queries, over
+// the whole cache, padded to the row count the kernels may read.
+static __global__ void fattn_sparse_ref_mask(
+        const half * __restrict__ src, half * __restrict__ dst,
+        int n_kv, int row0, int tile, int mask_rows, int src_rows, int64_t s31) {
+    const int r = blockIdx.y;
+    half * out = dst + (size_t) r * n_kv;
+    const bool live = r < tile && row0 + r < src_rows;
+    const half * in = src + (size_t)(row0 + r) * s31;
+    for (int j = blockIdx.x*blockDim.x + threadIdx.x; j < n_kv; j += gridDim.x*blockDim.x) {
+        out[j] = live ? in[j] : __float2half(-INFINITY);
+    }
+    GGML_UNUSED(mask_rows);
+}
+
+// Every position, in order, as the union.  With this the compact path must
+// reproduce the dense one exactly, so a disagreement is in the plumbing -- the
+// query view, the buffer strides, the output layout -- and not in sparsity.
+static __global__ void fattn_sparse_identity_union(
+        int32_t * __restrict__ union_idx, int32_t * __restrict__ union_len, int n_kv) {
+    int32_t * out = union_idx + (size_t) blockIdx.x * n_kv;
+    for (int i = blockIdx.y*blockDim.x + threadIdx.x; i < n_kv; i += gridDim.y*blockDim.x) {
+        out[i] = i;
+    }
+    if (blockIdx.y == 0 && threadIdx.x == 0) {
+        union_len[blockIdx.x] = n_kv;
+    }
+}
+
+// The mask over the compact buffer is the real mask read at the union's
+// positions.  Taking the value rather than synthesising a zero is both simpler
+// and exact: whatever the model puts in an allowed entry travels with it, and a
+// position the query did not select is already -inf in the source.  Slots past a
+// tile's union, and rows past the queries it holds, are -inf -- the buffer is
+// sized by the widest union in the group, so most tiles have a tail.
+static __global__ void fattn_sparse_compact_mask(
+        const half * __restrict__ src, const int32_t * __restrict__ union_idx,
+        const int32_t * __restrict__ union_len, half * __restrict__ out,
+        int n_kv, int row0, int tile, int union_n, int mask_rows, int rows,
+        int src_rows, int64_t s31) {
+    const int b = blockIdx.x;
+    const int r = blockIdx.y;
+
+    half * dst = out + ((size_t) b * mask_rows + r) * union_n;
+    const int  len  = min(union_len[b], union_n);
+    const int  row  = row0 + b*tile + r;
+    const bool live = r < tile && b*tile + r < rows && row < src_rows;
+    const half    * in  = src + (size_t) row * s31;
+    const int32_t * idx = union_idx + (size_t) b * n_kv;
+
+    for (int j = threadIdx.x; j < union_n; j += blockDim.x) {
+        dst[j] = (live && j < len) ? in[idx[j]] : __float2half(-INFINITY);
     }
 }
 
@@ -263,11 +333,15 @@ static void fattn_sparse_prep_check(const char * stage, cudaStream_t stream, boo
 }
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const ggml_tensor * K, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, mask, K, indices, n_kv_max, stream);
+    GGML_UNUSED_VARS(ctx, dst, indices, n_kv_max, stream);
     GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
 #else
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
     const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
@@ -302,17 +376,19 @@ void ggml_cuda_flash_attn_ext_compact_mask(
         // A union can contain every entry of all 16 lists. Truncation would undermeasure preparation and drop selected keys.
         const int    union_cap = int(std::min<int64_t>(n_kv, int64_t(tile) * n_kv_max));
         GGML_ASSERT(union_cap <= 4 * 16384);
-        // Keep the previous 4 * 16384 gathered-row budget by processing fewer tiles when unions are larger.
-        const int    group     = std::max(1, std::min(4, (4 * 16384) / union_cap));
+        // Halved from the K-only budget: the buffer now holds V beside K, and the
+        // prototype's F16 conversion of both sits after the output.
+        const int    group     = std::max(1, std::min(4, (2 * 16384) / union_cap));
         const int    words     = (n_kv + 31) / 32;
         const size_t smem      = size_t(words) * sizeof(uint32_t);
-        const size_t row_bytes = ggml_row_size(K->type, K->ne[0]);
-        const int    n_head_kv = int(K->ne[2]);
+        const size_t row_bytes   = ggml_row_size(K->type, K->ne[0]);
+        const size_t row_bytes_v = ggml_row_size(V->type, V->ne[0]);
+        const int    n_head_kv   = int(K->ne[2]);
         static const bool prep_gather_on = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_GATHER");
 
         const int    union_words = (union_cap + 31) / 32;
         const size_t need_idx  = size_t(group) * n_kv * sizeof(int32_t);
-        const size_t need_gath = size_t(group) * union_cap * n_head_kv * row_bytes;
+        const size_t need_gath = size_t(group) * union_cap * n_head_kv * (row_bytes + row_bytes_v);
         const size_t need_bm   = size_t(group) * words * sizeof(uint32_t);
         const size_t need_qm   = size_t(group) * tile * union_words * sizeof(uint32_t);
         static const bool prep_mask_on = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_MASK");
@@ -344,8 +420,10 @@ void ggml_cuda_flash_attn_ext_compact_mask(
             if (prep_gather_on) {
                 // int4 loads require aligned rows; do not silently omit a short byte tail.
                 GGML_ASSERT(reinterpret_cast<uintptr_t>(K->data) % alignof(int4) == 0);
+                GGML_ASSERT(reinterpret_cast<uintptr_t>(V->data) % alignof(int4) == 0);
                 GGML_ASSERT(K->nb[1] % alignof(int4) == 0 && K->nb[2] % alignof(int4) == 0);
-                GGML_ASSERT(row_bytes % sizeof(int4) == 0);
+                GGML_ASSERT(V->nb[1] % alignof(int4) == 0 && V->nb[2] % alignof(int4) == 0);
+                GGML_ASSERT(row_bytes % sizeof(int4) == 0 && row_bytes_v % sizeof(int4) == 0);
                 if (need_gath > scratch.gathered_capacity) {
                     if (scratch.gathered) { CUDA_CHECK(cudaFree(scratch.gathered)); }
                     CUDA_CHECK(cudaMalloc(&scratch.gathered, need_gath));
@@ -453,13 +531,358 @@ void ggml_cuda_flash_attn_ext_compact_mask(
                         GGML_LOG_WARN("prep_verify: union and per-query membership agree with the index lists (n_kv=%d, tile=%d)\n", n_kv, tile);
                     }
                 }
+                char * gK = scratch.gathered;
+                char * gV = gK + size_t(group) * union_cap * n_head_kv * row_bytes;
+                // Isolation switch: replace the union with every position in order.
+                static const bool identity_union = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_IDENTITY");
+                if (identity_union) {
+                    GGML_ASSERT(union_cap >= n_kv);
+                    const dim3 g(nt, 64, 1);
+                    fattn_sparse_identity_union<<<g, 256, 0, stream>>>(scratch.union_idx, scratch.union_len, n_kv);
+                    fattn_sparse_prep_check("identity_union", stream, true);
+                }
                 if (prep_gather_on) {
                     fattn_stage_timer t("prep_gather", ggml_cuda_get_device(), rows, stream);
                     const dim3 grid(256, nt, 1);
                     fattn_sparse_gather_rows<<<grid, 64, 0, stream>>>(
-                        (const char *) K->data, scratch.gathered, scratch.union_idx, scratch.union_len,
-                        n_kv, row_bytes, K->nb[1], n_head_kv, K->nb[2], union_cap);
+                        (const char *) K->data, gK, (const char *) V->data, gV,
+                        scratch.union_idx, scratch.union_len, n_kv,
+                        row_bytes,   K->nb[1], K->nb[2],
+                        row_bytes_v, V->nb[1], V->nb[2],
+                        n_head_kv, union_cap);
                     fattn_sparse_prep_check("prep_gather", stream, !fattn_stage_profile::enabled());
+
+                    // The compact buffer has to hold the bytes of the rows the union
+                    // names, in the order the attention kernel will read them.  A
+                    // wrong stride here still produces plausible timings and wrong
+                    // attention, so it is checked against the source rather than
+                    // assumed from the index arithmetic.
+                    static const bool verify_gather = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_VERIFY");
+                    if (verify_gather) {
+                        static bool gather_announced = false;
+                        std::vector<int32_t> h_len(nt);
+                        CUDA_CHECK(cudaMemcpyAsync(h_len.data(), scratch.union_len,
+                            h_len.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                        int bad = 0;
+                        for (int b = 0; b < nt && bad == 0; ++b) {
+                            const int len = std::min(h_len[b], union_cap);
+                            std::vector<int32_t> uni(len);
+                            CUDA_CHECK(cudaMemcpyAsync(uni.data(), scratch.union_idx + (size_t) b * n_kv,
+                                size_t(len)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                            // sample rows across the union rather than all of them
+                            const int step = std::max(1, len / 64);
+                            for (int r = 0; r < len && bad == 0; r += step) {
+                                for (int h = 0; h < n_head_kv; ++h) {
+                                    const size_t slot = ((size_t) b * n_head_kv + h) * union_cap + r;
+                                    std::vector<char> want(row_bytes), got(row_bytes);
+                                    CUDA_CHECK(cudaMemcpyAsync(want.data(),
+                                        (const char *) K->data + h*K->nb[2] + (size_t) uni[r] * K->nb[1],
+                                        row_bytes, cudaMemcpyDeviceToHost, stream));
+                                    CUDA_CHECK(cudaMemcpyAsync(got.data(), gK + slot * row_bytes,
+                                        row_bytes, cudaMemcpyDeviceToHost, stream));
+                                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                                    if (want != got) {
+                                        GGML_LOG_ERROR("prep_verify gather K mismatch tile=%d slot=%d head=%d pos=%d\n", b, r, h, uni[r]);
+                                        bad++;
+                                        break;
+                                    }
+                                    std::vector<char> wantv(row_bytes_v), gotv(row_bytes_v);
+                                    CUDA_CHECK(cudaMemcpyAsync(wantv.data(),
+                                        (const char *) V->data + h*V->nb[2] + (size_t) uni[r] * V->nb[1],
+                                        row_bytes_v, cudaMemcpyDeviceToHost, stream));
+                                    CUDA_CHECK(cudaMemcpyAsync(gotv.data(), gV + slot * row_bytes_v,
+                                        row_bytes_v, cudaMemcpyDeviceToHost, stream));
+                                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                                    if (wantv != gotv) {
+                                        GGML_LOG_ERROR("prep_verify gather V mismatch tile=%d slot=%d head=%d pos=%d\n", b, r, h, uni[r]);
+                                        bad++;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        GGML_ASSERT(bad == 0);
+                        if (!gather_announced) {
+                            gather_announced = true;
+                            GGML_LOG_WARN("prep_verify: gathered K and V rows match the source at the union's positions\n");
+                        }
+                    }
+                }
+
+                // The prototype: run the ordinary dense dispatch on the compact
+                // buffer.  Everything it is handed is a plain tensor -- gathered
+                // K and V, an F16 mask over the union, a strided view of this
+                // group's queries -- so the attention itself is the code already
+                // in production, and what is measured is a real kernel on real
+                // selections rather than a microbenchmark standing in for one.
+                static const bool prep_attn_on = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_ATTN");
+                if (prep_attn_on && prep_gather_on && dst->src[4] == nullptr) {
+                    // The buffer is sized by the group's widest union, so its length
+                    // must come back to the host before the launch can be shaped.
+                    // A real implementation would pad to a fixed granularity and
+                    // avoid this synchronisation; the prototype pays it to keep the
+                    // measured kernel honest about the rows it actually visits.
+                    std::vector<int32_t> h_len(nt);
+                    CUDA_CHECK(cudaMemcpyAsync(h_len.data(), scratch.union_len,
+                        h_len.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    int union_n = 0;
+                    for (int b = 0; b < nt; ++b) {
+                        union_n = std::max(union_n, h_len[b]);
+                    }
+                    union_n = std::min(GGML_PAD(union_n, 256), union_cap);
+
+                    // llama.cpp pads mask rows to 64 so a wide query tile can read
+                    // past the queries it holds; the tail is -inf.
+                    const int      mask_rows = 64;
+                    const int64_t  n_head    = Q->ne[2];
+                    const size_t   need_cm   = size_t(nt) * mask_rows * union_n * sizeof(half);
+                    // dst, then the F16 K and V that launch_fattn expects to find after it
+                    const size_t   dst_bytes = size_t(V->ne[0]) * n_head * tile * nt * sizeof(float);
+                    const size_t   need_out  = GGML_PAD(dst_bytes, 128)
+                        + GGML_PAD(size_t(K->ne[0]) * union_n * n_head_kv * nt * sizeof(half), 128)
+                        + GGML_PAD(size_t(V->ne[0]) * union_n * n_head_kv * nt * sizeof(half), 128);
+
+                    if (need_cm > scratch.cmask_capacity) {
+                        if (scratch.cmask) { CUDA_CHECK(cudaFree(scratch.cmask)); }
+                        CUDA_CHECK(cudaMalloc(&scratch.cmask, need_cm));
+                        scratch.cmask_capacity = need_cm;
+                    }
+                    if (need_out > scratch.out_capacity) {
+                        if (scratch.out) { CUDA_CHECK(cudaFree(scratch.out)); }
+                        CUDA_CHECK(cudaMalloc(&scratch.out, need_out));
+                        scratch.out_capacity = need_out;
+                    }
+
+                    {
+                        fattn_stage_timer t("prep_cmask", ggml_cuda_get_device(), rows, stream);
+                        const dim3 grid(nt, mask_rows, 1);
+                        fattn_sparse_compact_mask<<<grid, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS, 0, stream>>>(
+                            (const half *) mask->data, scratch.union_idx, scratch.union_len, scratch.cmask,
+                            n_kv, t0*tile, tile, union_n, mask_rows, rows - t0*tile,
+                            int(mask->ne[1]), s31);
+                        fattn_sparse_prep_check("prep_cmask", stream, !fattn_stage_profile::enabled());
+                    }
+
+                    ggml_tensor Qc = *Q;
+                    Qc.ne[1] = tile;    Qc.ne[3] = nt;
+                    Qc.nb[3] = size_t(tile) * Q->nb[1];
+                    Qc.data  = (char *) Q->data + size_t(t0) * tile * Q->nb[1];
+                    Qc.view_src = nullptr; Qc.buffer = nullptr;
+
+                    ggml_tensor Kc = *K;
+                    Kc.ne[1] = union_n; Kc.ne[2] = n_head_kv; Kc.ne[3] = nt;
+                    Kc.nb[1] = row_bytes;
+                    Kc.nb[2] = size_t(union_cap) * row_bytes;
+                    Kc.nb[3] = size_t(n_head_kv) * union_cap * row_bytes;
+                    Kc.data  = gK; Kc.view_src = nullptr; Kc.buffer = nullptr;
+
+                    ggml_tensor Vc = *V;
+                    Vc.ne[1] = union_n; Vc.ne[2] = n_head_kv; Vc.ne[3] = nt;
+                    Vc.nb[1] = row_bytes_v;
+                    Vc.nb[2] = size_t(union_cap) * row_bytes_v;
+                    Vc.nb[3] = size_t(n_head_kv) * union_cap * row_bytes_v;
+                    Vc.data  = gV; Vc.view_src = nullptr; Vc.buffer = nullptr;
+
+                    ggml_tensor Mc = *mask;
+                    Mc.ne[0] = union_n; Mc.ne[1] = mask_rows; Mc.ne[2] = 1; Mc.ne[3] = nt;
+                    Mc.nb[0] = sizeof(half);
+                    Mc.nb[1] = size_t(union_n) * sizeof(half);
+                    Mc.nb[2] = size_t(mask_rows) * Mc.nb[1];
+                    Mc.nb[3] = Mc.nb[2];
+                    Mc.data  = scratch.cmask; Mc.view_src = nullptr; Mc.buffer = nullptr;
+
+                    ggml_tensor Dc = *dst;
+                    Dc.ne[0] = V->ne[0]; Dc.ne[1] = n_head; Dc.ne[2] = tile; Dc.ne[3] = nt;
+                    Dc.nb[0] = sizeof(float);
+                    Dc.nb[1] = Dc.ne[0] * Dc.nb[0];
+                    Dc.nb[2] = Dc.ne[1] * Dc.nb[1];
+                    Dc.nb[3] = Dc.ne[2] * Dc.nb[2];
+                    Dc.data  = scratch.out; Dc.view_src = nullptr; Dc.buffer = nullptr;
+                    Dc.src[0] = &Qc; Dc.src[1] = &Kc; Dc.src[2] = &Vc; Dc.src[3] = &Mc; Dc.src[4] = nullptr;
+                    // n_kv_max of zero keeps the inner dispatch on the dense path,
+                    // so the prototype cannot recurse into its own preparation.
+                    ggml_set_op_params_i32(&Dc, 4, 0);
+
+                    {
+                        fattn_stage_timer t("prep_attn", ggml_cuda_get_device(), rows, stream);
+                        g_fattn_in_compact = true;
+                        ggml_cuda_flash_attn_ext(ctx, &Dc);
+                        g_fattn_in_compact = false;
+                        fattn_sparse_prep_check("prep_attn", stream, !fattn_stage_profile::enabled());
+                    }
+
+                    // The decisive check.  A compact path can look fast for the
+                    // wrong reason: flash attention skips a key block whose mask
+                    // is entirely -inf, so a mask that wrongly masks too much buys
+                    // speed by computing less.  Run the ordinary dense dispatch on
+                    // the same queries against the full cache and compare outputs.
+                    static const bool verify_attn = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_VERIFY");
+                    if (verify_attn) {
+                        static bool attn_announced = false;
+                        for (int b = 0; b < nt; ++b) {
+                            GGML_ASSERT(h_len[b] <= union_n);   // a truncated union would drop selected keys
+                        }
+
+                        const size_t ref_mask_bytes = size_t(mask_rows) * n_kv * sizeof(half);
+                        const size_t ref_out_bytes  = GGML_PAD(size_t(V->ne[0]) * n_head * tile * sizeof(float), 128)
+                            + GGML_PAD(size_t(K->ne[0]) * n_kv * n_head_kv * sizeof(half), 128)
+                            + GGML_PAD(size_t(V->ne[0]) * n_kv * n_head_kv * sizeof(half), 128);
+                        half  * ref_mask = nullptr;
+                        float * ref_out  = nullptr;
+                        CUDA_CHECK(cudaMalloc(&ref_mask, ref_mask_bytes));
+                        CUDA_CHECK(cudaMalloc(&ref_out,  ref_out_bytes));
+
+                        // Elementwise relative error is the wrong measure here: most of
+                        // the output is near zero, where a difference of one ulp reads as
+                        // a large relative error.  Normalised mean square error is what
+                        // ggml's own backend tests use for this operator.
+                        double sum_d2 = 0.0, sum_e2 = 0.0, max_abs = 0.0;
+                        int worst_b = -1, worst_i = -1;
+                        double worst = 0.0;
+                        for (int b = 0; b < nt; ++b) {
+                            const int row0 = (t0 + b) * tile;
+                            if (row0 >= rows) {
+                                break;
+                            }
+                            {
+                                const dim3 g(64, mask_rows, 1);
+                                fattn_sparse_ref_mask<<<g, 256, 0, stream>>>(
+                                    (const half *) mask->data, ref_mask, n_kv, row0, tile,
+                                    mask_rows, int(mask->ne[1]), s31);
+                                fattn_sparse_prep_check("ref_mask", stream, true);
+                            }
+
+                            ggml_tensor Qd = *Q;
+                            Qd.ne[1] = tile; Qd.ne[3] = 1;
+                            Qd.data  = (char *) Q->data + size_t(row0) * Q->nb[1];
+                            Qd.view_src = nullptr; Qd.buffer = nullptr;
+
+                            ggml_tensor Md = *mask;
+                            Md.ne[0] = n_kv; Md.ne[1] = mask_rows; Md.ne[2] = 1; Md.ne[3] = 1;
+                            Md.nb[0] = sizeof(half);
+                            Md.nb[1] = size_t(n_kv) * sizeof(half);
+                            Md.nb[2] = size_t(mask_rows) * Md.nb[1];
+                            Md.nb[3] = Md.nb[2];
+                            Md.data  = ref_mask; Md.view_src = nullptr; Md.buffer = nullptr;
+
+                            ggml_tensor Dd = *dst;
+                            Dd.ne[0] = V->ne[0]; Dd.ne[1] = n_head; Dd.ne[2] = tile; Dd.ne[3] = 1;
+                            Dd.nb[0] = sizeof(float);
+                            Dd.nb[1] = Dd.ne[0] * Dd.nb[0];
+                            Dd.nb[2] = Dd.ne[1] * Dd.nb[1];
+                            Dd.nb[3] = Dd.ne[2] * Dd.nb[2];
+                            Dd.data  = ref_out; Dd.view_src = nullptr; Dd.buffer = nullptr;
+                            Dd.src[0] = &Qd; Dd.src[1] = (ggml_tensor *) K; Dd.src[2] = (ggml_tensor *) V;
+                            Dd.src[3] = &Md; Dd.src[4] = nullptr;
+                            ggml_set_op_params_i32(&Dd, 4, 0);
+
+                            g_fattn_in_compact = true;
+                            ggml_cuda_flash_attn_ext(ctx, &Dd);
+                            g_fattn_in_compact = false;
+                            fattn_sparse_prep_check("ref_attn", stream, true);
+
+                            const size_t n_out = size_t(V->ne[0]) * n_head * tile;
+                            std::vector<float> a(n_out), e(n_out);
+                            CUDA_CHECK(cudaMemcpyAsync(a.data(), scratch.out + (size_t) b * n_out,
+                                n_out*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaMemcpyAsync(e.data(), ref_out, n_out*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                            for (size_t i = 0; i < n_out; ++i) {
+                                const double d = double(a[i]) - double(e[i]);
+                                sum_d2 += d*d;
+                                sum_e2 += double(e[i])*double(e[i]);
+                                if (std::fabs(d) > max_abs) { max_abs = std::fabs(d); worst_b = b; worst_i = int(i); }
+                            }
+                        }
+                        CUDA_CHECK(cudaFree(ref_mask));
+                        CUDA_CHECK(cudaFree(ref_out));
+
+                        const double nmse = sum_e2 > 0.0 ? sum_d2 / sum_e2 : 0.0;
+                        worst = nmse;
+                        // ggml's own backend test for this operator accepts 5e-4.
+                        if (nmse > 5e-4) {
+                            GGML_LOG_ERROR("prep_verify attention mismatch: nmse %.4g at tile=%d elem=%d (n_kv=%d union_n=%d n_head=%d tile=%d DV=%d)\n",
+                                           worst, worst_b, worst_i, n_kv, union_n, int(n_head), tile, int(V->ne[0]));
+                            // Where the disagreement sits says which index is wrong:
+                            // one query means the query view, one head means the head
+                            // stride, everything means the layout.
+                            const int row0 = (t0 + worst_b) * tile;
+                            const size_t n_out = size_t(V->ne[0]) * n_head * tile;
+                            std::vector<float> a(n_out), e(n_out);
+                            CUDA_CHECK(cudaMemcpyAsync(a.data(), scratch.out + (size_t) worst_b * n_out,
+                                n_out*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                            {
+                                half * rm = nullptr; float * ro = nullptr;
+                                CUDA_CHECK(cudaMalloc(&rm, size_t(mask_rows) * n_kv * sizeof(half)));
+                                CUDA_CHECK(cudaMalloc(&ro, GGML_PAD(n_out*sizeof(float), 128)
+                                    + GGML_PAD(size_t(K->ne[0]) * n_kv * n_head_kv * sizeof(half), 128)
+                                    + GGML_PAD(size_t(V->ne[0]) * n_kv * n_head_kv * sizeof(half), 128)));
+                                const dim3 g(64, mask_rows, 1);
+                                fattn_sparse_ref_mask<<<g, 256, 0, stream>>>(
+                                    (const half *) mask->data, rm, n_kv, row0, tile, mask_rows, int(mask->ne[1]), s31);
+                                ggml_tensor Qd = *Q; Qd.ne[1] = tile; Qd.ne[3] = 1;
+                                Qd.data = (char *) Q->data + size_t(row0) * Q->nb[1];
+                                Qd.view_src = nullptr; Qd.buffer = nullptr;
+                                ggml_tensor Md = *mask;
+                                Md.ne[0] = n_kv; Md.ne[1] = mask_rows; Md.ne[2] = 1; Md.ne[3] = 1;
+                                Md.nb[0] = sizeof(half); Md.nb[1] = size_t(n_kv)*sizeof(half);
+                                Md.nb[2] = size_t(mask_rows)*Md.nb[1]; Md.nb[3] = Md.nb[2];
+                                Md.data = rm; Md.view_src = nullptr; Md.buffer = nullptr;
+                                ggml_tensor Dd = *dst;
+                                Dd.ne[0] = V->ne[0]; Dd.ne[1] = n_head; Dd.ne[2] = tile; Dd.ne[3] = 1;
+                                Dd.nb[0] = sizeof(float); Dd.nb[1] = Dd.ne[0]*Dd.nb[0];
+                                Dd.nb[2] = Dd.ne[1]*Dd.nb[1]; Dd.nb[3] = Dd.ne[2]*Dd.nb[2];
+                                Dd.data = ro; Dd.view_src = nullptr; Dd.buffer = nullptr;
+                                Dd.src[0] = &Qd; Dd.src[1] = (ggml_tensor *) K; Dd.src[2] = (ggml_tensor *) V;
+                                Dd.src[3] = &Md; Dd.src[4] = nullptr;
+                                ggml_set_op_params_i32(&Dd, 4, 0);
+                                g_fattn_in_compact = true; ggml_cuda_flash_attn_ext(ctx, &Dd); g_fattn_in_compact = false;
+                                CUDA_CHECK(cudaMemcpyAsync(e.data(), ro, n_out*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                                CUDA_CHECK(cudaStreamSynchronize(stream));
+                                CUDA_CHECK(cudaFree(rm)); CUDA_CHECK(cudaFree(ro));
+                            }
+                            const int DV = int(V->ne[0]);
+                            for (int q = 0; q < tile; ++q) {
+                                double mq = 0.0; int nbad = 0;
+                                for (int h = 0; h < n_head; ++h) {
+                                    for (int d = 0; d < DV; ++d) {
+                                        const size_t i = size_t(d) + DV*(h + n_head*q);
+                                        const double df = std::fabs(double(a[i]) - double(e[i]));
+                                        const double sc = std::max(std::fabs(double(e[i])), 1e-3);
+                                        if (df/sc > mq) { mq = df/sc; }
+                                        if (df/sc > 2e-2) { nbad++; }
+                                    }
+                                }
+                                GGML_LOG_ERROR("  query %2d: max rel %.4g, %d/%d elements off\n", q, mq, nbad, int(n_head)*DV);
+                            }
+                            for (int h = 0; h < n_head; ++h) {
+                                double mh = 0.0;
+                                for (int q = 0; q < tile; ++q) {
+                                    for (int d = 0; d < DV; ++d) {
+                                        const size_t i = size_t(d) + DV*(h + n_head*q);
+                                        const double df = std::fabs(double(a[i]) - double(e[i]));
+                                        const double sc = std::max(std::fabs(double(e[i])), 1e-3);
+                                        if (df/sc > mh) { mh = df/sc; }
+                                    }
+                                }
+                                GGML_LOG_ERROR("  head %2d: max rel %.4g\n", h, mh);
+                            }
+                            GGML_ABORT("compact attention disagrees with dense");
+                        }
+                        static int64_t nmse_next = 0;
+                        if (!attn_announced || n_kv >= nmse_next) {
+                            attn_announced = true;
+                            nmse_next = int64_t(n_kv) * 2;
+                            GGML_LOG_WARN("prep_verify: compact attention matches dense, nmse %.3g max_abs %.3g (n_kv=%d union_n=%d)\n",
+                                          nmse, max_abs, n_kv, union_n);
+                        }
+                    }
                 }
             }
             CUDA_CHECK(cudaGetLastError());

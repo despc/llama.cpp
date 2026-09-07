@@ -725,7 +725,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 }
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const ggml_tensor * K, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, int32_t * indices, int32_t n_kv_max, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1012,6 +1012,11 @@ struct fattn_stage_profile {
 
 static fattn_stage_profile g_fattn_stages;
 
+// Set while the compact-buffer prototype runs the dense dispatch on its own
+// tensors.  Without it the prototype's stages accumulate into the very totals it
+// is being compared against, and the dense baseline silently includes its rival.
+static thread_local bool g_fattn_in_compact = false;
+
 // One timed region.  Explicit begin/end rather than a scope, so that it never
 // spans more of a function than intended.
 struct fattn_stage_timer {
@@ -1046,7 +1051,11 @@ struct fattn_stage_timer {
         CUDA_CHECK(status);
         float ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, a, b));
-        g_fattn_stages.add(stage, device, nq, ms);
+        if (g_fattn_in_compact) {
+            g_fattn_stages.add((std::string("c.") + stage).c_str(), device, nq, ms);
+        } else {
+            g_fattn_stages.add(stage, device, nq, ms);
+        }
         CUDA_CHECK(cudaEventDestroy(a));
         CUDA_CHECK(cudaEventDestroy(b));
     }
@@ -1184,7 +1193,7 @@ void launch_fattn(
         const size_t mask_rows = size_t(mask->ne[1]) * mask->ne[3];
 
         KV_max.alloc(size_t(n_kv_max) * mask_rows);
-        ggml_cuda_flash_attn_ext_compact_mask(ctx, mask, K, KV_max.ptr, n_kv_max, main_stream);
+        ggml_cuda_flash_attn_ext_compact_mask(ctx, dst, KV_max.ptr, n_kv_max, main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.

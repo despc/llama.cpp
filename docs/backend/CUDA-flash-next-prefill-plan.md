@@ -1951,3 +1951,93 @@ run on a compact buffer, so nothing yet confirms that a real fused operator hits
 the microbenchmark's numbers, and the gather currently stages K only. Step 2
 replaces the model with a measurement, and it is the first step whose failure
 would cost real implementation work rather than an afternoon.
+
+## Step 2: attention on the compact buffer
+
+The prototype hands the ordinary dense dispatch a set of plain tensors -- K and V
+gathered at the union's positions, an F16 mask over the union, a strided view of
+the group's queries, an output buffer -- and lets the production attention code
+run on them unchanged. Nothing in the kernel knows about sparsity. What is
+measured is therefore a real kernel on real selections, which is what Step 0's
+arithmetic was standing in for.
+
+Two things fell out of building it that the model had not anticipated.
+
+**The membership mask does not need to be synthesised.** The plan called for
+turning the per-query bits into a mask. But the sparse index lists are themselves
+derived from the attention mask, so the mask over the compact buffer is just the
+original mask read at the union's positions: `cmask[r][j] = mask[row][union[j]]`.
+That is simpler, carries any value the model put in an allowed entry rather than
+assuming zero, and makes the bitmap of Step 1 unnecessary for correctness -- it
+remains as the compact representation a fused kernel would want, but the
+prototype does not need it, and dropping it removed 2.4% of attention from the
+cost.
+
+**Tiles batch into the sequence dimension.** A tile of sixteen queries is a
+narrow launch, and Step 0 measured that narrowness at 1.45-2.3x per pair. But the
+group's tiles differ only in which buffer they read, so they can be presented as
+`ne[3]` of one launch. Four tiles give sixty-four queries of parallelism at
+tile-16 union sizes, which is why the measured result beats the model that
+assumed one 16-query launch at a time. Most of Step 0's query-width penalty is an
+artefact of how the launch is shaped, not a property of the machine.
+
+### Correctness
+
+Three checks, all under `GGML_CUDA_FATTN_SPARSE_PREP_VERIFY`, all run on every
+microbatch of a full prefill:
+
+- union and per-query membership agree exactly with the index lists;
+- gathered K and V rows are byte-identical to the source rows at the union's
+  positions;
+- the compact output agrees with a dense reference computed over the full cache
+  for the same queries.
+
+The third needed two corrections before it meant anything. The first comparison
+used elementwise relative error and reported disagreement; most of the output is
+near zero, where one ulp reads as a large relative error, so the measure was
+wrong rather than the result. Normalised mean square error -- what ggml's own
+backend test for this operator uses, at a 5e-4 threshold -- gives 4.3e-07 at
+n_kv 4608, 3.0e-07 at 9216 and 1.6e-07 at 18432. It falls as the cache grows, so
+there is no systematic drift, and it sits three orders of magnitude inside the
+operator's own tolerance.
+
+The second correction was the more useful one. Before trusting any of it,
+`GGML_CUDA_FATTN_SPARSE_PREP_IDENTITY` replaces the union with every position in
+order, which makes the compact path mathematically identical to the dense one. It
+reported 4.5e-07 -- so the query view, the buffer strides, the output layout and
+the mask construction are all sound, and any disagreement under a real union
+would have been attributable to sparsity alone. Building that switch before
+hunting the discrepancy is what kept the search to one iteration.
+
+### What it costs
+
+Dense attention against the whole compact chain -- union, gather, compact mask,
+and the nested dispatch including its own F16 conversion and fixups:
+
+| prompt | dense attention | compact chain | ratio |
+|---|---|---|---|
+| 30k | 6107.3 ms | 1046.7 ms | **5.83x** |
+| 50k | 16246.3 ms | 2229.6 ms | **7.29x** |
+
+The comparison is conservative in the dense path's favour: its figure is the
+attention kernel alone, while the compact figure includes every stage of
+preparation and the whole nested dispatch. The ratio grows with context, as the
+union sizes predicted it would.
+
+Two honest caveats. The prototype runs *beside* the dense path rather than
+replacing it, so its reads may find data the dense pass has already pulled into
+L2; and it copies the group's union lengths back to the host to shape the launch,
+a synchronisation excluded from the timings that a real implementation must
+remove by padding to a fixed granularity. Neither is large enough to overturn a
+5.8-7.3x ratio, but both have to go before the number can be quoted as an
+end-to-end result.
+
+### Where that leaves the projection
+
+Step 0 projected 1.79x on attention at n_kv 18432 from a model of 16-query
+launches. The measurement is 5.83x over a 30k prefill, because batching tiles
+into `ne[3]` removes the penalty the model charged and because the compact buffer
+also shrinks the F16 conversion. Attention's share of prefill is what converts
+this into an end-to-end figure, and that share is measured, not assumed: about
+15% at 30k under this profiler and 41.3% in the 100k census. The next step is to
+stop projecting and substitute the path.
