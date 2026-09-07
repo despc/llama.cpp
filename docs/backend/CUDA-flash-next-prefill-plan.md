@@ -2495,3 +2495,35 @@ section listed as owed. Prefill is untouched, short-prefix output is identical i
 all three, there are no CUDA errors, and `capturing=1` confirms the regime now
 runs inside captured graphs with buffers that cannot move under them.
 Verification: per-query nmse 1.88e-06 and 5.46e-07.
+
+### The per-query threshold, measured
+
+The second of G3's two open items. Decode throughput at five prefix lengths, same
+build and run, the regime off and on with its floor lowered to 1024 so only the
+structural gate applies:
+
+| Prefix | Off | On | | Same output |
+| ---: | ---: | ---: | ---: | --- |
+| 6 000 | 62.09 | 62.10 | 0.0% | yes |
+| 10 000 | 60.46 | 61.75 | +2.1% | yes |
+| 15 000 | 57.01 | 58.76 | +3.1% | yes |
+| 20 000 | 54.58 | 56.95 | +4.3% | yes |
+| 30 000 | 49.19 | 53.03 | +7.8% | no |
+
+**The threshold does not need changing, and the reason is that there is nothing
+to protect against.** The tiled regime loses 30% below its break-even, which is
+what the 8192 floor is for. The per-query regime does not lose anywhere measured:
+it is level at 6k and improves monotonically after. Keeping 8192 costs nothing,
+because nothing is gained below it either; lowering it gains nothing. The item is
+closed by a measurement that changes no code, which is a result and not an
+omission.
+
+The structural gate -- `union_n * 2 >= n_kv`, so roughly n_kv above 4608 -- is
+doing the work a threshold would otherwise have to.
+
+A second finding, incidental but worth more than the first: **the output is
+byte-identical up to 20k with the path engaged**, and the regime does engage
+there (first observed at n_kv 10240). Divergence is not an automatic consequence
+of the reassociation; it appears only once the accumulated difference is enough to
+flip a token. That bounds the behavioural change more tightly than "greedy output
+changes above the threshold" did.
