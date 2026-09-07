@@ -1592,3 +1592,84 @@ Three things are still not established, and none of them is small:
 Attention is 19.7% of Tesla time at 30k. Two thirds of that is 13% of Tesla time
 and about 11% of prefill at this length -- an estimate under the assumptions
 above, not a budget.
+
+### Closing pass on the probe, 2026-09-07
+
+The first pass had two defects, both of the kind this document keeps warning
+about: an experiment that silently compared a thing with itself, and a timer
+whose boundaries did not match its label.
+
+**The geometry sweep tested one point, not three.** `ncols1=32` requires
+`32*ncols2 <= 64` for an instantiation to exist; at the deployment's `ncols2=4`
+it does not, so the case fell through to the default rule and the run measured
+the default against itself. The override also applied to the Blackwells, which
+were not the subject. It now reports the requested geometry and the one actually
+used, refuses unavailable values out loud, and is confined to Volta unless asked
+otherwise.
+
+Re-run with that reporting, at `ncols2=4` where only two geometries exist:
+
+| Requested | Outcome | Prefill 30k |
+| --- | --- | ---: |
+| ncols1 = 8 | used | 705.9 t/s |
+| ncols1 = 16 (the default) | used | 733.1 t/s |
+| ncols1 = 32 | not available, fell back | 732.7 t/s |
+
+So the default is the better of the two that exist. A wider tile would need
+`ncols2 = 2`, whose configuration fails `max_blocks_per_sm > 0` -- it wants more
+shared memory than the card has. Geometry is not an available lever here without
+new instantiations, which is a weaker statement than "the geometry is optimal"
+and is the one the evidence supports.
+
+**The attention timer covered the fixups.** It was declared at function scope and
+outlived both stream-k fixup launches, and the only `combine` timer was on the
+branch this configuration does not take. Scoped to the launch, with both fixups
+timed separately:
+
+| Stage | Time | Share | Calls |
+| --- | ---: | ---: | ---: |
+| attention kernel | 6097.8 ms | 99.1% | 780 |
+| convert K/V from Q8 | 44.5 ms | 0.7% | 780 |
+| stream-k fixup (general) | 7.8 ms | 0.1% | 312 |
+
+The conclusion survives the correction -- the fixups were 0.1% -- but it was not
+established before and is now.
+
+### Union at real long prefixes
+
+Measured during a 100k prefill, no extrapolation:
+
+| Cache length | union over 16 queries | ratio to cache |
+| ---: | ---: | ---: |
+| 4 608 | 3 692 | 1.25x |
+| 9 216 | 4 873 | 1.89x |
+| 18 432 | 6 189 | 2.98x |
+| 37 120 | 7 553 | 4.91x |
+| 74 496 | 8 758 | 8.51x |
+
+The union nearly saturates: quadrupling the cache from 18k to 74k grows it by a
+factor of 1.4. Neighbouring queries select largely the same positions, so at the
+75k mean cache of a 150k prefill a tile of sixteen queries would visit about an
+eighth of what the dense path reads. The earlier extrapolation of 7x was close;
+the measurement is 8.5x and replaces it.
+
+### Where this leaves P1
+
+Against the decision rule: conversion is 0.7%, geometry offers nothing available,
+and the kernel's time tracks the positions it processes at an exponent of 0.95.
+What remains is the positions, and at a long prefix seven eighths of them are not
+selected.
+
+Still not established, and the last of these is now the largest unknown:
+
+- The microarchitectural limiter, which cannot be measured on the Teslas because
+  Nsight cannot see them under the isolated driver.
+- The cost of gathering by index, building the union, and masking within it --
+  no figure here counts any of it, and it is what a prototype exists to measure.
+- Attention's share at long context. It is 19.7% of Tesla time at 30k and grows
+  faster with context than the expert matmuls do, but the share at 75k has not
+  been profiled, so the eightfold reduction cannot yet be turned into a figure
+  for the request.
+
+The next step is a small operator-level prototype that includes union
+construction and masking, not an integrated kernel.

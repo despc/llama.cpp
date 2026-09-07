@@ -1,3 +1,4 @@
+#include <mutex>
 #include "common.cuh"
 #include <cinttypes>
 #include <vector>
@@ -198,9 +199,30 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// Reports what geometry was requested and what was actually used, once per
+// distinct outcome.  A forced value that no instantiation exists for must be
+// visible: silently using the default instead makes the measurement compare the
+// default against itself.
+static void ggml_cuda_fattn_geometry_report(int cc, int want1, int want2, int got1, int got2, bool taken) {
+    static std::set<std::tuple<int,int,int,int,int,int>> seen;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!seen.insert({cc, want1, want2, got1, got2, taken ? 1 : 0}).second) {
+        return;
+    }
+    if (taken) {
+        GGML_LOG_WARN("fattn_geometry cc=%d requested ncols1=%d ncols2=%d -> USED ncols1=%d ncols2=%d\n",
+                      cc, want1, want2, got1, got2);
+    } else {
+        GGML_LOG_WARN("fattn_geometry cc=%d requested ncols1=%d ncols2=%d -> NOT AVAILABLE (needs ncols1*ncols2 <= 64), falling back to the default rule\n",
+                      cc, want1, want2);
+    }
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const bool only_volta = !ggml_env_flag_enabled("GGML_CUDA_FATTN_GEOMETRY_ALL_ARCH");
     const ggml_tensor * Q = dst->src[0];
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -219,14 +241,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         }
     }
 
+    // Only instantiations with ncols1*ncols2 <= 64 exist, so a request outside that
+    // is not available.  Say so rather than falling through to the default, which
+    // silently turns the experiment into a comparison of the default with itself.
     static const int ncols1_forced = getenv("GGML_CUDA_FATTN_NCOLS1") ? atoi(getenv("GGML_CUDA_FATTN_NCOLS1")) : 0;
-    if (ncols1_forced) {
+    if (ncols1_forced && (!only_volta || cc == GGML_CUDA_CC_VOLTA)) {
+        bool taken = false;
         switch (ncols1_forced) {
-            case  8: if constexpr (8*ncols2  <= 64) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV,  8, ncols2>(ctx, dst); return; } break;
-            case 16: if constexpr (16*ncols2 <= 64) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16, ncols2>(ctx, dst); return; } break;
-            case 32: if constexpr (32*ncols2 <= 64) { ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, ncols2>(ctx, dst); return; } break;
+            case  8: if constexpr (8*ncols2  <= 64) { taken = true; ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV,  8, ncols2>(ctx, dst); } break;
+            case 16: if constexpr (16*ncols2 <= 64) { taken = true; ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16, ncols2>(ctx, dst); } break;
+            case 32: if constexpr (32*ncols2 <= 64) { taken = true; ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32, ncols2>(ctx, dst); } break;
             default: break;
         }
+        if (taken) {
+            ggml_cuda_fattn_geometry_report(cc, ncols1_forced, ncols2, ncols1_forced, ncols2, true);
+            return;
+        }
+        ggml_cuda_fattn_geometry_report(cc, ncols1_forced, ncols2, 0, ncols2, false);
     }
 
     if constexpr (ncols2 <= 16) {

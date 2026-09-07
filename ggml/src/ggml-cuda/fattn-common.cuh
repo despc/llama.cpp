@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <tuple>
@@ -1307,7 +1308,10 @@ void launch_fattn(
                           ntiles_x, ntiles_z_gqa, ntiles_KV, parallel_blocks, (long long) Q->ne[1], (long long) K->ne[1], n_kv_max);
         }
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
-        fattn_stage_timer t_attn("attention", ggml_cuda_get_device(), int(Q->ne[1]), main_stream);
+        // Scoped to the launch alone.  Declared at function scope it outlived the
+        // stream-k fixups below and counted them as attention.
+        std::unique_ptr<fattn_stage_timer> t_attn(
+            new fattn_stage_timer("attention", ggml_cuda_get_device(), int(Q->ne[1]), main_stream));
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,
@@ -1324,6 +1328,7 @@ void launch_fattn(
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
+    t_attn.reset();   // the kernel is timed; the fixups below are not part of it
 
     if (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
@@ -1339,6 +1344,7 @@ void launch_fattn(
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+            fattn_stage_timer t_fix("fixup_uniform", ggml_cuda_get_device(), int(Q->ne[1]), main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
@@ -1356,6 +1362,7 @@ void launch_fattn(
             const dim3 blocks_num_combine = {blocks_num.x, ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+            fattn_stage_timer t_fix("fixup_general", ggml_cuda_get_device(), int(Q->ne[1]), main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
