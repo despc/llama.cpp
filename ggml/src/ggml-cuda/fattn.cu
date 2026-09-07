@@ -1,4 +1,7 @@
 #include "common.cuh"
+#include <cinttypes>
+#include <vector>
+#include <set>
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
@@ -103,6 +106,51 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
         (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
+
+    // How much do neighbouring queries select in common?  A sparse attention that
+    // gives every query its own index list cannot amortise a K or V row across a
+    // tile of queries the way the dense kernel does, and at these shapes that costs
+    // more traffic than visiting fewer positions saves.  The only way it pays is a
+    // shared list per tile with per-query masking, and whether that is smaller than
+    // the dense span is entirely a property of the model's selections.  Opt-in via
+    // GGML_CUDA_FATTN_SPARSE_OVERLAP; reports once and is not cheap.
+    static const bool overlap_report = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_OVERLAP");
+    static int64_t overlap_next = 4096;   // report when the cache passes each power of two
+    if (overlap_report && mask->ne[0] >= overlap_next) {
+        overlap_next = mask->ne[0] * 2;
+
+        const int64_t rows = mask->ne[1] * mask->ne[3];
+        std::vector<int32_t> host(size_t(rows) * n_kv_max);
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), indices, host.size()*sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        GGML_LOG_WARN("fattn_sparse_overlap n_kv=%d n_kv_max=%d rows=%" PRId64 "\n",
+                      int(mask->ne[0]), n_kv_max, rows);
+        for (int tile : {1, 2, 4, 8, 16, 32, 64}) {
+            int64_t union_total = 0;
+            int64_t tiles = 0;
+            for (int64_t r0 = 0; r0 + tile <= rows; r0 += tile) {
+                std::set<int32_t> u;
+                for (int64_t r = r0; r < r0 + tile; ++r) {
+                    for (int i = 0; i < n_kv_max; ++i) {
+                        const int32_t v = host[size_t(r)*n_kv_max + i];
+                        if (v >= 0) {
+                            u.insert(v);
+                        }
+                    }
+                }
+                union_total += (int64_t) u.size();
+                tiles++;
+            }
+            if (tiles) {
+                const double mean_union = double(union_total) / tiles;
+                // rows read per query, against one row per query in a dense tile pass
+                GGML_LOG_WARN("fattn_sparse_overlap tile=%-3d mean_union=%8.1f  rows_read_per_query=%7.1f  (dense would read %d)\n",
+                              tile, mean_union, mean_union / tile, int(mask->ne[0]));
+            }
+        }
+    }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
