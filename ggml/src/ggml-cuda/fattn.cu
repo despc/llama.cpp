@@ -126,10 +126,21 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     // Compacting the mask costs one pass over the whole cache regardless of how many
     // queries there are, so it is repaid by the queries that then skip the unselected
     // positions.  At one or two queries -- decode, and speculative verification --
-    // it is not repaid: measured on a 50k prefix, letting decode take this path costs
-    // 2.5% of generation.  Leave those to the dense kernels.
+    // it is not repaid, so leave those to the dense kernels.
     if (Q->ne[1] < 16) {
         return false;
+    }
+
+    // 256/256 is off unless asked for.  Enabling it was neutral on prefill here --
+    // only the two Blackwells can take the path and they hold about a sixth of the
+    // GPU time -- and appeared to cost generation, but that measurement was taken
+    // against binaries carrying an unconditional profiler synchronisation and has
+    // to be redone.  A run-time switch keeps both arms in one binary.
+    if (Q->ne[0] == 256 && K->ne[0] == 256) {
+        static const bool sparse_256 = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_256");
+        if (!sparse_256) {
+            return false;
+        }
     }
 
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&

@@ -1757,15 +1757,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    // qwen4exp's 256/256 heads are deliberately absent.  The path is correct for
-    // them and passes 143/143, but on the four-GPU layer split it is neutral on
-    // prefill -- the two Blackwells that can take it hold a sixth of the GPU time --
-    // while costing 2.2% of generation after a 50k prefix and 12 MiB, because the
-    // index buffer it allocates during prefill shifts the pool the decode
-    // allocations then come from.  Restore this line together with the Volta
-    // fragment shapes that would let the Teslas use it too.
+    // qwen4exp's 256/256 heads are compiled in but disabled at run time: the
+    // kernel variant exists so the path can be toggled inside one binary, which is
+    // the only way to attribute what it costs.  shall_use_sparse() decides whether
+    // it is used; see GGML_CUDA_FATTN_SPARSE_256.
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
-           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
+           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
+           (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
