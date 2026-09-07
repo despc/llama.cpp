@@ -2076,12 +2076,20 @@ graphs and this path never runs at decode's query counts. The path now checks
 |---|---|---|---|
 | prefill 30k | 735.9 t/s | 758.6 t/s | +3.1% |
 | prefill 50k | 642.7 t/s | 699.5 t/s | +8.8% |
+| prefill 100k | 474.2 t/s | 583.2 t/s | **+23.0%** |
+| prefill 150k | 377.6 t/s | 507.4 t/s | **+34.4%** |
 | decode (short prefix) | 61.77 t/s | 62.06 t/s | unchanged |
 | decode output | — | — | byte-identical |
+| VRAM | — | +124 MiB/device | scratch |
 
 The gain grows with context because the path only engages where the union is less
 than half the cache, which at these union sizes means n_kv above roughly 13k --
-so on a 30k prompt most of the prefill is still dense.
+so on a 30k prompt most of the prefill is still dense, while at 150k almost all of
+it is compact. A 150k prefill now takes 295s against 398s.
+
+Set against where this document started, prefill at 100k has gone 310 -> 474 -> 583
+t/s: the first step from fixing three Volta dispatch defects, the second from
+attending to a few thousand rows instead of a hundred thousand.
 
 Decode is unaffected by construction as well as by measurement: the path requires
 at least sixteen queries, and returns before touching anything below that. The
