@@ -10609,6 +10609,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // qwen4exp attention at prefill shapes, swept over the cache length.  A sparse
+    // path hands the kernel a compact cache of the union's length instead of the
+    // real one, so whether it saves anything depends on this kernel costing
+    // proportionally less on a shorter cache.  Every block has fixed overhead --
+    // setup, online softmax, the fixup -- whose share grows as the cache shrinks,
+    // so that proportionality is an assumption until it is measured.
+    for (int64_t kv : {4096, 8192, 16384, 32768, 49152}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            256, 256, 2, {12, 1}, kv, 512, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+
+    // The same kernel at the query counts a compact path would actually use.  The
+    // union is only small over a handful of queries, so a sparse prefill replaces
+    // one wide launch with many narrow ones.  Volta's MMA tile is 32 rows wide, so
+    // a launch narrower than that wastes part of every tile; these cases price
+    // that waste against the rows the union saves.
+    for (int64_t nb : {16, 32, 64, 128}) {
+        for (int64_t kv : {2048, 4096, 8192, 16384}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
     // qwen4exp expert projections at their real shapes and quantisations.  With
     // 512 experts and 10 chosen per token a prefill microbatch touches nearly
     // every expert, so what this measures is how fast the whole expert weight set

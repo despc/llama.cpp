@@ -1799,3 +1799,89 @@ does not change a symptom, that is evidence about the hypothesis, and the next
 step is a tool that localises -- compute-sanitizer names the kernel and the
 address -- not another guess. The scratch now lives in the backend context per
 device and per stream.
+
+## Step 0: does a compact buffer actually cost less?
+
+The whole sparse project rests on one assumption, stated at the end of the
+previous section as the largest unverified link in the chain: that the dense
+kernel on a compact buffer of a few thousand rows costs proportionally less than
+the same kernel on the full cache. If there is a floor -- fixed setup, online
+softmax, the fixup, a launch too narrow to fill the machine -- the project dies
+before a line of the operator is written. Two sweeps in `test-backend-ops perf`,
+at the model's real attention shape (hsk=hsv=256, nh=2, nr23=[12,1], Q8_0 K and
+V) on a V100, answer it.
+
+### Cache length: no floor
+
+At the dense path's own width of 512 queries, cost per query-key pair is flat
+across a twelvefold range of cache length:
+
+| kv | us/run | us per Mpair | vs kv=4096 | if perfectly linear |
+|---|---|---|---|---|
+| 4096 | 2789.1 | 1330 | 1.00x | 1.00x |
+| 8192 | 5312.2 | 1267 | 1.90x | 2.00x |
+| 16384 | 10545.6 | 1257 | 3.78x | 4.00x |
+| 32768 | 21032.9 | 1254 | 7.54x | 8.00x |
+| 49152 | 31492.8 | 1251 | 11.29x | 12.00x |
+
+The spread is 6%, and it leans the helpful way: a short cache is slightly *more*
+expensive per pair, so shrinking the buffer surrenders nothing to fixed cost.
+Halving the rows halves the time.
+
+### Query width: this is where the floor is
+
+The first sweep flatters the idea, because it prices a shape the compact path
+cannot use. The union is only small over a handful of queries, so a sparse
+prefill replaces one 512-query launch with many narrow ones, and Volta's MMA tile
+is 32 rows wide -- a narrower launch wastes part of every tile. Cost per pair,
+same shape, swept over queries per launch:
+
+| nb | kv=2048 | 4096 | 8192 | 16384 | 32768 | 49152 |
+|---|---|---|---|---|---|---|
+| 16 | 2854 | 2262 | 1973 | 1820 | - | - |
+| 32 | 2678 | 2037 | 1836 | 1727 | - | - |
+| 64 | 1822 | 1541 | 1426 | 1371 | - | - |
+| 128 | 1484 | 1357 | 1297 | 1274 | - | - |
+| 512 | - | 1331 | 1266 | 1256 | 1251 | 1251 |
+
+A 16-query launch pays 1.45x to 2.3x per pair against a 512-query one. That is
+the floor, and it is real: it removes roughly half of what the row count
+promises. It does not remove the project, and finding it cost one afternoon
+rather than the week the operator would have taken.
+
+### Which tile, and where it starts paying
+
+Tile width trades two measured curves against each other. A wider tile amortises
+the launch better -- 64 queries cost 1.33x less per pair than 16 -- but the union
+over a wider tile is larger, and `GGML_CUDA_FATTN_SPARSE_OVERLAP` says the union
+grows faster than the launch efficiency improves. Combining the two sweeps, cost
+of attention for one 512-query ubatch, kernel only:
+
+| n_kv | dense us | tile=16 | tile=32 | tile=64 |
+|---|---|---|---|---|
+| 4608 | 3114 | 4443 (0.70x) | 4256 (0.73x) | 3361 (0.93x) |
+| 9216 | 5966 | 5463 (1.09x) | 6041 (0.99x) | 5623 (1.06x) |
+| 18432 | 11845 | 6622 (1.79x) | 8296 (1.43x) | 9219 (1.28x) |
+| 37120 | 23776 | 7761 (3.06x) | 12032 (1.98x) | 19715 (1.24x) |
+
+Tile 16 wins everywhere it wins at all, and the reason the advantage accelerates
+is visible in the union sizes: between n_kv 18432 and 37120 the cache doubles
+while the union over 16 queries goes 6189 -> 7553. Sparsity is nearly a constant
+number of rows per tile; the dense cost it replaces is linear in the cache. The
+gap therefore widens with every additional token of context, which is exactly the
+regime the deployment cares about.
+
+Charging preparation at the 12% of attention already measured for the serial
+union plus gather, the end-to-end picture per ubatch is 0.65x at 4608, 0.97x at
+9216, 1.47x at 18432 and 2.24x at 37120. Against attention's 41.3% share of a
+100k prefill, and with the union curve still flattening at the 50k test cap, that
+projects to roughly 1.3-1.4x on total prefill at long context -- and a loss below
+about 10k, which is what makes Step 4's length threshold a correctness-of-design
+requirement rather than a refinement.
+
+### Verdict
+
+Proceed. The assumption held for cache length, failed partially for query width
+in a way that costs about half the theoretical win, and the remaining win is
+large enough and grows with context. Two numbers now govern the design that did
+not exist before: the tile is 16, and the path must be off below roughly 10k.
