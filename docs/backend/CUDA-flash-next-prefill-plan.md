@@ -133,12 +133,17 @@ it bounds this path, not every sparse attention on this card. The sparse path
 needs one query column per block and this model's
 GQA ratio is 12. The `ncols1*ncols2 < 32` guard is a correctness bound, not the
 compile-time prune it resembles. Enabling it for the two Blackwells that can take
-it is neutral on prefill -- they hold a sixth of the GPU time -- and appeared to
-cost 2.2% of generation, so the 256/256 eligibility was withdrawn. That figure is
-not established: it was measured against binaries carrying the profiler's
-unconditional synchronisation, which alone accounts for 1.2%, and the mechanism
-offered for the rest (pool state left by the index buffer) was never isolated.
-Remeasure before treating either the cost or its cause as known. The plumbing, the query-count gate, the tests and the
+it is neutral on prefill -- they hold a sixth of the GPU time -- and was withdrawn
+on a reported 2.2% generation cost.
+
+That cost does not exist. Remeasured on 2026-09-07 as P0.4 asks -- one binary,
+`GGML_CUDA_FATTN_SPARSE_256` toggled, all throughput profilers off, interleaved
+both ways: prefill at 30k 732.7 against 732.2 tokens/s, generation after a 30k
+prefix 43.73 +- 0.28 against 43.79 +- 0.25, 12 MiB more on the Teslas. The 2.2%
+was the profiler's synchronisation, and the pool-state mechanism proposed for it
+was explaining an artefact; that regression theory is retired. The path stays off
+because neutral does not justify 12 MiB on a split this tight, not because it
+costs anything. The plumbing, the query-count gate, the tests and the
 comment explaining the bound all stay: restoring one line re-enables it the day
 narrower Volta fragments exist.
 
@@ -188,7 +193,7 @@ Closed work: grouped Volta MMQ, the correct DP4A tile table, DP4A-only J_FIT ena
 
 The current recorded prefill reference is 907.1 / 733.0 / 475.3 / 377.7 tokens/s at 5k / 30k / 100k / 150k. The latest J_FIT recheck explicitly reports generation parity after short and 50k prefixes; a 150k prefill pass is not by itself a matched 150k-prefix generation comparison. Include that comparison in acceptance for the next candidate, reserving room for its continuation within the unchanged context limit.
 
-The pre-J_FIT Tesla shares (48% experts, 17% attention, 16.9% other matmuls, 4% recurrence, 2.7% top-k at 30k) are stale. Historical scaling suggests long-context attention/indexer work deserves priority, but does not establish a current crossover at 50k or prove which operation dominates at 150k.
+The pre-J_FIT Tesla shares (48% experts, 17% attention, 16.9% other matmuls, 4% recurrence, 2.7% top-k at 30k) are stale. Refreshed 2026-09-07 on the deployed build at 30k, against an uninstrumented reference of 732.9 tokens/s (the host timeline costs 0.5%, the per-operation profiler 6.3%): the Teslas spend 28637 ms, down 14%, split MUL_MAT_ID 40.0%, FLASH_ATTN_EXT 19.7%, MUL_MAT 19.6%, GATED_DELTA_NET 4.7%, TOP_K 3.1%; the Blackwells are unchanged at 6356 ms, which independently confirms the tile fitting no longer reaches them. Attention and the dense matmuls together are 39.3%, level with the experts. Host timeline with allocation finally separated from graph construction: build 52 ms, alloc 362 ms, set_inputs 251 ms, submit 89.9%, sync 8.4%. Still outstanding for P0: the target/draft and prefill/decode split, and a long-prefix trace. Historical scaling suggests long-context attention/indexer work deserves priority, but does not establish a current crossover at 50k or prove which operation dominates at 150k.
 
 | Priority | Next work | Why now | Decision / deliverable |
 | --- | --- | --- | --- |
