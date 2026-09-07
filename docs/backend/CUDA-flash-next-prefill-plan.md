@@ -49,8 +49,10 @@ Greedy output is byte-identical to the previous deployment for everything except
 the compact path, which changes it above the threshold. That change is
 floating-point reassociation, not a different computation: the set of attended
 positions is verified identical and NMSE against a dense reference is 4e-07,
-against the 5e-4 ggml itself accepts for this operator. It is nonetheless a
-behavioural change, and `FATTN_COMPACT=0` reverses it.
+against the 5e-4 ggml itself accepts for this operator. Perplexity over a fixed
+corpus, measured later, is 2.8943 dense against 2.8929 compact -- 0.048%, thirteen
+times inside one standard error -- so no quality loss is measurable. It is
+nonetheless a behavioural change, and `FATTN_COMPACT=0` reverses it.
 
 ### Correction, 2026-09-07: two of the conclusions above were wrong
 
@@ -2227,21 +2229,18 @@ diagnosing: the identity-union switch, the below-threshold decode comparison, th
 J_FIT census. The one that was not -- the traffic estimate -- was caught only
 because the estimate was checked against a measurement instead of acted on.
 
-### The one measurement still owed
+### The measurement that was owed here, since made
 
-Nothing here establishes that generation *quality* is unchanged above the
-threshold. NMSE of 4e-07 establishes that the numerical difference is small; it
-does not establish that the model's predictions are as good, and the two are not
-the same claim. Greedy output does change, which is expected from reassociation
-and would equally follow from changing the microbatch or the tensor split, but
-"expected" is not "measured".
+This section used to say that nothing established generation *quality*, only that
+the numerical difference was small, and that the two are different claims. That
+was right, and the measurement has since been made -- see the quality section at
+the end. In short: perplexity over a fixed corpus is 2.8943 dense against 2.8929
+compact, a difference of 0.048% and thirteen times inside one standard error,
+with the compact figure nominally lower in every chunk. No measurable quality
+loss on the deployed path.
 
-The measurement that would settle it is perplexity over a fixed corpus at a
-context long enough to engage the path, both arms, same file and settings; a
-top-1 agreement rate over many positions would say how often the divergence
-actually occurs. Neither has been run. Until one is, the honest statement is that
-the path is a throughput change whose quality effect is unmeasured, and
-`FATTN_COMPACT=0` exists for anyone unwilling to accept that.
+The per-query decode regime is measured separately and less tightly, and that
+distinction is kept rather than averaged away.
 
 ### Open work
 
@@ -2412,15 +2411,18 @@ review and its fixes closed the item, so the list is not read as outstanding.
 - ~~**CUDA graph capture is argued, not confirmed.**~~ Closed by direct
   observation -- `capturing=1` does appear -- which also proved the scratch
   lifetime hazard was live rather than theoretical.
-- **The threshold is inherited, not measured.** Still open. 8192 was chosen for
-  what building a *union* costs; the per-query regime builds none, so its
-  break-even is a different number and is unknown. It may pay well below 8192.
+- ~~**The threshold is inherited, not measured.**~~ Closed, and by a measurement
+  that changed no code: the regime never loses in the measured range, so the
+  threshold protects against nothing. Keeping 8192 costs nothing because nothing
+  is gained below it either.
 - ~~**The union kernel is doing unnecessary work at decode.**~~ Closed as a
   consequence of the lifetime fix: the bitmap, scan and compaction are gone,
   because one query's index list is already its own union.
-- **Generation quality above the threshold is unmeasured.** Still open, and
-  unchanged in kind from the prefill path -- except that this regime changes
-  generation directly, so it matters more here.
+- ~~**Generation quality above the threshold is unmeasured.**~~ Closed, with the
+  weight of the two answers kept distinct: tight for the deployed path
+  (perplexity, 0.048%), weak for this one (24 single-step predictions, bounding
+  the effect only to about ±23% in probability). No degradation detected in
+  either.
 
 ### Review of f8a35540e: three defects, one of them structural
 
@@ -2621,3 +2623,72 @@ single-step predictions would bring the bound to the same order as the perplexit
 one. Nothing in the evidence so far suggests it would find anything -- flips only
 at near-ties, a clean split of signs, a clean perplexity on the sibling path --
 but that is an expectation, not a measurement, and it is written here as such.
+
+## Conclusions
+
+Written at the end of the work, for a reader who will not read the logs. Every
+number here appears with its evidence above; what this section adds is which
+claims the evidence actually supports.
+
+### What shipped
+
+Prefill on the reference configuration went **310 → 475 → 583 t/s at 100k** and
+**377 → 506 at 150k**. The first step was three dispatch defects on Volta: the
+model's kernels were being routed as if the cards were newer, and fixing that
+roughly doubled prefill without touching a line of arithmetic. The second was
+compact attention: the model already attends to 2051 selected positions per
+query, and the kernel was reading the whole cache anyway.
+
+Generation is unchanged as deployed, and byte-identical below the threshold.
+
+### What the evidence supports, and what it does not
+
+- **Prefill throughput.** Measured, one run per arm across five context lengths,
+  switch off and on. Solid.
+- **Quality of the deployed path.** Perplexity 2.8943 against 2.8929, 0.048%,
+  thirteen times inside one standard error, sign favouring the compact path in
+  every chunk. This bounds the effect well below anything that could matter.
+- **Quality of the per-query decode regime.** No degradation detected, on a
+  measurement weak enough that it only excludes a large one. Fourteen usable
+  positions; two standard errors is about ±23% in probability. Kept separate from
+  the line above rather than averaged into it.
+- **Correctness of the compact paths.** Verified against a dense reference on the
+  live path, not a prototype: NMSE 7e-07 and 1.75e-06 tiled, 1.88e-06 and
+  5.46e-07 per-query, against ggml's own 5e-4 for this operator. The union, the
+  per-query membership and the gathered rows are each checked exactly against
+  their sources.
+- **Behaviour.** Greedy output changes above the threshold, and the reason is
+  now characterised rather than asserted: flips occur only where the top two
+  candidates are within about a tenth of each other; where the model is confident
+  both paths agree.
+
+### What this document got wrong, and what caught it
+
+Nine recorded errors. The pattern in all of them is the same: a difference
+measured without establishing where it came from.
+
+Three were caught by building an isolating control *before* diagnosing -- the
+identity-union switch, the same-configuration decode control, the J_FIT census.
+Two were caught by a verifier that found defects in itself first. One was caught
+only because an estimate was checked against a measurement instead of acted on,
+and that one -- the traffic estimate that valued sparsity at 1.4x -- would have
+closed the project.
+
+The three that cost the most time were all cases of accepting a plausible cause:
+attributing a generation regression to a tile rule, to sparse-at-decode, and to
+tensor naming, when the cause was an unconditional synchronisation the profiler
+itself had added. The lesson the document keeps re-learning is that when a guard
+does not change a symptom, that is evidence about the hypothesis.
+
+### What is left
+
+- **R12 / TOP_K** is now the largest single item: 17.7% of decode and 13.9% of
+  prefill, growing at the same rate as the attention it feeds, and nothing has
+  been tried against it. Sparse attention cannot remove it -- it consumes what
+  TOP_K produces.
+- **G3 is not deployed.** It is measured, verified and off by default. Deploying
+  it is a decision about accepting a behavioural change in generation, which is
+  the user's to make and not a technical gap.
+- **The per-query quality bound is loose** and could be tightened with a few
+  hundred single-step predictions rather than twenty-four.
+- **P2 through P6** in the priority table are untouched.
