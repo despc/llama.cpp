@@ -2309,3 +2309,73 @@ measured rather than inherited.
 R12/TOP_K is then the largest single remaining item in the whole document, at
 17.7% of decode and 13.9% of prefill, and unlike attention nothing has yet been
 tried against it.
+
+## G3: the compact path at decode, 2026-09-07
+
+The decode profile put attention at 25.6% of decode GPU time, so the same idea
+was applied there. It turned out to be a smaller change than the prefill path,
+for a reason worth stating before the numbers.
+
+**A union exists only to amortise one gathered cache over a tile of queries.**
+With a single query there is nothing to amortise: the tile is one query, the
+"union" is that query's own selection, and -- decisively -- its size is bounded
+by the indexer's own top-k, so it is known *before* the launch as
+`min(n_kv, n_kv_max)` rather than counted on the device afterwards.
+
+That removes the host read-back, and with it the reason the path could not run
+inside a CUDA graph. Decode depends on graphs; a sparse decode that disabled them
+would have given back more than it took. A capture also cannot express an
+allocation, so the path declines when its scratch is not already large enough and
+takes the compact route on a later capture, once an uncaptured call has sized the
+buffers.
+
+The gate was measured first, as for prefill. One query, V100, Q8_0 cache:
+
+| kv | us/run |
+| ---: | ---: |
+| 2 048 | 34.6 |
+| 16 384 | 177.3 |
+| 65 536 | 657.5 |
+| 151 552 | 1581.4 |
+
+Replacing a 150k dense read with a 2051-row compact one is 45x on the operator,
+where prefill's compact path manages about 6x -- because prefill must union
+sixteen queries' selections and decode must not.
+
+### Results
+
+Same build, same run, `GGML_CUDA_FATTN_SPARSE_COMPACT_DECODE` off and on:
+
+| After a prefix of | Off | On | |
+| ---: | ---: | ---: | ---: |
+| short | 54.69 | 56.85 | output byte-identical |
+| 100 001 | 26.40 | 31.73 | **+20.2%** |
+| 150 001 | 20.01 | 26.37 | **+31.8%** |
+
+This is the first generation improvement in this document. Every gain before it
+was in prefill, with generation held unchanged as an acceptance condition.
+
+Above the threshold the generated text changes, for the same reason and with the
+same standing as the prefill path: reassociation, not a different computation.
+Below it the output is byte-identical.
+
+### Verification, and what it caught
+
+`GGML_CUDA_FATTN_SPARSE_COMPACT_VERIFY` runs a dense reference over the full
+cache for the same queries and compares, now on the live path rather than a
+prototype. Bounded to a few calls per mode: it materialises an FP16 mirror of the
+cache, and running it on every layer of every token establishes nothing more
+while exhausting memory.
+
+- tiled: nmse 7.14e-07 and 1.75e-06
+- per-query: nmse 1.88e-06 and 5.46e-07, at n_kv 50176 with union_n 2304
+
+against the 5e-4 ggml accepts for this operator.
+
+Truncation is structurally impossible here -- `union_n` is at least `n_kv_max` and
+one query selects at most that many positions -- but that is an argument, and the
+check is a measurement. Writing it was worth it for two defects it found in
+itself before it found anything else: a 64-row reference mask read past its end
+under an 80-query group, and a zero-norm reference that the first version
+reported as `nmse 0`, which reads as a perfect match and is in fact a check that
+measured nothing. The second now aborts explicitly.

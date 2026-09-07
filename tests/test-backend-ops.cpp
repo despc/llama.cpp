@@ -10634,6 +10634,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Decode shapes.  One query (the draft) and two (target verification at MTP
+    // depth 1) against caches from a compact buffer's size up to a full one.  A
+    // single query selects its own 2051 positions and needs no union, so the
+    // question for a sparse decode path is only the ratio between these rows.
+    for (int64_t nb : {1, 2}) {
+        for (int64_t kv : {2048, 4096, 16384, 65536, 151552}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
+
     // qwen4exp expert projections at their real shapes and quantisations.  With
     // 512 experts and 10 chosen per token a prefill microbatch touches nearly
     // every expert, so what this measures is how fast the whole expert weight set
