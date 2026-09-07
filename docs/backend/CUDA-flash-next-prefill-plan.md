@@ -1490,3 +1490,105 @@ gather-based kernel may well meet the same limit and return nothing.
 That is the same mistake the FP16 expert proposal made: a large rewrite justified
 by an unverified assumption about the bottleneck. The next step for P1 is the
 cheap probe, not the kernel.
+
+## The attention probe, 2026-09-07
+
+Run before writing any sparse kernel, to establish what the existing attention
+operation spends its time on rather than assume it. All figures are from a 30k
+prompt on the deployed build, Teslas unless stated.
+
+### Correction to the P1 arithmetic above: the dense tile is 16 queries, not 64
+
+The union table in the previous section was compared against the wrong baseline.
+The dense path on the Teslas runs `ncols1=16, ncols2=4` -- sixteen queries and
+four of the twelve grouped query heads -- confirmed from the launch profile. A K
+row is therefore amortised over sixteen queries, not sixty-four, so the
+comparison must be made at that width:
+
+| Cache length | union over 16 queries | dense reads | ratio |
+| ---: | ---: | ---: | ---: |
+| 4 608 | 3 692 | 4 608 | 1.25x |
+| 9 216 | 4 873 | 9 216 | 1.89x |
+| 18 432 | 6 189 | 18 432 | 2.98x |
+
+The union over sixteen queries grows as roughly the 0.37 power of the cache
+length, not the 0.85 measured for tiles of sixty-four. Extrapolating gives about
+7x at the 75k mean cache of a 150k prefill, but three points do not support an
+extrapolation and the long cases have not been run.
+
+The earlier conclusion -- "1.42x, so P1 is worth about 5%" -- was arithmetic
+against a tile width the kernel does not use. It is withdrawn.
+
+### What the operation spends its time on
+
+`launch_fattn` does three separable things. Timed apart with
+`GGML_CUDA_FATTN_STAGE_PROFILE`, over the prefill:
+
+| Stage | Time | Share |
+| --- | ---: | ---: |
+| attention kernel | 6108.5 ms | 99.3% |
+| convert K/V from Q8 to FP16 | 44.5 ms | 0.7% |
+| combine partial results | under 0.1 ms | — |
+
+R7 -- avoiding the full Q8 to FP16 conversion before each MMA call -- addresses
+0.7% of the operation. It is retired as a speed candidate on these shapes. It
+also means the "13% of FP16 peak" figure quoted earlier, computed over the whole
+operation, is very nearly the kernel's own efficiency: the other two stages are
+too small to distort it.
+
+### The tile geometry is not the problem
+
+Forced through the already-compiled instantiations with
+`GGML_CUDA_FATTN_NCOLS1` / `_NCOLS2`, prefill at 30k:
+
+| Geometry | Prefill |
+| --- | ---: |
+| default (16 x 4) | 731.9 t/s |
+| ncols1 = 32 | 733.1 t/s |
+| ncols1 = 8 | 706.3 t/s |
+| ncols2 = 2 or 8 | will not launch |
+
+The default is within 0.2% of the best available, and the two `ncols2` variants
+fail `max_blocks_per_sm > 0`: they need more shared memory than the card allows,
+so their occupancy is zero. Tuning the existing dense kernel's geometry is
+retired as a candidate.
+
+### The time is proportional to the pairs evaluated
+
+Attention on the Teslas at two prompt lengths:
+
+| Prompt | Attention | (query, key) pairs | ms per Gpair |
+| ---: | ---: | ---: | ---: |
+| 5 000 | 187.5 ms | 1.25e7 | 15.0 |
+| 30 001 | 5637.2 ms | 4.5e8 | 12.5 |
+
+A full prefill evaluates about n^2/2 pairs, so the pair count grows 36x between
+these while the time grows 30x -- an exponent of 0.95, and a cost per pair that
+barely moves. Whatever the kernel is limited by microarchitecturally, its time
+tracks the number of positions it processes.
+
+### What this decides, and what it does not
+
+Against the decision rule: conversion does not dominate, so R7 first is out;
+configuration and geometry do not dominate, so tuning the dense kernel first is
+out. What remains is the positions themselves, and that is what sparsity removes.
+On this evidence a sparse kernel that visited the union of a tile's selections
+instead of the whole cache would remove about two thirds of the attention work at
+an 18k cache, growing with context.
+
+Three things are still not established, and none of them is small:
+
+- **The microarchitectural limiter.** Nsight Compute cannot see the Teslas under
+  the isolated driver, as the hardware audit records, so stall reasons, occupancy
+  and eligible-warp counts are unavailable on the cards that matter. "Time tracks
+  positions" is a statement about behaviour, not a diagnosis. A gather kernel
+  could meet a limit the streaming one does not.
+- **The cost of the gather.** Every figure above counts positions, not the cost
+  of reading them by index instead of contiguously, nor of building the union,
+  nor of masking per query within it.
+- **The long-context case.** The 7x extrapolation rests on three cache lengths
+  below 20k. The regime P1 is meant for has not been measured.
+
+Attention is 19.7% of Tesla time at 30k. Two thirds of that is 13% of Tesla time
+and about 11% of prefill at this length -- an estimate under the assumptions
+above, not a budget.
