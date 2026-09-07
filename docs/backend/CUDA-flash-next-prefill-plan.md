@@ -6,7 +6,7 @@ Reading guide: **[outcome](#outcome-what-shipped-what-did-not-and-why)** first i
 
 Follow-up: [review of the executed experiments and alternative implementations](#review-of-executed-experiments-and-alternative-implementations) qualifies several causal explanations above and in the historical logs, and gives the next experiments. The reported measurements are preserved; proposed mechanisms and untested alternatives are not new benchmark results.
 
-Current execution order: [next priorities after the rechecks](#where-the-next-gain-has-to-come-from), updated against HEAD dbc99aee0 on 2026-09-07. This order supersedes the earlier R/G/A rankings; those sections retain implementation details and historical evidence, not an outstanding task list.
+Current execution order: [next priorities after the rechecks](#where-the-next-gain-has-to-come-from), updated against HEAD dbc99aee0 on 2026-09-07. P0 and P1 in that table are now closed by the compact attention path; the open list starts at P2, and the one measurement this document still owes is named at the end. This order supersedes the earlier R/G/A rankings; those sections retain implementation details and historical evidence, not an outstanding task list.
 
 ## Outcome: what shipped, what did not, and why
 
@@ -17,15 +17,36 @@ the wrong turns, which are kept because two of them were convincing.
 Prefill on the fixed reference configuration, tokens/s, deployed against where
 this document started:
 
-| Prompt | Before | Deployed | |
-| ---: | ---: | ---: | ---: |
-| 5 000 | 478.0 | 907.1 | +90% |
-| 30 000 | 411.8 | 733.0 | +78% |
-| 100 000 | 309.7 | 475.3 | +54% |
-| 150 000 | — | 377.7 | — |
+Prefill on the fixed reference configuration, tokens/s, in the three states this
+document passes through: where it started, after the three Volta dispatch fixes,
+and with the compact attention path that replaced dense attention above a length
+threshold. The last two columns are one measurement run, same build, switch off
+and on.
 
-Generation is unchanged at every prefix length measured, memory is unchanged, and
-greedy output is byte-identical to the previous deployment.
+| Prompt | At the start | Dispatch fixes | Compact path | |
+| ---: | ---: | ---: | ---: | ---: |
+| 5 000 | 478.0 | 865.9 | 867.2 | +81% |
+| 30 001 | 411.8 | 741.7 | 765.4 | +86% |
+| 49 999 | — | 640.3 | 699.0 | — |
+| 100 001 | 309.7 | 475.0 | 584.8 | +89% |
+| 150 001 | — | 377.1 | 506.2 | — |
+
+The compact path contributes +0.2% at 5k, +3.2% at 30k, +9.2% at 50k, +23.1% at
+100k and +34.3% at 150k: it engages only where a tile's union is under half the
+cache, so a short prompt is untouched and a 150k one is almost entirely compact.
+A 150k prefill takes 295 s against 398 s.
+
+Generation is unchanged. It cannot reach the compact path, which requires at
+least sixteen queries, and the controlled comparison -- a prefix below the
+threshold, where both builds emit the same tokens -- gives 61.77 against 62.06
+tokens/s with byte-identical output.
+
+Greedy output is byte-identical to the previous deployment for everything except
+the compact path, which changes it above the threshold. That change is
+floating-point reassociation, not a different computation: the set of attended
+positions is verified identical and NMSE against a dense reference is 4e-07,
+against the 5e-4 ggml itself accepts for this operator. It is nonetheless a
+behavioural change, and `FATTN_COMPACT=0` reverses it.
 
 ### Correction, 2026-09-07: two of the conclusions above were wrong
 
@@ -189,16 +210,16 @@ The residual generation gap is now resolved: the profiler inserted an unconditio
 
 This is the current execution order, based on the rechecks recorded through dbc99aee0 and the deployed launcher's documented settings. This update is a planning review, not another benchmark run. Keep the fixed model and Q8 KV, four-device placement, context 160072, ubatch 512, and MTP depth 1 as the control.
 
-Closed work: grouped Volta MMQ, the correct DP4A tile table, DP4A-only J_FIT enabled by default, and the unconditional profiler-sync defect. J_FIT now gives 810.9 -> 907.1 tokens/s at 5k, not a marginal unexplained gain. The Blackwell tile regression explains the earlier discrepancy; empty CTAs remain an independent optimization hypothesis, not its established cause. Do not repeat the completed build-variation investigation or spend another cycle deciding whether to enable J_FIT.
+Closed work: grouped Volta MMQ, the correct DP4A tile table, DP4A-only J_FIT enabled by default, the unconditional profiler-sync defect, and -- added 2026-09-07, after this table was written -- the compact attention path, which closes P0 and P1. J_FIT now gives 810.9 -> 907.1 tokens/s at 5k, not a marginal unexplained gain. The Blackwell tile regression explains the earlier discrepancy; empty CTAs remain an independent optimization hypothesis, not its established cause. Do not repeat the completed build-variation investigation or spend another cycle deciding whether to enable J_FIT.
 
-The current recorded prefill reference is 907.1 / 733.0 / 475.3 / 377.7 tokens/s at 5k / 30k / 100k / 150k. The latest J_FIT recheck explicitly reports generation parity after short and 50k prefixes; a 150k prefill pass is not by itself a matched 150k-prefix generation comparison. Include that comparison in acceptance for the next candidate, reserving room for its continuation within the unchanged context limit.
+The current recorded prefill reference is 867.2 / 765.4 / 699.0 / 584.8 / 506.2 tokens/s at 5k / 30k / 50k / 100k / 150k, on the deployed build with the compact attention path on; with it off, 865.9 / 741.7 / 640.3 / 475.0 / 377.1. The latest J_FIT recheck explicitly reports generation parity after short and 50k prefixes; a 150k prefill pass is not by itself a matched 150k-prefix generation comparison. Include that comparison in acceptance for the next candidate, reserving room for its continuation within the unchanged context limit.
 
 The pre-J_FIT Tesla shares (48% experts, 17% attention, 16.9% other matmuls, 4% recurrence, 2.7% top-k at 30k) are stale. Refreshed 2026-09-07 on the deployed build at 30k, against an uninstrumented reference of 732.9 tokens/s (the host timeline costs 0.5%, the per-operation profiler 6.3%): the Teslas spend 28637 ms, down 14%, split MUL_MAT_ID 40.0%, FLASH_ATTN_EXT 19.7%, MUL_MAT 19.6%, GATED_DELTA_NET 4.7%, TOP_K 3.1%; the Blackwells are unchanged at 6356 ms, which independently confirms the tile fitting no longer reaches them. Attention and the dense matmuls together are 39.3%, level with the experts. Host timeline with allocation finally separated from graph construction: build 52 ms, alloc 362 ms, set_inputs 251 ms, submit 89.9%, sync 8.4%. Still outstanding for P0: the target/draft and prefill/decode split, and a long-prefix trace. Historical scaling suggests long-context attention/indexer work deserves priority, but does not establish a current crossover at 50k or prove which operation dominates at 150k.
 
 | Priority | Next work | Why now | Decision / deliverable |
 | --- | --- | --- | --- |
-| P0 | Refresh attribution and repeat the sparse control on the corrected runtime | Both kernel dispatch and synchronization changed; the old sparse generation penalty is confounded | A current per-device, target/draft, prefill/decode breakdown and a clean sparse on/off result. |
-| P1 | Index-native sparse attention for the two V100s (A2/R1), initially prefill-only | Strongest plausible long-context compute opportunity; the tested implementation, not the whole idea, is blocked | Correct selected-index SIMT prototype at actual shapes; promote only after request-level and generation gates. |
+| ~~P0~~ | **Done.** Attribution refreshed at 30k and 100k; sparse control clean | — | 41.3% FLASH_ATTN_EXT, 25.9% MUL_MAT_ID, 12.7% MUL_MAT, 7.4% TOP_K at 100k. |
+| ~~P1~~ | **Done and deployed.** Compact attention over the tile's union, prefill-only | — | +23.1% at 100k, +34.3% at 150k; generation unchanged; behind `FATTN_COMPACT`. See Steps 0-2 and the integration section below. |
 | P2 | A bounded generation probe selected from G2/G5/G1/G4 | Generation must not become an afterthought; recent fixes show that dispatch and synchronization deserve inspection before new kernels | Test one measured cost: supported target backend sampling, a redundant handoff, tiny expert dispatch, or long-prefix dense draft attention. |
 | P3 | Remove the measured peak-live buffer with R4/R5/R7 | These can enable overlap without promising a large direct CPU speedup | Per-device late-prefix headroom sufficient for a specified two-slot allocation, or a direct speed gain. |
 | P4 | Two-slot pipeline after P3 (A5/R2) | Current implementation OOMs at 30k and has not demonstrated useful overlap | Full-context fit plus a timeline showing actual overlap, followed by unchanged generation. |
@@ -1473,23 +1494,25 @@ At a narrower tile sparsity loses outright: 32 tiles of 16 queries read
 32 x 6189 = 198048 rows at an 18432 cache, against 8 x 18432 = 147456 for dense
 tiles of 64.
 
-So the traffic argument for P1 is 1.4x at 30k and perhaps 1.7x at 150k, not the
-7x or 73x that "2051 of n_kv" suggests. Attention is 19.7% of Tesla time, so a
-kernel that read the union instead of the whole cache and lost nothing to
-scattered access would save about 5.9% of Tesla time at 30k -- and scattered
-access does lose something, against a dense path that streams contiguously.
+**The conclusion drawn from this table was wrong, and the table was not.** The
+union sizes above stand -- they are reused throughout the later work. What was
+wrong was reading them at a tile width of 64 and concluding sparsity was worth
+1.4x at 30k, perhaps 1.7x at 150k, and about 5.9% of Tesla time; and the
+suspicion that a gather kernel would meet the same unexplained limit and return
+nothing. The measured result is a 5.83x reduction of the attention operator at
+30k and 7.29x at 50k, and +34.3% on end-to-end prefill at 150k.
 
-The arithmetic argument is different and unresolved: sparsity does 9x fewer dot
-products at an 18432 cache. Which of the two bounds applies depends on what
-limits the current kernel, and neither does: at 30k the attention kernels run at
-about 13% of Volta's FP16 peak while reading far too little to be
-bandwidth-limited. Until that is explained -- occupancy, the full Q8 to FP16
-conversion `launch_fattn` performs before each MMA call, or something else -- a
-gather-based kernel may well meet the same limit and return nothing.
+Two things caused the underestimate. The comparison was made at tile 64, where
+the union is largest, when the operating point is tile 16. And the narrow-launch
+penalty that tile 16 appears to carry is removed by presenting a group's tiles as
+the sequence dimension of one launch -- which the arithmetic had no way to
+anticipate, because it was reasoning about traffic rather than about how the
+launch is shaped.
 
-That is the same mistake the FP16 expert proposal made: a large rewrite justified
-by an unverified assumption about the bottleneck. The next step for P1 is the
-cheap probe, not the kernel.
+The paragraph below it, on the arithmetic bound and the unexplained 13% of FP16
+peak, was the useful half: it correctly said the bottleneck was not established
+and that the next step was a probe rather than a kernel. That was right, and it
+is what was done.
 
 ## The attention probe, 2026-09-07
 
@@ -1660,19 +1683,18 @@ and the kernel's time tracks the positions it processes at an exponent of 0.95.
 What remains is the positions, and at a long prefix seven eighths of them are not
 selected.
 
-Still not established, and the last of these is now the largest unknown:
+Three things were listed here as unestablished. All three were subsequently
+measured, and the list is kept only to record what the answers turned out to be:
 
-- The microarchitectural limiter, which cannot be measured on the Teslas because
-  Nsight cannot see them under the isolated driver.
-- The cost of gathering by index, building the union, and masking within it --
-  no figure here counts any of it, and it is what a prototype exists to measure.
-- Attention's share at long context. It is 19.7% of Tesla time at 30k and grows
-  faster with context than the expert matmuls do, but the share at 75k has not
-  been profiled, so the eightfold reduction cannot yet be turned into a figure
-  for the request.
+- The microarchitectural limiter still cannot be measured on the Teslas, because
+  Nsight cannot see them under the isolated driver. It stopped mattering: the
+  compact path was built and measured instead of explained.
+- The cost of gathering by index, building the union and masking within it is
+  3.1% of attention -- and 1.2% of that is the union, once its compaction is a
+  parallel scan rather than one thread.
+- Attention's share at long context was profiled at 41.3% of Tesla time at 100k.
 
-The next step is a small operator-level prototype that includes union
-construction and masking, not an integrated kernel.
+The prototype that answers them is described under Step 2 below.
 
 ### The long-context profile, 2026-09-07
 
@@ -1724,11 +1746,16 @@ visiting the union instead of the whole cache removes about five sixths of the
 attention work. That is 34.4% of Tesla time and, at the Teslas' 84.3% share, about
 29% of summed GPU time -- against the 11% the 30k data supported.
 
-The assumptions are load-bearing and none of them is verified: that the union can
-be gathered at the cost of a contiguous read, that building it and masking within
-it are free, and that a gather kernel meets no limit the streaming one avoids.
-Those three are what a prototype exists to measure, and they can only reduce the
-figure.
+The three assumptions named here -- that the union can be gathered at the cost of
+a contiguous read, that building and masking it are free, and that a gather
+kernel meets no limit the streaming one avoids -- were all measured, and all
+three held better than this paragraph expected. The gather costs 0.7% of
+attention, preparation as a whole 3.1%, and the compact kernel is the production
+kernel unmodified, so it meets no new limit by construction.
+
+The closing sentence, that measurement could only reduce the figure, was wrong.
+The estimate of about 29% of summed GPU time was in the right region but for
+partly wrong reasons, and the measured end-to-end gain at 150k is +34.3%.
 
 TOP_K's 7.4% is not addressed by any of this. It is the indexer's own selection,
 and it grows at the same rate as the attention it feeds.
@@ -1844,10 +1871,19 @@ same shape, swept over queries per launch:
 | 128 | 1484 | 1357 | 1297 | 1274 | - | - |
 | 512 | - | 1331 | 1266 | 1256 | 1251 | 1251 |
 
-A 16-query launch pays 1.45x to 2.3x per pair against a 512-query one. That is
-the floor, and it is real: it removes roughly half of what the row count
-promises. It does not remove the project, and finding it cost one afternoon
-rather than the week the operator would have taken.
+A 16-query launch pays 1.45x to 2.3x per pair against a 512-query one.
+
+**This floor turned out to be an artefact of how the launch was shaped, not a
+property of the machine.** The table is a correct measurement of one 16-query
+launch at a time, and that is what the model below assumes. But a group's tiles
+differ only in which buffer they read, so they can be presented as the sequence
+dimension of a single launch; four tiles give sixty-four queries of parallelism
+at tile-16 union sizes. Step 2 measures 5.83x where the model built from this
+table predicted 1.79x, and this is most of the difference.
+
+The measurement was still worth making. It was cheap, it was the gate the project
+was supposed to pass before any operator existed, and it produced the two numbers
+that did survive: the tile is 16, and the path must be off on short caches.
 
 ### Which tile, and where it starts paying
 
@@ -1943,14 +1979,13 @@ n_kv 4608, 1.06x at 9216, 1.69x at 18432 and 2.80x at 37120. The break-even move
 down to roughly 8k and the long-context win recovers most of what the serial
 compaction was giving away.
 
-### What is still unmeasured
+### What was still unmeasured at this point
 
-The sparse side of every comparison above is still a model: the microbenchmark
-for a 16-query launch, multiplied by the measured union size. No attention has
-run on a compact buffer, so nothing yet confirms that a real fused operator hits
-the microbenchmark's numbers, and the gather currently stages K only. Step 2
-replaces the model with a measurement, and it is the first step whose failure
-would cost real implementation work rather than an afternoon.
+The sparse side of every comparison above was a model: the microbenchmark for a
+16-query launch multiplied by the measured union size, with no attention having
+run on a compact buffer and the gather staging K only. Step 2 replaced the model
+with a measurement, and the model turned out to understate the result by more
+than three times.
 
 ## Step 2: attention on the compact buffer
 
@@ -2126,3 +2161,90 @@ engages the path at n_kv 13312, and returns byte-identical decode output.
 
 The launcher scripts live outside this repository, in `~/llama.cpp`, so they are
 not covered by this commit.
+
+## The full measurement, 2026-09-07
+
+One run per arm on the deployed build, switch off and on, five context lengths,
+prefill and generation. Every earlier figure in this document is superseded by
+this table where they disagree.
+
+Prefill, tokens/s:
+
+| Context | Dense | Compact | |
+| ---: | ---: | ---: | ---: |
+| 5 000 | 865.9 | 867.2 | +0.2% |
+| 30 001 | 741.7 | 765.4 | +3.2% |
+| 49 999 | 640.3 | 699.0 | +9.2% |
+| 100 001 | 475.0 | 584.8 | **+23.1%** |
+| 150 001 | 377.1 | 506.2 | **+34.3%** |
+
+Generation after a prefix of that length, tokens/s:
+
+| After | Dense | Compact | |
+| ---: | ---: | ---: | ---: |
+| short | 58.87 | 58.94 | +0.1% |
+| 30 001 | 42.16 | 40.39 | −4.2% |
+| 49 999 | 41.40 | 36.03 | −13.0% |
+| 100 001 | 26.44 | 26.61 | +0.6% |
+| 150 001 | 21.43 | 19.83 | −7.5% |
+
+**The generation column is not a comparison of two algorithms.** The compact path
+requires sixteen queries and cannot run at decode. Above the threshold the two
+builds prefill differently, emit different text, and MTP's draft acceptance
+depends on the text, so these differences measure content, not code -- which is
+why they have no sign: +0.6% at 100k against −13.0% at 50k. The comparison that
+does mean something is the one where both builds emit the same tokens, on a
+prefix below the threshold: 61.77 against 62.06 tokens/s, identical output hash.
+Generation is unaffected.
+
+A chart of both curves, with the threshold and the non-comparable region marked,
+is published at
+<https://claude.ai/code/artifact/f0246bcf-fce5-4e52-82e5-261c0936580c>.
+
+### What this document got wrong, and what that cost
+
+Worth recording, because the pattern repeated:
+
+- The traffic estimate for P1 (1.4x at 30k, ~5.9% of Tesla time) was computed at
+  the wrong tile width and reasoned about bytes when the answer depended on how
+  the launch was shaped. It nearly closed the project.
+- Step 0's query-width floor is a correct measurement whose conclusion did not
+  survive, because tiles batch into the sequence dimension.
+- Step 1's membership bitmap was built and then turned out to be unnecessary: the
+  mask over the compact buffer is the original mask read at the union's
+  positions.
+- The first attention comparison reported a mismatch that was the metric's fault,
+  not the code's. Elementwise relative error on near-zero outputs says nothing.
+- A 12% generation regression was reported and was an artefact of comparing two
+  runs that had generated different text.
+
+Four of those five were caught by building an isolating control before
+diagnosing: the identity-union switch, the below-threshold decode comparison, the
+J_FIT census. The one that was not -- the traffic estimate -- was caught only
+because the estimate was checked against a measurement instead of acted on.
+
+### The one measurement still owed
+
+Nothing here establishes that generation *quality* is unchanged above the
+threshold. NMSE of 4e-07 establishes that the numerical difference is small; it
+does not establish that the model's predictions are as good, and the two are not
+the same claim. Greedy output does change, which is expected from reassociation
+and would equally follow from changing the microbatch or the tensor split, but
+"expected" is not "measured".
+
+The measurement that would settle it is perplexity over a fixed corpus at a
+context long enough to engage the path, both arms, same file and settings; a
+top-1 agreement rate over many positions would say how often the divergence
+actually occurs. Neither has been run. Until one is, the honest statement is that
+the path is a throughput change whose quality effect is unmeasured, and
+`FATTN_COMPACT=0` exists for anyone unwilling to accept that.
+
+### Open work
+
+P2 through P6 in the priority table are untouched. Within this project the
+remaining items are the host synchronisation the compact path still performs once
+per attention operation to shape its launch, which padding to a fixed granularity
+would remove; the threshold, which is set at 8192 by argument rather than by a
+measured break-even on the real chain; and R12/TOP_K, which was 7.4% of the 100k
+profile and grows at the same rate as the attention it feeds -- now the largest
+single remaining item, since attention no longer is.
