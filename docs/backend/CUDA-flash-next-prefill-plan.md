@@ -2557,3 +2557,67 @@ One limit, stated because it would otherwise be overclaimed: perplexity runs the
 corpus in batches, so it exercises the tiled regime -- the deployed one -- and
 barely touches the per-query regime, which needs one or two queries. The decode
 regime is measured separately below.
+
+### The per-query regime: top-1 agreement, and what caused it
+
+Perplexity runs in batches and so barely touches the regime that runs at one or
+two queries. Measured separately, with both arms prefilling identically -- the
+tiled path on in both -- so that only the decode step differs. Twenty-four
+single-step greedy predictions on 12k-token slices of the corpus:
+
+**Top-1 agreement: 21/24 = 87.5%.**
+
+That is a much larger behavioural change than the prefill path shows, and before
+attributing it to anything, the control: **the same configuration run twice
+agrees 24/24 = 100%**, with the regime never engaging in either arm. The process
+is deterministic, so the 12.5% is the regime and not run-to-run noise. This
+document has five recorded cases of a difference measured without establishing
+where it came from; this one is established.
+
+**The flips happen only where the model is nearly indifferent.** Top-1 against
+top-2 probability at the three disagreements and three agreements:
+
+| Prompt | Off: top-1 / top-2 | On: top-1 / top-2 | gap | |
+| ---: | --- | --- | ---: | --- |
+| 0 | `/local` 0.9991 / 0.0009 | `/local` 0.9990 / 0.0010 | 0.998 | |
+| 1 | `''` 0.8536 / 0.0276 | `''` 0.7593 / 0.0525 | 0.826 | |
+| 2 | `EM` 1.0000 / 0.0000 | `EM` 1.0000 / 0.0000 | 1.000 | |
+| 5 | `apped` 0.3526 / 0.3379 | `e` 0.4053 / 0.3569 | **0.015** | flip |
+| 9 | `\n` 0.3435 / 0.2377 | ` the` 0.4336 / 0.2502 | **0.106** | flip |
+| 17 | ` \` 0.2278 / 0.1820 | ` ninja` 0.2414 / 0.2229 | **0.046** | flip |
+
+Where the model is confident it agrees; where the top two are within a few
+percentage points it does not. The perturbation is not changing what the model
+predicts, it is resolving coin-flips differently. Note also that the
+distributions themselves move by up to about 10% relative -- larger than an NMSE
+of 1e-6 per layer would naively suggest, which is what compounding over 48 layers
+and a softmax does to it.
+
+### Does the decode regime predict the real text as well?
+
+The direct question, and the one perplexity could not reach. For each prompt, the
+log-probability each arm assigned to the token that actually continues the
+corpus:
+
+| | mean logprob | perplexity-equivalent |
+| --- | ---: | ---: |
+| decode path off | -3.25112 | 25.82 |
+| decode path on | -3.27390 | 26.41 |
+
+Paired difference **-0.02279 with a standard error of 0.10648** -- a fifth of one
+standard error -- and the sign is split exactly, better on 7 positions and worse
+on 7.
+
+**No detectable degradation, on a measurement that is weak.** Only 14 of 24
+positions had the true token inside the top 40, and at that sample size two
+standard errors is about ±0.21 in logprob, roughly ±23% in probability. So this
+rules out a large regression and does not rule out a small one. That is a
+genuinely different statement from the perplexity result for the tiled path,
+which was tight enough to bound the effect at 0.048%, and the two should not be
+quoted as if they carried the same weight.
+
+Tightening it needs more positions rather than more thought: a few hundred
+single-step predictions would bring the bound to the same order as the perplexity
+one. Nothing in the evidence so far suggests it would find anything -- flips only
+at near-ties, a clean split of signs, a clean perplexity on the sibling path --
+but that is an expectation, not a measurement, and it is written here as such.
