@@ -2403,29 +2403,24 @@ them restores the dense paths exactly.
 
 ### What G3 still owes before it could be deployed
 
-Stated so the next session does not have to reconstruct it, and so the numbers
-above are not read as more settled than they are.
+Written when the section below had not been done yet; struck through where the
+review and its fixes closed the item, so the list is not read as outstanding.
 
-- **The clean A/B covers 100k and 150k only.** A 50k run with verification on
-  gave 45.33 tokens/s against a 41.40 dense figure from an earlier run, which is
-  suggestive and is not a controlled comparison. Repeat the A/B at 30k and 50k.
-- **CUDA graph capture is argued, not confirmed.** The path is written to be
-  capturable and declines inside a capture only when its scratch is short, but
-  nothing yet verifies that decode graphs are actually still being captured with
-  it on rather than silently falling back every time. Both outcomes are
-  consistent with the speedup observed, so this has to be checked directly, not
-  inferred from it. If capture is in fact failing, the win is larger than
-  measured, not smaller -- which is exactly why it should not be left to
-  inference.
-- **The threshold is inherited, not measured.** 8192 was chosen for what building
-  a *union* costs. The per-query regime builds no union, so its break-even is a
-  different number and is currently unknown; it may well pay far below 8192.
-- **The union kernel is doing unnecessary work at decode.** For one query the
-  index list is already the union, sorted, so the bitmap, scan and compaction are
-  all avoidable. They are used because they are the verified code; replacing them
-  is an optimisation with a correctness cost to re-establish.
-- **Generation quality above the threshold is unmeasured**, exactly as for
-  prefill, and now it matters more: this regime changes generation directly.
+- ~~**The clean A/B covers 100k and 150k only.**~~ Closed: the controlled 50k
+  comparison is in the review section, at +29.2%. 30k is still not measured, and
+  is the one place the regime might not pay.
+- ~~**CUDA graph capture is argued, not confirmed.**~~ Closed by direct
+  observation -- `capturing=1` does appear -- which also proved the scratch
+  lifetime hazard was live rather than theoretical.
+- **The threshold is inherited, not measured.** Still open. 8192 was chosen for
+  what building a *union* costs; the per-query regime builds none, so its
+  break-even is a different number and is unknown. It may pay well below 8192.
+- ~~**The union kernel is doing unnecessary work at decode.**~~ Closed as a
+  consequence of the lifetime fix: the bitmap, scan and compaction are gone,
+  because one query's index list is already its own union.
+- **Generation quality above the threshold is unmeasured.** Still open, and
+  unchanged in kind from the prefill path -- except that this regime changes
+  generation directly, so it matters more here.
 
 ### Review of f8a35540e: three defects, one of them structural
 
