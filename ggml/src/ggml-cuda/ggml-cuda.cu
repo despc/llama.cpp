@@ -722,7 +722,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             auto & scratch = fattn_prep_scratch[i][j];
-            if (scratch.union_idx || scratch.union_len || scratch.gathered) {
+            if (scratch.union_idx || scratch.union_len || scratch.gathered ||
+                scratch.bitmap || scratch.prefix || scratch.qmask) {
                 ggml_cuda_set_device(i);
                 // Scratch can still be in use when the diagnostic timers are disabled.
                 if (streams[i][j] != nullptr) {
@@ -731,6 +732,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                 if (scratch.union_idx) { CUDA_CHECK(cudaFree(scratch.union_idx)); }
                 if (scratch.union_len) { CUDA_CHECK(cudaFree(scratch.union_len)); }
                 if (scratch.gathered)  { CUDA_CHECK(cudaFree(scratch.gathered)); }
+                if (scratch.bitmap)    { CUDA_CHECK(cudaFree(scratch.bitmap)); }
+                if (scratch.prefix)    { CUDA_CHECK(cudaFree(scratch.prefix)); }
+                if (scratch.qmask)     { CUDA_CHECK(cudaFree(scratch.qmask)); }
             }
             if (streams[i][j] != nullptr) {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));

@@ -1885,3 +1885,69 @@ Proceed. The assumption held for cache length, failed partially for query width
 in a way that costs about half the theoretical win, and the remaining win is
 large enough and grows with context. Two numbers now govern the design that did
 not exist before: the tile is 16, and the path must be off below roughly 10k.
+
+## Steps 1 and 3: the membership mask, and why they were built together
+
+Step 1 is the per-query membership mask, Step 3 the parallel replacement for the
+single-threaded union compaction. The plan listed them apart, but they want the
+same quantity and it would have been wasteful to compute it twice.
+
+The union is an OR over the tile's sixteen queries, so a query placed against the
+compact buffer would otherwise attend to positions its neighbours selected and it
+did not. To mark what it owns, the mask needs the *rank* of a cache position
+within the union -- which slot of the compact buffer that position landed in.
+Compaction needs the identical thing: where each bitmap word's first bit goes.
+One block-wide scan of the bitmap's popcounts answers both. Compaction becomes a
+per-word write with no serialisation, and the mask becomes a lookup:
+
+    rank(p) = prefix[p >> 5] + popcount(bitmap[p >> 5] & ((1 << (p & 31)) - 1))
+
+The bitmap and its prefix therefore moved from a kernel-local shared array to
+context scratch, so the mask kernel can read what the union kernel produced. The
+scan buffer is the only new shared memory, and it is sized by the block, not by
+the cache, so the reachable context is unchanged.
+
+### Correctness first
+
+`GGML_CUDA_FATTN_SPARSE_PREP_VERIFY` copies the whole working set back and checks
+the preparation against the index lists it was built from, on every microbatch:
+the union is ascending, duplicate-free and equal to the OR of its rows; every
+query's marked slots name exactly the positions that query selected; and no bit
+is set past `union_len`, which would address a row the gather never wrote. It ran
+across a full 30k prefill without firing. This gate matters more than the timings
+beside it -- a mask that is merely plausible costs nothing in any performance
+measurement and is silently wrong: one extra bit and a query attends to a
+neighbour's key, one missing and a selected key disappears.
+
+### What it costs
+
+Stage totals over a 30k prefill, both Teslas, against attention's own time:
+
+| stage | total ms | % of attention |
+|---|---|---|
+| attention | 6089.7 | 100.0% |
+| prep_union | 71.4 | 1.2% |
+| prep_mask | 74.3 | 1.2% |
+| prep_gather | 44.6 | 0.7% |
+| **preparation total** | **190.3** | **3.1%** |
+
+The serial compaction measured 11.2% of attention; the scan-based one measures
+1.2%, a ninefold reduction, and the mask that did not exist before costs about
+what the compaction now does. Preparation as a whole fell from about 12% to 3.1%,
+and both halves scale the same way with cache length -- the scan is linear in
+n_kv, as attention is -- so the ratio should hold as context grows.
+
+That improves the Step 0 projection rather than changing its shape. Charging
+preparation at 3.1% instead of 12%, the per-ubatch picture becomes 0.69x at
+n_kv 4608, 1.06x at 9216, 1.69x at 18432 and 2.80x at 37120. The break-even moves
+down to roughly 8k and the long-context win recovers most of what the serial
+compaction was giving away.
+
+### What is still unmeasured
+
+The sparse side of every comparison above is still a model: the microbenchmark
+for a 16-query launch, multiplied by the measured union size. No attention has
+run on a compact buffer, so nothing yet confirms that a real fused operator hits
+the microbenchmark's numbers, and the gather currently stages K only. Step 2
+replaces the model with a measurement, and it is the first step whose failure
+would cost real implementation work rather than an afternoon.

@@ -105,12 +105,23 @@ static __global__ void flash_attn_mask_to_sparse_indices(
 // to consume the result.  Nothing downstream uses the output yet.
 // ---------------------------------------------------------------------------
 
+// Threads per preparation block; the block-wide scan sizes its buffer from it.
+#define GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS 256
+
 // One block per tile of queries.  Marks the tile's selections in a bitmap over
 // the cache, then compacts the set bits into a sorted index list.
+//
+// Compaction is parallel: a block-wide scan over the bitmap's popcounts gives
+// every word the slot its first bit occupies, after which each thread emits its
+// own word independently.  The scan is kept because the membership mask needs
+// exactly the same quantity -- the rank of a cache position within the union --
+// so the two stages share it rather than each paying for its own pass.
 static __global__ void fattn_sparse_union(
         const int32_t * __restrict__ indices, int32_t * __restrict__ union_idx,
-        int32_t * __restrict__ union_len, int n_kv, int n_kv_max, int tile, int rows) {
+        int32_t * __restrict__ union_len, uint32_t * __restrict__ bitmap_out,
+        int32_t * __restrict__ prefix_out, int n_kv, int n_kv_max, int tile, int rows) {
     extern __shared__ uint32_t bitmap[];
+    __shared__ int32_t scan[GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS];
 
     const int t0    = blockIdx.x * tile;
     const int words = (n_kv + 31) / 32;
@@ -131,23 +142,87 @@ static __global__ void fattn_sparse_union(
     }
     __syncthreads();
 
-    // serial compaction by one thread: this is the part a real implementation
-    // would parallelise, and it is measured separately for that reason
+    uint32_t * bm = bitmap_out + (size_t) blockIdx.x * words;
+    int32_t  * pf = prefix_out + (size_t) blockIdx.x * words;
+
+    // Exclusive scan of per-word popcounts, in chunks of one block.  `carry` is
+    // computed identically by every thread, so it stays uniform without a
+    // broadcast.
+    int32_t carry = 0;
+    for (int base = 0; base < words; base += blockDim.x) {
+        const int w   = base + threadIdx.x;
+        const uint32_t bits = w < words ? bitmap[w] : 0u;
+        const int32_t  cnt  = __popc(bits);
+
+        scan[threadIdx.x] = cnt;
+        __syncthreads();
+        for (int d = 1; d < blockDim.x; d <<= 1) {
+            const int32_t add = threadIdx.x >= d ? scan[threadIdx.x - d] : 0;
+            __syncthreads();
+            scan[threadIdx.x] += add;
+            __syncthreads();
+        }
+        const int32_t inclusive = scan[threadIdx.x];
+        const int32_t total     = scan[blockDim.x - 1];
+
+        if (w < words) {
+            bm[w] = bits;
+            pf[w] = carry + inclusive - cnt;   // exclusive: slot of this word's first bit
+        }
+        carry += total;
+        __syncthreads();
+    }
+
     if (threadIdx.x == 0) {
-        int n = 0;
-        int32_t * out = union_idx + (size_t) blockIdx.x * n_kv;
-        for (int w = 0; w < words && n < n_kv; ++w) {
-            uint32_t m = bitmap[w];
-            while (m && n < n_kv) {
-                const int b = __ffs(m) - 1;
-                const int p = (w << 5) + b;
-                if (p < n_kv) {
-                    out[n++] = p;
-                }
-                m &= m - 1;
+        union_len[blockIdx.x] = carry;
+    }
+
+    // Each thread emits its own words at the slots the scan assigned.  Positions
+    // beyond n_kv were never set, so no bound is needed beyond the bitmap itself.
+    int32_t * out = union_idx + (size_t) blockIdx.x * n_kv;
+    for (int w = threadIdx.x; w < words; w += blockDim.x) {
+        uint32_t m = bitmap[w];
+        int      n = pf[w];
+        while (m) {
+            const int b = __ffs(m) - 1;
+            out[n++] = (w << 5) + b;
+            m &= m - 1;
+        }
+    }
+}
+
+// The third piece of preparation: which rows of the compact buffer does each
+// query in the tile actually own?  The union is an OR over the tile, so without
+// this a query would attend to positions its neighbours selected and it did not.
+// One bit per (query, union slot); the slot of a cache position is its rank in
+// the union, which the scan above already computed at word granularity.
+static __global__ void fattn_sparse_query_mask(
+        const int32_t * __restrict__ indices, const uint32_t * __restrict__ bitmap_in,
+        const int32_t * __restrict__ prefix_in, uint32_t * __restrict__ qmask,
+        int n_kv, int n_kv_max, int tile, int rows, int union_words) {
+    const int t0    = blockIdx.x * tile;
+    const int words = (n_kv + 31) / 32;
+
+    const uint32_t * bm = bitmap_in + (size_t) blockIdx.x * words;
+    const int32_t  * pf = prefix_in + (size_t) blockIdx.x * words;
+    uint32_t * mask = qmask + (size_t) blockIdx.x * tile * union_words;
+
+    for (size_t i = threadIdx.x; i < (size_t) tile * union_words; i += blockDim.x) {
+        mask[i] = 0;
+    }
+    __syncthreads();
+
+    for (int r = 0; r < tile && t0 + r < rows; ++r) {
+        const int32_t * row = indices + (size_t) (t0 + r) * n_kv_max;
+        uint32_t * dst = mask + (size_t) r * union_words;
+        for (int i = threadIdx.x; i < n_kv_max; i += blockDim.x) {
+            const int32_t v = row[i];
+            if (v >= 0 && v < n_kv) {
+                const int w    = v >> 5;
+                const int rank = pf[w] + __popc(bm[w] & ((1u << (v & 31)) - 1));
+                atomicOr(&dst[rank >> 5], 1u << (rank & 31));
             }
         }
-        union_len[blockIdx.x] = n;
     }
 }
 
@@ -235,8 +310,12 @@ void ggml_cuda_flash_attn_ext_compact_mask(
         const int    n_head_kv = int(K->ne[2]);
         static const bool prep_gather_on = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_GATHER");
 
+        const int    union_words = (union_cap + 31) / 32;
         const size_t need_idx  = size_t(group) * n_kv * sizeof(int32_t);
         const size_t need_gath = size_t(group) * union_cap * n_head_kv * row_bytes;
+        const size_t need_bm   = size_t(group) * words * sizeof(uint32_t);
+        const size_t need_qm   = size_t(group) * tile * union_words * sizeof(uint32_t);
+        static const bool prep_mask_on = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_MASK");
 
         if (smem <= 48*1024) {
             if (need_idx > scratch.union_idx_capacity) {
@@ -246,6 +325,21 @@ void ggml_cuda_flash_attn_ext_compact_mask(
             }
             if (!scratch.union_len) {
                 CUDA_CHECK(cudaMalloc(&scratch.union_len, 4 * sizeof(int32_t)));
+            }
+            // The bitmap and its prefix are written by the union and read by the
+            // mask, so they are sized together and always allocated: compaction
+            // itself now depends on the prefix.
+            if (need_bm > scratch.bitmap_capacity) {
+                if (scratch.bitmap) { CUDA_CHECK(cudaFree(scratch.bitmap)); }
+                if (scratch.prefix) { CUDA_CHECK(cudaFree(scratch.prefix)); }
+                CUDA_CHECK(cudaMalloc(&scratch.bitmap, need_bm));
+                CUDA_CHECK(cudaMalloc(&scratch.prefix, need_bm));
+                scratch.bitmap_capacity = need_bm;
+            }
+            if (prep_mask_on && need_qm > scratch.qmask_capacity) {
+                if (scratch.qmask) { CUDA_CHECK(cudaFree(scratch.qmask)); }
+                CUDA_CHECK(cudaMalloc(&scratch.qmask, need_qm));
+                scratch.qmask_capacity = need_qm;
             }
             if (prep_gather_on) {
                 // int4 loads require aligned rows; do not silently omit a short byte tail.
@@ -263,10 +357,101 @@ void ggml_cuda_flash_attn_ext_compact_mask(
                 const int nt = std::min(group, n_tiles - t0);
                 {
                     fattn_stage_timer t("prep_union", ggml_cuda_get_device(), rows, stream);
-                    fattn_sparse_union<<<nt, 256, smem, stream>>>(
+                    fattn_sparse_union<<<nt, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS, smem, stream>>>(
                         indices + (size_t) t0 * tile * n_kv_max, scratch.union_idx, scratch.union_len,
-                        n_kv, n_kv_max, tile, rows - t0*tile);
+                        scratch.bitmap, scratch.prefix, n_kv, n_kv_max, tile, rows - t0*tile);
                     fattn_sparse_prep_check("prep_union", stream, !fattn_stage_profile::enabled());
+                }
+                if (prep_mask_on) {
+                    fattn_stage_timer t("prep_mask", ggml_cuda_get_device(), rows, stream);
+                    fattn_sparse_query_mask<<<nt, GGML_CUDA_FATTN_SPARSE_PREP_NTHREADS, 0, stream>>>(
+                        indices + (size_t) t0 * tile * n_kv_max, scratch.bitmap, scratch.prefix,
+                        scratch.qmask, n_kv, n_kv_max, tile, rows - t0*tile, union_words);
+                    fattn_sparse_prep_check("prep_mask", stream, !fattn_stage_profile::enabled());
+                }
+                // Correctness of the preparation, checked against the index lists it
+                // was built from.  A membership mask that is merely plausible is
+                // worthless: an extra bit makes a query attend to a neighbour's
+                // position, a missing one silently drops a selected key, and both
+                // survive every performance measurement.  Opt-in, and it copies the
+                // whole working set back, so it is a gate to pass once and not a
+                // thing to leave on.
+                static const bool verify_on = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_PREP_VERIFY");
+                if (verify_on && prep_mask_on) {
+                    static bool announced = false;
+                    const size_t n_rows_g = size_t(nt) * tile;
+                    std::vector<int32_t>  h_idx(n_rows_g * n_kv_max);
+                    std::vector<int32_t>  h_uni(size_t(nt) * n_kv);
+                    std::vector<int32_t>  h_len(nt);
+                    std::vector<uint32_t> h_msk(size_t(nt) * tile * union_words);
+                    CUDA_CHECK(cudaMemcpyAsync(h_idx.data(), indices + (size_t) t0 * tile * n_kv_max,
+                        h_idx.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(h_uni.data(), scratch.union_idx,
+                        h_uni.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(h_len.data(), scratch.union_len,
+                        h_len.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(h_msk.data(), scratch.qmask,
+                        h_msk.size()*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                    int failures = 0;
+                    for (int b = 0; b < nt; ++b) {
+                        const int len = h_len[b];
+                        const int32_t * uni = h_uni.data() + (size_t) b * n_kv;
+                        if (len < 0 || len > union_cap) {
+                            GGML_LOG_ERROR("prep_verify tile=%d union_len=%d exceeds cap %d\n", b, len, union_cap);
+                            failures++;
+                            continue;
+                        }
+                        std::set<int32_t> all;
+                        for (int r = 0; r < tile && (t0+b)*tile + r < rows; ++r) {
+                            const int32_t * row = h_idx.data() + (size_t)(b*tile + r) * n_kv_max;
+                            std::set<int32_t> want, got;
+                            for (int i = 0; i < n_kv_max; ++i) {
+                                const int32_t v = row[i];
+                                if (v >= 0 && v < n_kv) { want.insert(v); all.insert(v); }
+                            }
+                            const uint32_t * m = h_msk.data() + (size_t)(b*tile + r) * union_words;
+                            for (int j = 0; j < len; ++j) {
+                                if (m[j >> 5] & (1u << (j & 31))) { got.insert(uni[j]); }
+                            }
+                            // A bit set past the union's length would address a row the
+                            // gather never wrote, so it has to be caught separately.
+                            for (int j = len; j < union_words*32; ++j) {
+                                if (m[j >> 5] & (1u << (j & 31))) {
+                                    GGML_LOG_ERROR("prep_verify tile=%d row=%d bit %d set beyond union_len %d\n", b, r, j, len);
+                                    failures++;
+                                    break;
+                                }
+                            }
+                            if (want != got) {
+                                GGML_LOG_ERROR("prep_verify tile=%d row=%d membership mismatch: want %zu got %zu\n",
+                                               b, r, want.size(), got.size());
+                                failures++;
+                            }
+                        }
+                        std::set<int32_t> uset(uni, uni + len);
+                        if ((int) uset.size() != len) {
+                            GGML_LOG_ERROR("prep_verify tile=%d union has duplicates: %d entries, %zu distinct\n", b, len, uset.size());
+                            failures++;
+                        }
+                        if (uset != all) {
+                            GGML_LOG_ERROR("prep_verify tile=%d union != OR of rows: %zu vs %zu\n", b, uset.size(), all.size());
+                            failures++;
+                        }
+                        for (int j = 1; j < len; ++j) {
+                            if (uni[j] <= uni[j-1]) {
+                                GGML_LOG_ERROR("prep_verify tile=%d union not ascending at %d\n", b, j);
+                                failures++;
+                                break;
+                            }
+                        }
+                    }
+                    GGML_ASSERT(failures == 0);
+                    if (!announced) {
+                        announced = true;
+                        GGML_LOG_WARN("prep_verify: union and per-query membership agree with the index lists (n_kv=%d, tile=%d)\n", n_kv, tile);
+                    }
                 }
                 if (prep_gather_on) {
                     fattn_stage_timer t("prep_gather", ggml_cuda_get_device(), rows, stream);

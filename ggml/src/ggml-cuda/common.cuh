@@ -1417,8 +1417,17 @@ struct ggml_cuda_fattn_prep_scratch {
     int32_t * union_idx = nullptr;
     int32_t * union_len = nullptr;
     char * gathered = nullptr;
+    // The union's bitmap and its word-level prefix sums outlive the kernel that
+    // builds them: compaction needs the prefix to know where each word's bits
+    // land, and the membership mask needs both to map a cache position to its
+    // slot in the compact buffer.
+    uint32_t * bitmap = nullptr;
+    int32_t  * prefix = nullptr;
+    uint32_t * qmask  = nullptr;
     size_t union_idx_capacity = 0;
     size_t gathered_capacity = 0;
+    size_t bitmap_capacity = 0;
+    size_t qmask_capacity = 0;
 };
 
 struct ggml_backend_cuda_context {
