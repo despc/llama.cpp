@@ -89,6 +89,24 @@ table, `pascal_dp4a`, that Volta never reached because its branch is tested
 first. Raising the Ampere branch to `>= TURING` is one line and was worth
 613 -> 811 t/s. This is a defect in upstream's dispatch, not a local workaround.
 
+**The MUL_MAT_ID column tile fitted to an expert's share**
+(`GGML_CUDA_MMQ_MMID_J_FIT`, on by default). `mul_mat_q_switch_J` sizes the tile
+from the batch, but the tile is spent per expert, and 512 experts with 10 chosen
+per token leave each expert about ten columns of a 64-wide tile -- six times the
+arithmetic, all padding. Confined to the DP4A layout, where padded columns are
+plain wasted dot products, it is worth 811 -> 907 t/s at 5k and holds at length:
+733.0 at 30k, 475.3 at 100k, 377.7 at 150k. Applying it on the MMA layout as well
+is a loss, which is what made it look like a 1.3% change for most of a day; see
+the correction below.
+
+**Instrumentation that does not change what it measures.** The phase profiler
+had added an unconditional `synchronize()` per ubatch, costing 1.2% of generation
+in every build; the sort, route, tile, launch and phase profilers are all opt-in;
+and `ggml_env_flag_enabled` parses the value of a flag rather than testing that
+the variable exists, so `FLAG=0` no longer enables the thing it names. That last
+one matters more than it sounds: a control run was silently becoming a candidate
+run.
+
 **Benchmark harnesses that own their process.** Each began by killing every
 process matching `pgrep -x llama-server` and adopting the first PID it found on a
 fixed port. `bench/harness.sh` now owns exactly the process it started on a port
@@ -98,16 +116,6 @@ existed, which is why the 5k benchmark had been the whole acceptance test.
 
 ### Measured, correct, and left switched off
 
-**Fitting the MMQ column tile to an expert's share**
-(`GGML_CUDA_MMQ_MMID_J_FIT`). `mul_mat_q_switch_J` sizes the tile from the batch,
-but the tile is spent per expert, and 512 experts with 10 chosen per token leave
-each expert about ten columns of a 64-wide tile -- six times the arithmetic, all
-padding. Fitting it: Q4_K gate/up 3644 -> 1627 us at 512 tokens, Q5_1 down
-4305 -> 2708; prefill +1.9% at 30k and +3.2% at 100k; memory identical; never
-selected at decode. It is correct and it is a gain. It is off because its
-end-to-end effect is a twentieth of its kernel effect, and understanding that gap
-matters more than banking 3%.
-
 **Runtime choice of pipeline copy slots** (`GGML_SCHED_N_COPIES`). The reserve
 fails at every startup and the scheduler then disables pipelining entirely, so
 this deployment has never pipelined. Two slots make the reserve succeed. They buy
@@ -116,13 +124,19 @@ prompt. Upstream's fallback is the right decision on a split this tight.
 
 ### Did not work, and why
 
-**Sparse attention (R1)** is blocked by Volta's MMA fragments, which exist only
-at 32 columns; the sparse path needs one query column per block and this model's
+**Sparse attention (R1) as implemented** is blocked by this backend's MMA tile
+abstraction, whose Volta fragments exist only at 32 columns. That is a property of
+the implementation, not of the hardware -- Volta has a 16x16 WMMA interface -- so
+it bounds this path, not every sparse attention on this card. The sparse path
+needs one query column per block and this model's
 GQA ratio is 12. The `ncols1*ncols2 < 32` guard is a correctness bound, not the
 compile-time prune it resembles. Enabling it for the two Blackwells that can take
-it is neutral on prefill -- they hold a sixth of the GPU time -- and costs 2.2% of
-generation through the pool state its index buffer leaves behind, so the 256/256
-eligibility was withdrawn. The plumbing, the query-count gate, the tests and the
+it is neutral on prefill -- they hold a sixth of the GPU time -- and appeared to
+cost 2.2% of generation, so the 256/256 eligibility was withdrawn. That figure is
+not established: it was measured against binaries carrying the profiler's
+unconditional synchronisation, which alone accounts for 1.2%, and the mechanism
+offered for the rest (pool state left by the index buffer) was never isolated.
+Remeasure before treating either the cost or its cause as known. The plumbing, the query-count gate, the tests and the
 comment explaining the bound all stay: restoring one line re-enables it the day
 narrower Volta fragments exist.
 
@@ -168,20 +182,30 @@ which is why the deployed binaries were left alone.
 
 ### Where the next gain has to come from
 
-At 30k on the Teslas after both dispatch fixes: MUL_MAT_ID 48.0%,
-FLASH_ATTN_EXT 17.0%, MUL_MAT 16.9%, GATED_DELTA_NET 4.0%, TOP_K 2.7%. From 5k to
-30k the expert matmuls grow 6.4x with the token count while attention grows 30x
-and top-k 42x, so experts dominate up to roughly 50k and attention near the
-context limit -- which is where this deployment is weakest, 441 t/s at 100k
-against 811 at 5k.
+The last per-operation profile was taken before the tile fitting, so its shares
+are stale: at 30k on the Teslas it read MUL_MAT_ID 48.0%, FLASH_ATTN_EXT 17.0%,
+MUL_MAT 16.9%, GATED_DELTA_NET 4.0%, TOP_K 2.7%, and the expert share has since
+fallen. What survives is the scaling: from 5k to 30k the expert matmuls grow 6.4x
+with the token count while attention grows 30x and top-k 42x, so experts dominate
+up to roughly 50k and attention near the context limit -- which is where this
+deployment is weakest, 475 t/s at 100k and 378 at 150k against 907 at 5k.
 
-1. Volta MMA fragment shapes narrower than 32 columns. Unblocks R1, the only
-   candidate whose value grows with context.
+1. Sparse attention for the Teslas. Its value grows with context, which is where
+   this deployment is weakest. New narrower MMA fragments are one route and the
+   most expensive; an index-native SIMT kernel that never uses MMA, or the twelve
+   useful heads placed in a legal 32-column tile with masked padding, are cheaper
+   ones to try first.
 2. Graph reuse across ubatches (R16). The graph was reused once in 125, because
    the indexer input shape follows the cache length, so CUDA graphs are
    unavailable for prefill.
-3. Real pipeline overlap, which needs the memory that R4, R5 and R7 were expected
-   to free -- and R4 and R5 are now retired.
+3. Real pipeline overlap, which needs memory freed first. R4 and R5 are retired
+   as direct speed targets -- 0.6% and 0.3% respectively -- but not as memory
+   enablers: neither figure measures the peak held by the expanded score and mask
+   intermediates they would remove.
+
+Before any of it, remeasure the sparse-attention generation cost on binaries
+without the profiler's synchronisation, and re-profile: every share above was
+taken on the old dispatch.
 
 ## Scope and stop point
 
@@ -1129,6 +1153,12 @@ never selected at decode, where the batch of one or two tokens leaves through
 MMVQ. It stays opt-in only because its end-to-end effect is small relative to the
 2.2x it produces in the kernel, which is itself the evidence that the expert
 matmuls are no longer the critical path.
+
+> Superseded on 2026-09-07. The end-to-end effect was small because the rule was
+> also firing on the Blackwells, where a narrow tile loses more than the padding
+> saves. Confined to the DP4A layout it is worth 11.9%, it is deployed and on by
+> default, and the inference about the critical path drawn from its small gain is
+> withdrawn. See the correction in the outcome section.
 
 Attribution then took two more wrong turns worth recording, because each looked
 convincing:
