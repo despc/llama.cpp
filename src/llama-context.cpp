@@ -1379,21 +1379,21 @@ bool llama_context::set_adapter_cvec(
 // added -- "compute" is only the submit, and the waiting shows up in "sync".
 namespace {
 struct ubatch_phase_profile {
-    bool     enabled = getenv("LLAMA_UBATCH_PROFILE") != nullptr;
+    bool     enabled = ggml_env_flag_enabled("LLAMA_UBATCH_PROFILE");
     int64_t  calls   = 0;
     int64_t  reused  = 0;
-    double   build_ms = 0, alloc_ms = 0, inputs_ms = 0, compute_ms = 0, sync_ms = 0, apply_ms = 0;
+    double   build_ms = 0, alloc_ms = 0, inputs_ms = 0, compute_ms = 0, sync_ms = 0, apply_ms = 0, reuse_wait_ms = 0;
 
     ~ubatch_phase_profile() {
         if (!enabled || calls == 0) {
             return;
         }
-        const double total = apply_ms + build_ms + alloc_ms + inputs_ms + compute_ms + sync_ms;
+        const double total = apply_ms + build_ms + alloc_ms + inputs_ms + compute_ms + sync_ms + reuse_wait_ms;
         LLAMA_LOG_WARN("ubatch_profile calls=%" PRId64 " reused=%" PRId64 " total=%.0f ms"
-                       " | apply=%.0f build=%.0f alloc=%.0f set_inputs=%.0f submit=%.0f sync=%.0f\n",
-                       calls, reused, total, apply_ms, build_ms, alloc_ms, inputs_ms, compute_ms, sync_ms);
-        LLAMA_LOG_WARN("ubatch_profile shares: apply=%.1f%% build=%.1f%% alloc=%.1f%% set_inputs=%.1f%% submit=%.1f%% sync=%.1f%%\n",
-                       100*apply_ms/total, 100*build_ms/total, 100*alloc_ms/total,
+                       " | apply=%.0f build=%.0f alloc=%.0f reuse_wait=%.0f set_inputs=%.0f submit=%.0f sync=%.0f\n",
+                       calls, reused, total, apply_ms, build_ms, alloc_ms, reuse_wait_ms, inputs_ms, compute_ms, sync_ms);
+        LLAMA_LOG_WARN("ubatch_profile shares: apply=%.1f%% build=%.1f%% alloc=%.1f%% reuse_wait=%.1f%% set_inputs=%.1f%% submit=%.1f%% sync=%.1f%%\n",
+                       100*apply_ms/total, 100*build_ms/total, 100*alloc_ms/total, 100*reuse_wait_ms/total,
                        100*inputs_ms/total, 100*compute_ms/total, 100*sync_ms/total);
     }
 };
@@ -1432,23 +1432,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
+            phase_timer t(&g_ubatch_profile.reuse_wait_ms);
             ggml_backend_sched_synchronize(sched.get());
         }
 
         n_reused++;
         g_ubatch_profile.reused++;
     } else {
-        phase_timer t(&g_ubatch_profile.build_ms);
-        res->reset();
+        {
+            phase_timer t(&g_ubatch_profile.build_ms);
+            res->reset();
 
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
-
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+            gf = model.build_graph(gparams);
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1456,6 +1455,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        phase_timer t(&g_ubatch_profile.alloc_ms);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1927,7 +1927,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-        { phase_timer t(&g_ubatch_profile.sync_ms); synchronize(); }
+
+        // Attributing the GPU wait needs a synchronisation point that does not
+        // otherwise exist here, so the profiler creates one -- and only the profiler.
+        // The sync figure it reports is therefore the wait made visible, not a wait
+        // the uninstrumented path performs.
+        if (g_ubatch_profile.enabled) {
+            phase_timer t(&g_ubatch_profile.sync_ms);
+            synchronize();
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

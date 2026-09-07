@@ -2308,7 +2308,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 // measuring.  Decode and speculative verification are untouched; they leave
 // through the MMVQ path above, far below this batch size.
 static bool ggml_cuda_mmid_prefill_mmq(const ggml_tensor * src0, const int cc, const int64_t ne11) {
-    static const bool enabled = std::getenv("GGML_CUDA_MMID_MMQ_PREFILL") != nullptr;
+    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_MMID_MMQ_PREFILL");
 
     if (!enabled || !ggml_is_quantized(src0->type)) {
         return false;
@@ -2385,7 +2385,7 @@ struct ggml_cuda_mmid_route_table {
 static ggml_cuda_mmid_route_table g_cuda_mmid_routes;
 
 static bool ggml_cuda_mmid_route_profile_enabled() {
-    static const bool enabled = std::getenv("GGML_CUDA_MMID_ROUTE_PROFILE") != nullptr;
+    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_MMID_ROUTE_PROFILE");
     return enabled;
 }
 
@@ -4795,7 +4795,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 // Each CUDA runtime in this build carries its own copy of these statics, so the
 // two driver stacks report separately -- GGML_CUDA_NAME says which is speaking.
 static bool ggml_cuda_op_profile_enabled() {
-    static const bool enabled = std::getenv("GGML_CUDA_OP_PROFILE") != nullptr;
+    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_OP_PROFILE");
     return enabled;
 }
 

@@ -1479,7 +1479,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     // at J = 64 for ~10 real columns that is six times the arithmetic.  Size the tile
     // to the expert's share instead.  The grid still covers ceil(ncols_max/J) tiles
     // per expert, so a busier-than-average expert is still fully processed.
-    static const bool mmid_fit_J = getenv("GGML_CUDA_MMQ_MMID_J_FIT") != nullptr;
+    static const bool mmid_fit_J = ggml_env_flag_enabled("GGML_CUDA_MMQ_MMID_J_FIT");
     if (mmid_fit_J && args.ids_dst != nullptr && args.nchannels_x > 1) {
         const int64_t per_expert = std::max<int64_t>(1, (args.ncols_dst + args.nchannels_x - 1) / args.nchannels_x);
 

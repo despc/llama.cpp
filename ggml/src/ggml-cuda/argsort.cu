@@ -132,7 +132,7 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
         }
     }
 
-    if (std::getenv("GGML_CUDA_SORT_PROFILE") && nrows > 8 && ncols > 1024) {
+    if (ggml_env_flag_enabled("GGML_CUDA_SORT_PROFILE") && nrows > 8 && ncols > 1024) {
         GGML_LOG_WARN("cuda_sort_scratch device=%d cols=%d rows=%d cub_bytes=%zu arrays_bytes=%zu\n",
                       ggml_cuda_get_device(), ncols, nrows, temp_storage_bytes, (size_t) ncols * nrows * (sizeof(float) + sizeof(int)));
     }

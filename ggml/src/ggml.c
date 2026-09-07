@@ -571,6 +571,15 @@ int64_t ggml_time_us(void) {
 }
 #endif
 
+bool ggml_env_flag_enabled(const char * name) {
+    const char * value = getenv(name);
+    if (!value || !value[0]) {
+        return false;
+    }
+    return !(strcmp(value, "0")     == 0 || strcmp(value, "false") == 0 ||
+             strcmp(value, "no")    == 0 || strcmp(value, "off")   == 0);
+}
+
 int64_t ggml_cycles(void) {
     return clock();
 }

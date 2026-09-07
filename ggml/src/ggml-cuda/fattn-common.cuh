@@ -1222,7 +1222,7 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
-        static const bool launch_profile = getenv("GGML_CUDA_FATTN_LAUNCH_PROFILE") != nullptr;
+        static const bool launch_profile = ggml_env_flag_enabled("GGML_CUDA_FATTN_LAUNCH_PROFILE");
         if (launch_profile) {
             GGML_LOG_WARN("fattn_launch sparse=%d ncols1=%d ncols2=%d nwarps=%d smem=%zu grid=%u,%u,%u block=%u,%u ntiles_x=%d ntiles_z_gqa=%d ntiles_KV=%d parallel_blocks=%d Qne1=%lld Kne1=%lld n_kv_max=%d\n",
                           (int) use_sparse, ncols1, ncols2, nwarps, nbytes_shared,

@@ -733,6 +733,12 @@ extern "C" {
     GGML_API void    ggml_time_init(void); // call this once at the beginning of the program
     GGML_API int64_t ggml_time_ms(void);
     GGML_API int64_t ggml_time_us(void);
+
+    // Reads a boolean opt-in from the environment.  Absent, empty, "0", "false", "no"
+    // and "off" are disabled; anything else enables.  Testing only for the variable's
+    // presence makes "FLAG=0" turn a feature on, which silently turns a control run
+    // into a candidate run.
+    GGML_API bool ggml_env_flag_enabled(const char * name);
     GGML_API int64_t ggml_cycles(void);
     GGML_API int64_t ggml_cycles_per_ms(void);
 
