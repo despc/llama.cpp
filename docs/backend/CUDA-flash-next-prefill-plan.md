@@ -2692,3 +2692,73 @@ does not change a symptom, that is evidence about the hypothesis.
 - **The per-query quality bound is loose** and could be tightened with a few
   hundred single-step predictions rather than twenty-four.
 - **P2 through P6** in the priority table are untouched.
+
+## Which changes can affect the model's numerics
+
+A survey across every commit of this work, since "does it change what the model
+computes" is asked more often than it is answered precisely. Three classes, and
+the distinction that matters is between a change that *can* reorder arithmetic
+and one that was *shown* to change output.
+
+### Can reorder arithmetic; measured to leave greedy output byte-identical
+
+All three are on by default and deployed. Each changes which MMQ tile shape runs,
+and therefore the order in which products are accumulated, so each could in
+principle move a result by an ulp. Each was validated by a token-for-token greedy
+comparison against the previous deployment and did not.
+
+| Commit | Change | Why it could matter |
+| --- | --- | --- |
+| `2628dc82d` | grouped MMQ for quantised `MUL_MAT_ID` prefill | replaces one `ggml_cuda_mul_mat` per expert with one grouped MMQ launch; different kernel, different accumulation |
+| `efb8d872e` | Volta routed to the DP4A tile tables, not the Ampere ones | different tile geometry, so different reduction tree |
+| `de3dbad40`, `9e8b48b5f` | `MUL_MAT_ID` column tile sized to an expert's share (J_FIT) | narrower tiles change how partial sums combine |
+
+`efb8d872e` and the J_FIT default are **unconditional in the fork**, so they reach
+every model these libraries serve, including Qwen3.8-27B, which has never been
+measured with them.
+
+### Can reorder arithmetic; measured to change output above a threshold
+
+| Commit | Change | Status |
+| --- | --- | --- |
+| `de27aca98`, `e1095e290`, `817afc2ac` | compact attention, prefill (`FATTN_COMPACT`) | on by default. Byte-identical output below the threshold; differs above. Perplexity 2.8943 → 2.8929, a difference of 0.048% |
+| `f8a35540e`, `817afc2ac` | compact attention, decode (`FATTN_COMPACT_DECODE`) | **off by default in `start_qwen_flash-4gpu-mtp.sh`**, on in the other two launchers. Byte-identical to about 20k; top-1 agreement 87.5% above that |
+
+The mechanism is the same in both: the set of attended positions is verified
+identical, so what changes is the order of summation, not the computation. What
+differs is that attention accumulates over thousands of terms and feeds a softmax,
+so an ulp there survives into a near-tie between two candidate tokens where the
+matmul reorderings above did not.
+
+### Cannot affect numerics
+
+Server request rejection (`75b3b2b4c`), profiler and phase labelling
+(`9ca8d44b9`, `0e692f571`, `6d43d8b03`), every probe whose output nothing
+consumes (`d38450784`, `ec2ff5fe7`, `05698c89f`, `30f5e66a7`, `104b50d7b`), the
+run-time pipeline copy count (`65009231e`), and all documentation commits. The
+probes can exhaust memory and can slow a run; they cannot change a result.
+
+`374c9a2bd` (parallel union compaction) is in this class despite touching the
+compact path: it produces the same sorted set of indices as the serial version,
+which the verifier checks element by element.
+
+### Two theoretical risks that are not reorderings
+
+Worth naming separately, because they could change *which* values are computed
+rather than the order they are summed in, and that is a different kind of error.
+
+1. **The selection list truncates silently.** `flash_attn_mask_to_sparse_indices`
+   writes at most `n_kv_max` entries per row (`fattn.cu`, the `dst < n_kv_max`
+   guard). A row whose mask admits more positions than that would lose the
+   remainder, and the compact path would then attend to fewer keys than the dense
+   one. Nothing observed suggests it happens -- NMSE against a dense reference
+   over the full cache is 1e-6 or better at every length tested, which it could
+   not be if keys were being dropped -- but the guard is silent, so this rests on
+   the verification rather than on a check at the point of truncation.
+
+2. **The chunked top-k sort could break ties differently.**
+   `GGML_CUDA_SORT_PREFILL_CHUNK_MIB` (`argsort.cu`) bounds the sort workspace by
+   processing in chunks. Chunking a selection can reorder equal keys, and the
+   indexer's top-k is exactly a selection. It is **off by default** and the
+   deployment does not set it, so this is a hazard of a path nobody is on rather
+   than a live one.
