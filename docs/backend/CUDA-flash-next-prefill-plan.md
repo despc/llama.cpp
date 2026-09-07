@@ -1732,3 +1732,70 @@ figure.
 
 TOP_K's 7.4% is not addressed by any of this. It is the indexer's own selection,
 and it grows at the same rate as the attention it feeds.
+
+## The preparation probe, 2026-09-07
+
+Nothing here is faster. This measures what a sparse attention would have to spend
+before it could save anything, so that the decision to build it rests on the
+number that could sink it rather than on the number that motivates it.
+
+The approach measured keeps the existing dense attention compute and changes only
+what it is given: for a tile of sixteen queries, take the union of their selected
+positions, gather the K/V rows at those positions into a compact buffer, and hand
+the dense kernel that buffer with a per-query mask. If that works, the kernel
+sees a cache of the union's length instead of the real one, and nothing about the
+attention arithmetic changes.
+
+### The measured cost of preparation
+
+Against attention time on the same run, prefill only:
+
+| Stage | 30k prompt | 100k prompt |
+| --- | ---: | ---: |
+| attention (the baseline) | 6091 ms | 63029 ms |
+| union construction | 681.8 ms, 11.2% | 7901.4 ms, 12.5% |
+| gather of K rows | 44.5 ms, 0.7% | 435.0 ms, 0.7% |
+| convert K/V from Q8 | 44.5 ms, 0.7% | 478.0 ms, 0.8% |
+
+**The gather is the result that matters.** Reading rows by index instead of in
+sequence was the risk that could have ended the idea before it started, and it
+costs under one percent of attention at both lengths and does not grow with
+context. A q8_0 row of 256 values is 272 bytes, which is large enough that a
+scattered read is still an efficient one.
+
+The union figure is an upper bound on a deliberately naive implementation, not a
+property of the approach: the bitmap is compacted by a single thread, which is
+what makes it linear in the cache length and is why its share grows from 11.2% to
+12.5%. A parallel compaction is the standard fix and is not yet written.
+
+Only K is gathered in this probe. Doubling it for V, preparation at 100k is about
+8.8 s against 63 s of attention.
+
+### What this does and does not establish
+
+It establishes that the irregular access pattern is affordable and that
+preparation is a fraction of what sparsity would remove. Under the union ratios
+measured earlier -- about 6x at the 50k mean cache of a 100k prefill -- attention
+would fall from 63 s to roughly 10.5 s, against 8.8 s of preparation, so the
+preparation consumes about a sixth of the saving even before it is optimised.
+
+It establishes nothing about correctness. No attention has run on a compact
+buffer; the third stage, the per-query mask, is not written; and the estimate
+above assumes the dense kernel costs proportionally less on a shorter cache,
+which is now the largest unverified assumption in the chain.
+
+### The crash, and why the first diagnosis was wrong
+
+The probe's first version failed with illegal memory accesses, and two rounds of
+fixes aimed at index arithmetic and bounds did not help, because neither was at
+fault. The scratch buffers were a function-static cache. A cudaMalloc pointer
+belongs to the device it was allocated on, and this deployment has four devices
+across two runtimes, so the second backend to reach the probe used the first
+one's allocation. No bounds check can catch that, and the two builds spent adding
+bounds checks were spent on the wrong hypothesis.
+
+The lesson is the one this document keeps recording in other forms: when a guard
+does not change a symptom, that is evidence about the hypothesis, and the next
+step is a tool that localises -- compute-sanitizer names the kernel and the
+address -- not another guess. The scratch now lives in the backend context per
+device and per stream.
