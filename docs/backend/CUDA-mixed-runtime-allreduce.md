@@ -1473,6 +1473,16 @@ between the Blackwell pair and the Tesla pair over the shared root complex and
 host DRAM is not in these numbers. A pipeline would have all four cards sending
 and receiving at once, so the real figure will be lower than 1.85x.
 
+**Superseded.** It is lower, and by more than "contention" -- the probe also let
+the faster pair finish and go quiet while the slower one measured the tail of its
+run on an emptied link. With both pairs guaranteed to be working throughout, the
+Tesla figure is 1.63x for the copy engines and 1.34x for kernel-issued access at
+64 blocks, not 1.85x. And the projection in the paragraph above -- that
+overlapping publish with reduce saves about 4 s of a 20.8 s collective -- is
+wrong twice over: the phases were re-measured after the publication and share
+changes, and overlapping them was built and lost. See *Duplex, built and measured
+to a conclusion* at the end of this document.
+
 ### Still open
 
 And the shares will want re-measuring again after any further change to the
@@ -1531,6 +1541,12 @@ against the two-kernel form -- and repeated with all four cards loaded together 
 the collective's real volumes and its real direction ratio, which is nearer 1.7
 reads per write than 1:1. If the advantage survives both, move roles into the
 reduce-scatter; if it does not, the variant closes on a measurement.
+
+**It survived the probe and lost in the collective**, and it did so for a reason
+the probe could not show: reaching the overlap needs the collective cut into
+parts, and each part costs two cross-card synchronisation rounds on ranks that
+are 1.7x apart. The fused role grid was never needed -- two streams reach the
+same overlap -- so the role-split kernel was not built. See the last section.
 
 No ratio is proposed here. Three-to-five would come from phase times measured
 before the publication and share changes, and throughput is not linear in the
@@ -1755,3 +1771,45 @@ free of the grid-wide barrier and its residency requirement;
 from overlap; `GGML_CUDA_MIXED_AR_VERIFY=1` compares every collective against the
 flat kernel elementwise; `GGML_CUDA_MIXED_AR_RS_BLOCKS=n` sets the
 reduce-scatter's grid without touching the small path decode runs on.
+
+## Where this stands, 2026-09-08
+
+Prefill on the 27B went from 187.5 tokens/s on the meta backend to 390 on the
+deployed collective, every step of it bit-identical to the reference reduction,
+and the last of that came from arithmetic-free changes to how bytes move. The
+transport is now finished in a specific sense: there is nothing left in it that
+a measurement says is worth taking.
+
+**Closed, with numbers.**
+
+| question | answer |
+|---|---|
+| Does the link carry both directions at once? | Yes. 1.34x kernel-issued at 64 blocks, 1.63x for the copy engines, with all four cards working throughout. |
+| Does a role-split grid reach that overlap? | Yes, and it beats two kernels at equal grid size. |
+| Does a larger grid help the collective? | No. It is neutral without the grid-wide barrier and costs 31% with it. |
+| Was the grid-wide barrier the cause of that? | Yes. The phase-split control makes grid size stop mattering. |
+| Is there unused bandwidth inside a phase? | No. Publication runs at 3.41 GB/s a card against a 3.29 ceiling, the gather 2.89 against 2.83. |
+| Does overlapping the directions pay? | No. Overlap is worth +3.5% at four parts; the partitioning it requires costs 12.4%. |
+| Is the pipelined reduce-scatter worth keeping? | No. Correct, 402.7 against 413.7 at the time; left off as scaffolding. |
+| Do the collective's results match the reference? | Yes, elementwise: 965,345,280 elements a rank, zero differences, four cards, every variant. |
+
+**Still open, and worth something.**
+
+The ranks are uneven, and that is now the whole story. The Blackwells finish
+their share about 1.7x faster than the Teslas and spend 8-12% of every collective
+waiting; every synchronisation round costs roughly 320 microseconds of that skew.
+Shares (35/35/17/13) were tuned against the old phase structure and want
+re-measuring against the current one. Beyond that the remaining levers are not in
+the transport: which cards hold which layers, and whether some of these bytes
+need to cross at all.
+
+Two older items are still unfinished and unrelated to any of this: a `MUL_MAT_ID`
+output comparison to substantiate the Volta dispatch equivalence, and the
+Flash-Next work, which is a layer-split workload with its own plan and its own
+bottleneck model.
+
+**Not worth revisiting without new hardware.** Direct device-to-device transfer
+(1.38 GB/s against 3.29 through the host on the Tesla pair, unavailable on the
+Blackwells), swapping cards between slots (the cost model came out exactly
+neutral), republishing to a leader (catastrophic, twice), and overlapping the
+directions (this document's last three sections).
