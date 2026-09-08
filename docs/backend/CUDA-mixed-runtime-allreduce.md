@@ -1626,3 +1626,48 @@ sustained load reach 10.74 against 6.07, 1.77x -- a reference point for a
 different transport, worth keeping as the next option if a role-split collective
 turns out to lose its margin in the protocol, not a bound on what kernel-issued
 access can do.
+
+### The control: a larger grid, no role pipeline
+
+The transport probe said most of what a role split gains over the collective's
+eight blocks is having more requests in flight, not overlapping the directions --
+8 to 64 blocks was worth 19% to two plain kernels and 36% to the role split. So
+before crediting any of it to duplex, the same question had to be put to the
+collective: does the phased reduce-scatter go faster with a larger grid?
+
+The grid is negotiated now rather than fixed (`GGML_CUDA_MIXED_AR_BLOCKS`,
+default 8, the value every earlier figure was measured at). The constant it is
+capped by is the signal stride, which both runtimes must agree on whatever grid
+they run. And the old comment that eight blocks are resident so the grid-wide
+wait cannot deadlock is replaced by asking: `group_init` measures
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` for every kernel that can be
+launched, at each type it can be instantiated at, on each device, and refuses the
+group if the negotiated grid does not fit. A grid nobody can hold is a hang, and
+"it is only a few blocks" is not a check.
+
+| AllReduce | prefill tokens/s | output |
+|---|---:|---|
+| none (meta backend) | 177.4 | a96a6cf7... |
+| phased RS, 8 blocks | **390.8** | a96a6cf7... |
+| phased RS, 16 blocks | 387.2 | |
+| phased RS, 32 blocks | 343.0 | |
+| phased RS, 64 blocks | 270.3 | a96a6cf7... |
+
+The answer is no, and it is not close. The gain does not merely fail to transfer,
+it reverses: 64 blocks costs 31% against 8. The output is identical at 8, at 64
+and against the meta backend, so this is the algorithm's cost, not a breakage,
+and the occupancy gate did not fire on any of the four devices, so it is not
+residency either.
+
+The reason is in the barrier. The phased kernels wait grid-wide across every
+rank, so each block polls `n_ranks * blocks` signal words and every block does
+it: the words read per barrier per rank go as the square of the grid -- 256 at
+eight blocks, 16384 at sixty-four -- and every one of them is a read over the
+link the collective is otherwise trying to use.
+
+Two things follow. The 19% and 36% the probe measured cannot be claimed for the
+collective as it stands; whatever a role split is worth here, it is not that. And
+a role-split reduce-scatter is only worth building if it drops the grid-wide
+barrier, because the grid size it needs is exactly the grid size that barrier
+cannot afford. A consumer must wait on the specific producers of the chunk it is
+about to read, not on everyone.

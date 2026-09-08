@@ -1667,10 +1667,11 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
             // happened to own those indices, not by the peer's block of the same
             // index.  Waiting only on the matching block index lets a block read
             // bytes another block has not published -- plausible output, wrong
-            // arithmetic.  Eight blocks are resident together, so this cannot
-            // deadlock.
+            // arithmetic.  Every block of every rank must therefore be resident
+            // at once, which group_init checks against this kernel's occupancy
+            // rather than asserting from the grid being small.
             for (int peer = 0; peer < n_ranks; ++peer) {
-                for (int b = 0; b < (int) GGML_CUDA_MIXED_AR_BLOCKS; ++b) {
+                for (int b = 0; b < (int) gridDim.x; ++b) {
                     if (peer == rank && b == bid) {
                         continue;
                     }
@@ -1773,6 +1774,7 @@ struct ggml_cuda_mixed_ar_group {
     uint64_t stream_min_bytes = 0;
     uint64_t rs_min_bytes = 0;
     uint32_t stream_chunk = 8;
+    size_t blocks = 8;                                 // the negotiated grid
     uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS] = {};
     uint32_t pipe_chunks = 0;
     std::vector<ggml_cuda_ar_phase_acc *> phase_acc;   // per backend, device memory
@@ -1803,16 +1805,16 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
         // Blocks run concurrently, so the per-block sums are averaged rather than
         // added: the collective's cost is what one block spends, not all of them.
         double p = 0, wp = 0, r = 0, wr = 0, g = 0; unsigned long long calls = 0;
-        for (size_t b = 0; b < GGML_CUDA_MIXED_AR_BLOCKS; ++b) {
+        for (size_t b = 0; b < group->blocks; ++b) {
             p += host[b].publish; wp += host[b].wait_pub; r += host[b].reduce;
             wr += host[b].wait_red; g += host[b].gather; calls += host[b].calls;
         }
-        const double nb = (double) GGML_CUDA_MIXED_AR_BLOCKS;
+        const double nb = (double) group->blocks;
         const double tot = (p + wp + r + wr + g) / nb / 1e6;
         if (tot > 0.0) {
             GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d calls=%llu total=%8.1f ms | "
                           "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
-                          GGML_CUDA_NAME, group->ranks[i], (unsigned long long) (calls / GGML_CUDA_MIXED_AR_BLOCKS),
+                          GGML_CUDA_NAME, group->ranks[i], (unsigned long long) (calls / group->blocks),
                           tot, 100*p/(p+wp+r+wr+g), 100*wp/(p+wp+r+wr+g), 100*r/(p+wp+r+wr+g),
                           100*wr/(p+wp+r+wr+g), 100*g/(p+wp+r+wr+g));
         }
@@ -1836,6 +1838,33 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
     delete group;
 }
 
+// Can this device hold the whole grid at once?
+//
+// The phased kernels wait grid-wide across every rank, so a block that is not
+// resident is a block nobody is waiting on that everyone is waiting for.  The
+// old grid was eight and the code said so in a comment; a negotiated grid needs
+// the question asked of the kernel that will actually run, with its registers and
+// its shared memory, on the device it will run on.  The lightest kernel in a
+// probe guarantees nothing about the heaviest one here.
+template <typename T>
+static int ggml_cuda_ar_resident_blocks(int device) {
+    int per_sm = 0, sms = 0, worst = 1 << 30;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    const void * kernels[] = {
+        (const void *) ggml_cuda_mixed_ar_kernel<T>,
+        (const void *) ggml_cuda_mixed_ar_stream_kernel<T>,
+        (const void *) ggml_cuda_mixed_ar_rs_kernel<T>,
+        (const void *) ggml_cuda_mixed_ar_rs_pipe_kernel<T>,
+    };
+    for (const void * k : kernels) {
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k, 256, 0) != cudaSuccess) {
+            return 0;
+        }
+        worst = std::min(worst, per_sm * sms);
+    }
+    return worst;
+}
+
 void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * config) {
     if (!config || config->abi_version != GGML_CUDA_MIXED_AR_ABI_VERSION ||
         !config->backends || !config->ranks || !config->shared_host ||
@@ -1843,7 +1872,7 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         config->n_backends == 0 || config->n_backends > config->n_ranks ||
         config->slots != GGML_CUDA_MIXED_AR_SLOTS ||
         config->rank_bytes != GGML_CUDA_MIXED_AR_RANK_BYTES ||
-        config->blocks != GGML_CUDA_MIXED_AR_BLOCKS ||
+        config->blocks == 0 || config->blocks > GGML_CUDA_MIXED_AR_BLOCKS ||
         config->signal_stride != GGML_CUDA_MIXED_AR_SIGNAL_STRIDE) {
         return nullptr;
     }
@@ -1851,7 +1880,10 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         return nullptr;
     }
     const size_t data_bytes = config->slots * config->n_ranks * config->rank_bytes;
-    const size_t signal_bytes = config->slots * config->n_ranks * config->blocks * config->signal_stride;
+    // The stride, not the grid: peers index each other's signals by the constant,
+    // so the allocation follows the constant even when a smaller grid runs.
+    const size_t signal_bytes = config->slots * config->n_ranks *
+        GGML_CUDA_MIXED_AR_BLOCKS * config->signal_stride;
     if (config->data_bytes != data_bytes || config->shared_bytes != data_bytes + signal_bytes) {
         return nullptr;
     }
@@ -1862,6 +1894,7 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->rs_min_bytes = config->rs_min_bytes;
     group->stream_chunk = config->stream_chunk ? config->stream_chunk : 1;
     group->pipe_chunks = config->pipe_chunks;
+    group->blocks = config->blocks;
     // Runs in this library's namespace, so it sees this stack's devices.
     ggml_cuda_probe_p2p(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
     // No duplex probe here: group_init runs once per registry on the same thread,
@@ -1890,6 +1923,26 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         }
     }
     group->done_valid.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, false);
+
+    // Refuse rather than deadlock.  Every rank runs the same grid because peers
+    // index each other's blocks, so one device that cannot hold it disqualifies
+    // the setting for all of them -- and the answer is per device, per kernel.
+    for (size_t i = 0; i < config->n_backends; ++i) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(config->backends[i]->context);
+        ggml_cuda_set_device(ctx->device);
+        int fits = ggml_cuda_ar_resident_blocks<float>(ctx->device);
+        fits = std::min(fits, ggml_cuda_ar_resident_blocks<half>(ctx->device));
+        fits = std::min(fits, ggml_cuda_ar_resident_blocks<nv_bfloat16>(ctx->device));
+        if (fits <= 0 || (size_t) fits < group->blocks) {
+            GGML_LOG_WARN("%s: %s device %d holds %d blocks of 256 threads at once, "
+                          "a grid of %zu would wait on blocks that are not running\n",
+                          __func__, GGML_CUDA_NAME, ctx->device, fits, group->blocks);
+            ggml_cuda_mixed_ar_group_free(group);
+            return nullptr;
+        }
+        GGML_LOG_INFO("%s: %s device %d holds %d blocks at once, grid %zu\n",
+                      __func__, GGML_CUDA_NAME, ctx->device, fits, group->blocks);
+    }
 
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(config->backends[0]));
     for (size_t i = 0; i < config->n_backends; ++i) {
@@ -2002,25 +2055,25 @@ bool ggml_cuda_mixed_ar_group_enqueue(
 
 #define LAUNCH_MIXED_AR(T) \
         if (use_rs && group->pipe_chunks > 0) { \
-            ggml_cuda_mixed_ar_rs_pipe_kernel<T><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
+            ggml_cuda_mixed_ar_rs_pipe_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
                 reinterpret_cast<const T *>(tensor->data), \
                 reinterpret_cast<T *>(tensor->data), \
                 reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
                 (int) ne, arrival_slot, token, contribute, shards, (int) group->pipe_chunks, acc); \
         } else if (use_rs) { \
-            ggml_cuda_mixed_ar_rs_kernel<T><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
+            ggml_cuda_mixed_ar_rs_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
                 reinterpret_cast<const T *>(tensor->data), \
                 reinterpret_cast<T *>(tensor->data), \
                 reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
                 (int) ne, arrival_slot, token, contribute, shards, acc); \
         } else if (use_stream) { \
-            ggml_cuda_mixed_ar_stream_kernel<T><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
+            ggml_cuda_mixed_ar_stream_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
                 reinterpret_cast<const T *>(tensor->data), \
                 reinterpret_cast<T *>(tensor->data), \
                 reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
                 (int) ne, arrival_slot, token, contribute, stream_chunk); \
         } else { \
-            ggml_cuda_mixed_ar_kernel<T><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
+            ggml_cuda_mixed_ar_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
                 reinterpret_cast<const T *>(tensor->data), \
                 reinterpret_cast<T *>(tensor->data), \
                 reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \

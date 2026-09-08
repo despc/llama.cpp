@@ -17,10 +17,15 @@ struct ggml_cuda_ar_pipeline;
 // never signals.  Version 7 adds the probe rendezvous: the two runtimes measure
 // the link in separate libraries, so without a meeting point each of them times
 // a link the other is not using, which is not the link the collective runs on.
-static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 7;
+static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 8;
 static constexpr size_t GGML_CUDA_MIXED_AR_SLOTS = 2;
 static constexpr size_t GGML_CUDA_MIXED_AR_RANK_BYTES = 64 * 1024 * 1024;
-static constexpr size_t GGML_CUDA_MIXED_AR_BLOCKS = 8;
+// Signal-slot stride and the largest grid a group may launch.  The grid itself
+// is negotiated (config->blocks) and defaults to 8, which is what every figure in
+// the journal up to now was measured at.  It is a stride, not a count: peers
+// index each other's signals by it, so it must be identical in both runtimes
+// whatever grid they end up running.
+static constexpr size_t GGML_CUDA_MIXED_AR_BLOCKS = 64;
 // Ranks a single mixed AllReduce group can hold; sizes the per-element scratch
 // the butterfly tree is reduced in.
 static constexpr int GGML_CUDA_MIXED_AR_MAX_RANKS = GGML_CUDA_MAX_DEVICES;
@@ -61,7 +66,7 @@ struct ggml_cuda_mixed_ar_group_config {
     size_t data_bytes;
     size_t slots;
     size_t rank_bytes;
-    size_t blocks;
+    size_t blocks;          // the grid to launch; <= GGML_CUDA_MIXED_AR_BLOCKS
     size_t signal_stride;
     // Negotiated once for the whole communicator, not re-derived per runtime.
     // Every rank picks the algorithm from these and the tensor's size, so the

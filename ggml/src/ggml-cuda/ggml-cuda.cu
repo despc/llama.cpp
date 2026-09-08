@@ -1699,6 +1699,15 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     // Pipelined reduce-scatter: publish chunk c while reducing c-1 and gathering
     // c-2, so the link carries both directions at once.  0 disables it.
     const uint32_t mixed_ar_pipe = (uint32_t) ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_PIPE_CHUNKS", 0);
+    // The grid every rank runs.  The transport probe says most of what a role
+    // split gains over eight blocks is having more requests in flight rather
+    // than overlapping the directions -- 8 to 64 blocks is worth 19% to two
+    // plain kernels -- so the phased collective has to be tried at a larger grid
+    // before any of that gain is credited to duplex.  Default 8, which is what
+    // every figure recorded so far was measured at.  Each runtime refuses a grid
+    // its devices cannot hold resident.
+    const size_t mixed_ar_blocks = (size_t) std::min<uint64_t>(GGML_CUDA_MIXED_AR_BLOCKS,
+        std::max<uint64_t>(1, ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_BLOCKS", 8)));
 
     uint32_t mixed_ar_shares[GGML_CUDA_MIXED_AR_MAX_RANKS];
     for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
@@ -1799,7 +1808,7 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             local_backends.data(), ranks.data(), local_backends.size(), n_ranks,
             ret->mixed_host, shared_bytes, data_bytes,
             GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
-            GGML_CUDA_MIXED_AR_BLOCKS, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
+            mixed_ar_blocks, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
             mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk, mixed_ar_pipe,
             {},
             (char *) ret->mixed_host + shared_bytes, probe_bytes,
