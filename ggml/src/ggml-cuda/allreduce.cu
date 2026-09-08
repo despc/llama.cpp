@@ -1337,12 +1337,31 @@ struct ggml_cuda_ar_phase_acc {
     unsigned long long wait_red;   // blocked until every peer has reduced
     unsigned long long gather;     // reading the shards this rank does not own
     unsigned long long calls;
+    // Wall time of the whole collective, stamped on the stream that finishes it.
+    // The phase fields are summed per block, so where phases overlap they add up
+    // to more than the collective actually took; this is what says whether they
+    // overlapped at all.
+    unsigned long long wall_beg;
+    unsigned long long wall_sum;
 };
+
 
 static __device__ __forceinline__ unsigned long long ggml_cuda_ar_now() {
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
+}
+
+static __global__ void ggml_cuda_ar_stamp_kernel(ggml_cuda_ar_phase_acc * acc, bool begin) {
+    if (!acc || threadIdx.x != 0) {
+        return;
+    }
+    const unsigned long long now = ggml_cuda_ar_now();
+    if (begin) {
+        acc[0].wall_beg = now;
+    } else {
+        atomicAdd(&acc[0].wall_sum, now - acc[0].wall_beg);
+    }
 }
 
 // Pipelined reduce-scatter.  Same arithmetic, both directions of the link at once.
@@ -1769,12 +1788,297 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
     }
 }
 
+// Bit view, so the comparison has no tolerance and no type-specific compare.
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_bits(float v) {
+    return __float_as_uint(v);
+}
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_bits(half v) {
+    return (uint32_t) __half_as_ushort(v);
+}
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_bits(nv_bfloat16 v) {
+    union { nv_bfloat16 h; unsigned short u; } c; c.h = v; return (uint32_t) c.u;
+}
+
+// The phase-split reduce-scatter: the same traffic and the same arithmetic, with
+// the waiting taken out of the working grid.
+//
+// The single-kernel form waits grid-wide across every rank, so each block polls
+// n_ranks * blocks signal words and every block does it.  That is the main
+// suspect for why a larger grid loses -- 390.8 tokens/s at eight blocks against
+// 270.3 at sixty-four -- but a throughput number cannot separate it from request
+// contention, worse access efficiency, or block imbalance.  So here is the
+// control: identical phases, identical volumes, identical reduction, with the
+// readiness moved into a one-block kernel between launches.  One block always
+// runs, and it polls one word per peer rather than blocks * n_ranks.
+//
+// A kernel finishing is not a peer being ready, so the gate is what carries
+// readiness across cards; stream order carries it within one.
+static __global__ void ggml_cuda_mixed_ar_gate_kernel(
+        uint32_t * arrival_slot, int rank, int n_ranks, uint32_t token, int word,
+        uint32_t target, bool reset, bool exact, bool do_wait,
+        ggml_cuda_ar_phase_acc * acc, int acc_field) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(uint32_t));
+    const unsigned long long t0 = acc ? ggml_cuda_ar_now() : 0;
+    uint32_t * my = arrival_slot + ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS) * SIGNAL_INTS;
+
+    if (reset) {
+        // Zero the counters before the token that says they are this call's, so a
+        // peer never reads last call's count under this call's token.
+        *(volatile uint32_t *) (my + GGML_CUDA_MIXED_AR_SIG_SPLIT_PUB) = 0;
+        *(volatile uint32_t *) (my + GGML_CUDA_MIXED_AR_SIG_SPLIT_RED) = 0;
+        __threadfence_system();
+        *(volatile uint32_t *) (my + GGML_CUDA_MIXED_AR_SIG_SPLIT_TOKEN) = token;
+        __threadfence_system();
+    }
+    // The phase's stores landed when its kernel completed; this orders the count
+    // that announces them after them.
+    __threadfence_system();
+    *(volatile uint32_t *) (my + word) = target;
+    __threadfence_system();
+    // Announcing is not the same as waiting.  Publishing a part depends on no
+    // peer, so the stream that publishes only announces and runs on; the stream
+    // that consumes is the one with something to wait for.  Making the publisher
+    // wait as well turns every part into a full barrier, and with ranks this
+    // uneven that costs more than the overlap returns.
+    for (int p = 0; do_wait && p < n_ranks; ++p) {
+        if (p == rank) {
+            continue;
+        }
+        const uint32_t * ps = arrival_slot + ((size_t) p * GGML_CUDA_MIXED_AR_BLOCKS) * SIGNAL_INTS;
+        for (;;) {
+            // Counting words are validated by the token beside them; a word used
+            // as a plain meeting point carries the token itself, so it needs no
+            // second word and no reset -- which matters where a reset would be
+            // read by a peer still waiting on the value being reset.
+            const uint32_t v = *(const volatile uint32_t *) (ps + word);
+            if (exact ? (v == target)
+                      : (*(const volatile uint32_t *) (ps + GGML_CUDA_MIXED_AR_SIG_SPLIT_TOKEN) == token &&
+                         v >= target)) {
+                break;
+            }
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif
+        }
+    }
+    __threadfence_system();
+    if (acc) {
+        const unsigned long long dt = ggml_cuda_ar_now() - t0;
+        if (acc_field == 0) { atomicAdd(&acc[0].wait_pub, dt); } else { atomicAdd(&acc[0].wait_red, dt); }
+    }
+}
+
+// Shard boundaries, integer and identical on every rank because the inputs are.
+static __device__ __forceinline__ int ggml_cuda_ar_shard_lo(
+        const ggml_cuda_ar_shards & shards, int r, int n_ranks, int count_vec) {
+    const uint32_t total = shards.cum[n_ranks];
+    return total ? (int) ((int64_t) shards.cum[r] * count_vec / (int64_t) total) : 0;
+}
+
+template <typename T>
+static __global__ void ggml_cuda_mixed_ar_split_pub_kernel(
+        const T * sendbuf, T * __restrict__ slot_data, int rank, int n_ranks,
+        size_t rank_stride, int count, bool contribute, ggml_cuda_ar_shards shards,
+        int part, int n_parts, ggml_cuda_ar_phase_acc * acc) {
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
+    const int tid = threadIdx.x;
+    const int gtid = blockIdx.x * blockDim.x + tid;
+    const int gnt  = gridDim.x * blockDim.x;
+    const unsigned long long t0 = acc ? ggml_cuda_ar_now() : 0;
+
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+    // Derived here rather than passed in: the vector width is a property of the
+    // architecture, so only the kernel can divide the tensor the same way on
+    // every rank.
+    const int part_lo = (int) ((int64_t) count_vec * part / n_parts);
+    const int part_hi = (int) ((int64_t) count_vec * (part + 1) / n_parts);
+    const bool last_part = part == n_parts - 1;
+    T * host_mine = slot_data + (size_t) rank * rank_stride;
+    const bool owns_tail = rank == n_ranks - 1;
+    const int mine_lo = ggml_cuda_ar_shard_lo(shards, rank,     n_ranks, count_vec);
+    const int mine_hi = ggml_cuda_ar_shard_lo(shards, rank + 1, n_ranks, count_vec);
+
+    for (int i = part_lo + gtid; i < part_hi; i += gnt) {
+        if (i >= mine_lo && i < mine_hi) {
+            continue;   // this rank's own shard has no reader
+        }
+        const int off = i * ELEMS_PER_VEC;
+        T wire[ELEMS_PER_VEC];
+#pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            wire[k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
+        }
+        ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
+    }
+    if (last_part && !owns_tail && blockIdx.x == 0 && tid < count - tail) {
+        host_mine[tail + tid] = contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f);
+    }
+    if (acc && tid == 0) {
+        atomicAdd(&acc[blockIdx.x].publish, ggml_cuda_ar_now() - t0);
+        atomicAdd(&acc[blockIdx.x].calls, 1ull);
+    }
+}
+
+template <typename T>
+static __global__ void ggml_cuda_mixed_ar_split_red_kernel(
+        const T * sendbuf, T * recvbuf, T * __restrict__ slot_data, int rank, int n_ranks,
+        size_t rank_stride, int count, bool contribute, ggml_cuda_ar_shards shards,
+        int part, int n_parts, ggml_cuda_ar_phase_acc * acc) {
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
+    const int tid = threadIdx.x;
+    const int gtid = blockIdx.x * blockDim.x + tid;
+    const int gnt  = gridDim.x * blockDim.x;
+    const unsigned long long t0 = acc ? ggml_cuda_ar_now() : 0;
+
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+    // Derived here rather than passed in: the vector width is a property of the
+    // architecture, so only the kernel can divide the tensor the same way on
+    // every rank.
+    const int part_lo = (int) ((int64_t) count_vec * part / n_parts);
+    const int part_hi = (int) ((int64_t) count_vec * (part + 1) / n_parts);
+    const bool last_part = part == n_parts - 1;
+    T * host_mine = slot_data + (size_t) rank * rank_stride;
+    const bool owns_tail = rank == n_ranks - 1;
+    // This part's slice of the shard this rank owns; empty when they do not meet.
+    const int red_lo = max(part_lo, ggml_cuda_ar_shard_lo(shards, rank,     n_ranks, count_vec));
+    const int red_hi = min(part_hi, ggml_cuda_ar_shard_lo(shards, rank + 1, n_ranks, count_vec));
+
+    for (int i = red_lo + gtid; i < red_hi; i += gnt) {
+        const int off = i * ELEMS_PER_VEC;
+        T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
+        for (int peer = 0; peer < n_ranks; ++peer) {
+            if (peer == rank) {
+#pragma unroll
+                for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                    wire[peer][k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
+                }
+            } else {
+                const T * host_peer = slot_data + (size_t) peer * rank_stride;
+                ggml_cuda_memcpy_1<sizeof(wire[peer])>(wire[peer], &host_peer[off]);
+            }
+        }
+        T out[ELEMS_PER_VEC];
+#pragma unroll
+        for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+            T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                v[peer] = wire[peer][k];
+            }
+            out[k] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+            recvbuf[off + k] = out[k];
+        }
+        ggml_cuda_memcpy_1<sizeof(out)>(&host_mine[off], out);
+    }
+    if (last_part && owns_tail && blockIdx.x == 0 && tid < count - tail) {
+        T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+        for (int peer = 0; peer < n_ranks; ++peer) {
+            v[peer] = peer == rank
+                ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
+                : (slot_data + (size_t) peer * rank_stride)[tail + tid];
+        }
+        const T total = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+        recvbuf[tail + tid] = total;
+        host_mine[tail + tid] = total;
+    }
+    if (acc && tid == 0) {
+        atomicAdd(&acc[blockIdx.x].reduce, ggml_cuda_ar_now() - t0);
+    }
+}
+
+template <typename T>
+static __global__ void ggml_cuda_mixed_ar_split_gat_kernel(
+        T * recvbuf, const T * __restrict__ slot_data, int rank, int n_ranks,
+        size_t rank_stride, int count, ggml_cuda_ar_shards shards,
+        int part, int n_parts, ggml_cuda_ar_phase_acc * acc) {
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
+    const int tid = threadIdx.x;
+    const int gtid = blockIdx.x * blockDim.x + tid;
+    const int gnt  = gridDim.x * blockDim.x;
+    const unsigned long long t0 = acc ? ggml_cuda_ar_now() : 0;
+
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+    // Derived here rather than passed in: the vector width is a property of the
+    // architecture, so only the kernel can divide the tensor the same way on
+    // every rank.
+    const int part_lo = (int) ((int64_t) count_vec * part / n_parts);
+    const int part_hi = (int) ((int64_t) count_vec * (part + 1) / n_parts);
+    const bool last_part = part == n_parts - 1;
+    const bool owns_tail = rank == n_ranks - 1;
+
+    for (int peer = 0; peer < n_ranks; ++peer) {
+        if (peer == rank) {
+            continue;
+        }
+        const T * host_peer = slot_data + (size_t) peer * rank_stride;
+        const int g_lo = max(part_lo, ggml_cuda_ar_shard_lo(shards, peer,     n_ranks, count_vec));
+        const int g_hi = min(part_hi, ggml_cuda_ar_shard_lo(shards, peer + 1, n_ranks, count_vec));
+        for (int i = g_lo + gtid; i < g_hi; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T got[ELEMS_PER_VEC];
+            ggml_cuda_memcpy_1<sizeof(got)>(got, &host_peer[off]);
+#pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                recvbuf[off + k] = got[k];
+            }
+        }
+    }
+    if (last_part && !owns_tail && blockIdx.x == 0 && tid < count - tail) {
+        recvbuf[tail + tid] = (slot_data + (size_t) (n_ranks - 1) * rank_stride)[tail + tid];
+    }
+    if (acc && tid == 0) {
+        atomicAdd(&acc[blockIdx.x].gather, ggml_cuda_ar_now() - t0);
+    }
+}
+
+// Direct comparison of the result against the reference reduction, element by
+// element.  Matching model output shows a matching continuation, which argmax
+// can produce from differing values; this cannot.
+template <typename T>
+static __global__ void ggml_cuda_mixed_ar_cmp_kernel(
+        const T * a, const T * b, int count, unsigned long long * counters) {
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gnt  = gridDim.x * blockDim.x;
+    unsigned long long bad = 0;
+    for (int i = gtid; i < count; i += gnt) {
+        // Bitwise: a reduction that is supposed to be identical has no tolerance
+        // to spend, and this also catches a sign of zero or a NaN payload moving.
+        if (ggml_cuda_ar_bits(a[i]) != ggml_cuda_ar_bits(b[i])) {
+            ++bad;
+        }
+    }
+    if (bad) {
+        atomicAdd(&counters[0], bad);
+    }
+    if (gtid == 0) {
+        atomicAdd(&counters[1], (unsigned long long) count);
+    }
+}
+
 struct ggml_cuda_mixed_ar_group {
     size_t n_ranks = 0;
     uint64_t stream_min_bytes = 0;
     uint64_t rs_min_bytes = 0;
     uint32_t stream_chunk = 8;
-    size_t blocks = 8;                                 // the negotiated grid
+    size_t blocks = 8;                                 // grid for the small paths
+    size_t rs_blocks = 8;                              // grid for the reduce-scatter
+    uint32_t rs_split = 0;                             // phases as separate launches
+    uint32_t duplex_parts = 0;                         // parts overlapped on a second stream
+    uint32_t duplex_noaux = 0;                         // same parts, one stream: the control
+    std::vector<cudaStream_t> aux;                     // per backend, carries publication
+    std::vector<cudaEvent_t> aux_ready;                // main -> aux, per backend
+    std::vector<std::vector<cudaEvent_t>> pub_done;    // aux -> main, per backend per part
+    uint32_t verify = 0;                               // compare against the flat kernel
+    std::vector<void *> verify_in;                     // per backend, device memory
+    std::vector<void *> verify_out;
+    std::vector<unsigned long long *> verify_counters; // {mismatches, elements}
     uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS] = {};
     uint32_t pipe_chunks = 0;
     std::vector<ggml_cuda_ar_phase_acc *> phase_acc;   // per backend, device memory
@@ -1794,6 +2098,40 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
     if (!group) {
         return;
     }
+    for (size_t i = 0; i < group->aux.size(); ++i) {
+        if (group->aux[i]) {
+            ggml_cuda_set_device(group->devices[i]);
+            CUDA_CHECK(cudaStreamSynchronize(group->aux[i]));
+            CUDA_CHECK(cudaStreamDestroy(group->aux[i]));
+        }
+        if (i < group->aux_ready.size() && group->aux_ready[i]) {
+            CUDA_CHECK(cudaEventDestroy(group->aux_ready[i]));
+        }
+        if (i < group->pub_done.size()) {
+            for (cudaEvent_t e : group->pub_done[i]) {
+                if (e) { CUDA_CHECK(cudaEventDestroy(e)); }
+            }
+        }
+    }
+    for (size_t i = 0; i < group->verify_counters.size(); ++i) {
+        if (!group->verify_counters[i]) {
+            continue;
+        }
+        ggml_cuda_set_device(group->devices[i]);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        unsigned long long host[2] = {0, 0};
+        CUDA_CHECK(cudaMemcpy(host, group->verify_counters[i], sizeof(host), cudaMemcpyDeviceToHost));
+        // The backend's own name, not GGML_CUDA_NAME: this file is compiled into
+        // both libraries but only ggml-cuda.cu sees the V100 build's override, so
+        // the constant would label every rank "CUDA" whichever stack it is on.
+        GGML_LOG_WARN("mixed_ar_verify backend=%s rank=%d %llu elements compared, "
+                      "%llu differ from the reference reduction\n",
+                      ggml_backend_name(group->backends[i]), group->ranks[i],
+                      (unsigned long long) host[1], (unsigned long long) host[0]);
+        CUDA_CHECK(cudaFree(group->verify_counters[i]));
+        if (group->verify_in[i])  { CUDA_CHECK(cudaFree(group->verify_in[i])); }
+        if (group->verify_out[i]) { CUDA_CHECK(cudaFree(group->verify_out[i])); }
+    }
     for (size_t i = 0; i < group->phase_acc.size(); ++i) {
         if (!group->phase_acc[i]) {
             continue;
@@ -1811,10 +2149,17 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
         }
         const double nb = (double) group->blocks;
         const double tot = (p + wp + r + wr + g) / nb / 1e6;
+        const double wall = (double) host[0].wall_sum / 1e6;
+        if (tot > 0.0) {
+            GGML_LOG_WARN("mixed_ar_wall backend=%s rank=%d wall=%8.1f ms  phases summed=%8.1f ms  "
+                          "overlap=%5.1f%%\n",
+                          ggml_backend_name(group->backends[i]), group->ranks[i], wall, tot,
+                          wall > 0 ? 100.0*(1.0 - wall/tot) : 0.0);
+        }
         if (tot > 0.0) {
             GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d calls=%llu total=%8.1f ms | "
                           "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
-                          GGML_CUDA_NAME, group->ranks[i], (unsigned long long) (calls / group->blocks),
+                          ggml_backend_name(group->backends[i]), group->ranks[i], (unsigned long long) (calls / group->blocks),
                           tot, 100*p/(p+wp+r+wr+g), 100*wp/(p+wp+r+wr+g), 100*r/(p+wp+r+wr+g),
                           100*wr/(p+wp+r+wr+g), 100*g/(p+wp+r+wr+g));
         }
@@ -1895,6 +2240,43 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->stream_chunk = config->stream_chunk ? config->stream_chunk : 1;
     group->pipe_chunks = config->pipe_chunks;
     group->blocks = config->blocks;
+    group->rs_blocks = config->rs_blocks ? config->rs_blocks : config->blocks;
+    group->rs_split = config->rs_split;
+    group->duplex_parts = config->duplex_parts;
+    group->duplex_noaux = config->duplex_noaux;
+    if (group->duplex_parts > 0) {
+        // Publication runs here while the reduction and gather of the previous
+        // part run on the backend's own stream.  A stream each, because two
+        // kernels that must overlap cannot share one.
+        group->aux.assign(config->n_backends, nullptr);
+        group->aux_ready.assign(config->n_backends, nullptr);
+        group->pub_done.assign(config->n_backends, {});
+        for (size_t i = 0; i < config->n_backends; ++i) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(config->backends[i]->context);
+            ggml_cuda_set_device(ctx->device);
+            if (cudaStreamCreateWithFlags(&group->aux[i], cudaStreamNonBlocking) != cudaSuccess ||
+                cudaEventCreateWithFlags(&group->aux_ready[i], cudaEventDisableTiming) != cudaSuccess) {
+                GGML_LOG_WARN("%s: no second stream; overlapped publication off\n", __func__);
+                group->duplex_parts = 0;
+                break;
+            }
+            group->pub_done[i].resize(group->duplex_parts, nullptr);
+            for (uint32_t q = 0; q < group->duplex_parts; ++q) {
+                if (cudaEventCreateWithFlags(&group->pub_done[i][q], cudaEventDisableTiming) != cudaSuccess) {
+                    group->duplex_parts = 0;
+                    break;
+                }
+            }
+            if (!group->duplex_parts) {
+                break;
+            }
+        }
+    }
+    group->verify = config->verify;
+    if (group->rs_blocks > GGML_CUDA_MIXED_AR_BLOCKS) {
+        ggml_cuda_mixed_ar_group_free(group);
+        return nullptr;
+    }
     // Runs in this library's namespace, so it sees this stack's devices.
     ggml_cuda_probe_p2p(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
     // No duplex probe here: group_init runs once per registry on the same thread,
@@ -1924,6 +2306,25 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     }
     group->done_valid.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, false);
 
+    if (group->verify) {
+        group->verify_in.assign(config->n_backends, nullptr);
+        group->verify_out.assign(config->n_backends, nullptr);
+        group->verify_counters.assign(config->n_backends, nullptr);
+        for (size_t i = 0; i < config->n_backends; ++i) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(config->backends[i]->context);
+            ggml_cuda_set_device(ctx->device);
+            if (cudaMalloc(&group->verify_in[i], GGML_CUDA_MIXED_AR_RANK_BYTES) != cudaSuccess ||
+                cudaMalloc(&group->verify_out[i], GGML_CUDA_MIXED_AR_RANK_BYTES) != cudaSuccess ||
+                cudaMalloc(&group->verify_counters[i], 2*sizeof(unsigned long long)) != cudaSuccess) {
+                GGML_LOG_WARN("%s: %s no room for verification buffers; verification off\n",
+                              __func__, GGML_CUDA_NAME);
+                group->verify = 0;
+                break;
+            }
+            CUDA_CHECK(cudaMemset(group->verify_counters[i], 0, 2*sizeof(unsigned long long)));
+        }
+    }
+
     // Refuse rather than deadlock.  Every rank runs the same grid because peers
     // index each other's blocks, so one device that cannot hold it disqualifies
     // the setting for all of them -- and the answer is per device, per kernel.
@@ -1933,15 +2334,19 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
         int fits = ggml_cuda_ar_resident_blocks<float>(ctx->device);
         fits = std::min(fits, ggml_cuda_ar_resident_blocks<half>(ctx->device));
         fits = std::min(fits, ggml_cuda_ar_resident_blocks<nv_bfloat16>(ctx->device));
-        if (fits <= 0 || (size_t) fits < group->blocks) {
-            GGML_LOG_WARN("%s: %s device %d holds %d blocks of 256 threads at once, "
-                          "a grid of %zu would wait on blocks that are not running\n",
-                          __func__, GGML_CUDA_NAME, ctx->device, fits, group->blocks);
+        const size_t want = std::max(group->blocks, group->rs_blocks);
+        if (fits <= 0 || (size_t) fits < want) {
+            GGML_LOG_WARN("%s: %s device %d has room for %d blocks of 256 threads, "
+                          "a grid of %zu could wait on blocks that are not running\n",
+                          __func__, GGML_CUDA_NAME, ctx->device, fits, want);
             ggml_cuda_mixed_ar_group_free(group);
             return nullptr;
         }
-        GGML_LOG_INFO("%s: %s device %d holds %d blocks at once, grid %zu\n",
-                      __func__, GGML_CUDA_NAME, ctx->device, fits, group->blocks);
+        // Necessary, not sufficient: this says the resources are there, not that
+        // the scheduler will have every block running at any given moment.  The
+        // phase-split path does not depend on it; the single-kernel one does.
+        GGML_LOG_INFO("%s: %s device %d has room for %d blocks, grids %zu/%zu\n",
+                      __func__, GGML_CUDA_NAME, ctx->device, fits, group->blocks, group->rs_blocks);
     }
 
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(config->backends[0]));
@@ -2012,6 +2417,145 @@ bool ggml_cuda_mixed_ar_group_prepare(void * context, size_t slot) {
     return true;
 }
 
+// One rank's launch for one collective.  Split out of the enqueue loop because
+// the phase-split path is several launches rather than one, and verification
+// wraps whichever path is chosen in a second, reference collective.
+template <typename T>
+static void ggml_cuda_mixed_ar_launch(
+        ggml_cuda_mixed_ar_group * group, size_t i, int rank, ggml_tensor * tensor,
+        void * slot_data_v, uint32_t * arrival_slot, uint32_t token, bool contribute,
+        const ggml_cuda_ar_shards & shards, ggml_cuda_ar_phase_acc * acc,
+        cudaStream_t stream, bool use_rs, bool use_stream, int stream_chunk,
+        size_t rank_stride, int ne) {
+    const int n_ranks = (int) group->n_ranks;
+    const unsigned small = (unsigned) group->blocks;
+    const unsigned big   = (unsigned) group->rs_blocks;
+    T * data = reinterpret_cast<T *>(tensor->data);
+    T * slot_data = reinterpret_cast<T *>(slot_data_v);
+
+    auto gate = [&](cudaStream_t st, int word, uint32_t target, bool reset, int field) {
+        ggml_cuda_mixed_ar_gate_kernel<<<1, 32, 0, st>>>(
+            arrival_slot, rank, n_ranks, token, word, target, reset, false, true, acc, field);
+    };
+    auto tell = [&](cudaStream_t st, int word, uint32_t target, bool reset) {
+        ggml_cuda_mixed_ar_gate_kernel<<<1, 32, 0, st>>>(
+            arrival_slot, rank, n_ranks, token, word, target, reset, false, false, nullptr, 0);
+    };
+    auto wait_for = [&](cudaStream_t st, int word, uint32_t target, int field) {
+        ggml_cuda_mixed_ar_gate_kernel<<<1, 32, 0, st>>>(
+            arrival_slot, rank, n_ranks, token, word, target, false, false, true, acc, field);
+    };
+    auto meet = [&](int word) {
+        ggml_cuda_mixed_ar_gate_kernel<<<1, 32, 0, stream>>>(
+            arrival_slot, rank, n_ranks, token, word, token, false, true, true, acc, 1);
+    };
+
+    auto run = [&]() {
+        if (use_rs && group->duplex_parts > 0 && i < group->aux.size() && group->aux[i]) {
+            // Overlapped publication.
+            //
+            // Every phase already runs the link flat out in one direction -- the
+            // profile puts publication at 3.41 GB/s a card against the probe's
+            // 3.29 store ceiling, and the gather at 2.89 against 2.83 -- so more
+            // blocks cannot help and only the other direction is left.  Cut the
+            // tensor into parts and publish part q+1 on a second stream while the
+            // first is reducing and gathering part q: publication only stores,
+            // the gather only loads, and the link carries both at once for more
+            // than it carries either alone.
+            //
+            // The parts are the same on every rank because the arithmetic is, and
+            // a part's readiness is a count rather than a flag, so three signal
+            // words carry any number of parts.
+            const int P = (int) group->duplex_parts;
+            // The control that separates the two things this path changes at
+            // once.  Cutting the collective into parts adds cross-card
+            // synchronisation rounds whether or not anything overlaps; running
+            // the publication on its own stream is what makes it overlap.  With
+            // the aux stream replaced by the main one, the rounds are identical
+            // and the overlap is impossible, so the difference between the two is
+            // the overlap and nothing else.
+            cudaStream_t aux = group->duplex_noaux ? stream : group->aux[i];
+            // The aux stream must not read the tensor before the model has
+            // written it, and the main stream has that ordering already.
+            CUDA_CHECK(cudaEventRecord(group->aux_ready[i], stream));
+            CUDA_CHECK(cudaStreamWaitEvent(aux, group->aux_ready[i], 0));
+            for (int q = 0; q < P; ++q) {
+                ggml_cuda_mixed_ar_split_pub_kernel<T><<<big, 256, 0, aux>>>(
+                    data, slot_data, rank, n_ranks, rank_stride, ne, contribute, shards,
+                    q, P, acc);
+                tell(aux, GGML_CUDA_MIXED_AR_SIG_SPLIT_PUB, (uint32_t) (q + 1), q == 0);
+                CUDA_CHECK(cudaEventRecord(group->pub_done[i][q], aux));
+            }
+            for (int q = 0; q < P; ++q) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, group->pub_done[i][q], 0));
+                wait_for(stream, GGML_CUDA_MIXED_AR_SIG_SPLIT_PUB, (uint32_t) (q + 1), 0);
+                ggml_cuda_mixed_ar_split_red_kernel<T><<<big, 256, 0, stream>>>(
+                    data, data, slot_data, rank, n_ranks, rank_stride, ne, contribute, shards,
+                    q, P, acc);
+                gate(stream, GGML_CUDA_MIXED_AR_SIG_SPLIT_RED, (uint32_t) (q + 1), false, 1);
+                ggml_cuda_mixed_ar_split_gat_kernel<T><<<big, 256, 0, stream>>>(
+                    data, slot_data, rank, n_ranks, rank_stride, ne, shards,
+                    q, P, acc);
+            }
+        } else if (use_rs && group->rs_split) {
+            // The control: same volumes, same arithmetic, waiting moved out of
+            // the working grid into a kernel that is one block wide.
+            ggml_cuda_mixed_ar_split_pub_kernel<T><<<big, 256, 0, stream>>>(
+                data, slot_data, rank, n_ranks, rank_stride, ne, contribute, shards,
+                0, 1, acc);
+            gate(stream, GGML_CUDA_MIXED_AR_SIG_SPLIT_PUB, 1, true, 0);
+            ggml_cuda_mixed_ar_split_red_kernel<T><<<big, 256, 0, stream>>>(
+                data, data, slot_data, rank, n_ranks, rank_stride, ne, contribute, shards,
+                0, 1, acc);
+            gate(stream, GGML_CUDA_MIXED_AR_SIG_SPLIT_RED, 1, false, 1);
+            ggml_cuda_mixed_ar_split_gat_kernel<T><<<big, 256, 0, stream>>>(
+                data, slot_data, rank, n_ranks, rank_stride, ne, shards,
+                0, 1, acc);
+        } else if (use_rs && group->pipe_chunks > 0) {
+            ggml_cuda_mixed_ar_rs_pipe_kernel<T><<<big, 256, 0, stream>>>(
+                data, data, slot_data, rank, n_ranks, rank_stride, ne,
+                arrival_slot, token, contribute, shards, (int) group->pipe_chunks, acc);
+        } else if (use_rs) {
+            ggml_cuda_mixed_ar_rs_kernel<T><<<big, 256, 0, stream>>>(
+                data, data, slot_data, rank, n_ranks, rank_stride, ne,
+                arrival_slot, token, contribute, shards, acc);
+        } else if (use_stream) {
+            ggml_cuda_mixed_ar_stream_kernel<T><<<small, 256, 0, stream>>>(
+                data, data, slot_data, rank, n_ranks, rank_stride, ne,
+                arrival_slot, token, contribute, stream_chunk);
+        } else {
+            ggml_cuda_mixed_ar_kernel<T><<<small, 256, 0, stream>>>(
+                data, data, slot_data, rank, n_ranks, rank_stride, ne,
+                arrival_slot, token, contribute);
+        }
+    };
+
+    if (!group->verify || i >= group->verify_in.size() || !group->verify_in[i]) {
+        if (acc) { ggml_cuda_ar_stamp_kernel<<<1, 32, 0, stream>>>(acc, true); }
+        run();
+        if (acc) { ggml_cuda_ar_stamp_kernel<<<1, 32, 0, stream>>>(acc, false); }
+        return;
+    }
+
+    // Run the collective under test, then the same reduction through the flat
+    // kernel from the same input, and compare the two results element by
+    // element.  The gates keep the passes apart across cards: without them a
+    // rank could start publishing its second pass into a slot a peer is still
+    // reading for its first.
+    const size_t nbytes = (size_t) ne * sizeof(T);
+    CUDA_CHECK(cudaMemcpyAsync(group->verify_in[i], data, nbytes, cudaMemcpyDeviceToDevice, stream));
+    run();
+    meet(GGML_CUDA_MIXED_AR_SIG_VERIFY_A);
+    CUDA_CHECK(cudaMemcpyAsync(group->verify_out[i], data, nbytes, cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(data, group->verify_in[i], nbytes, cudaMemcpyDeviceToDevice, stream));
+    ggml_cuda_mixed_ar_kernel<T><<<small, 256, 0, stream>>>(
+        data, data, slot_data, rank, n_ranks, rank_stride, ne,
+        arrival_slot, token, contribute);
+    meet(GGML_CUDA_MIXED_AR_SIG_VERIFY_B);
+    ggml_cuda_mixed_ar_cmp_kernel<T><<<64, 256, 0, stream>>>(
+        reinterpret_cast<const T *>(group->verify_out[i]), data, ne, group->verify_counters[i]);
+}
+
 bool ggml_cuda_mixed_ar_group_enqueue(
         void * context, ggml_tensor ** tensors, size_t slot, uint32_t token) {
     auto * group = static_cast<ggml_cuda_mixed_ar_group *>(context);
@@ -2053,33 +2597,6 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         uint32_t * arrival_slot = reinterpret_cast<uint32_t *>(base + group->data_bytes +
             slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE);
 
-#define LAUNCH_MIXED_AR(T) \
-        if (use_rs && group->pipe_chunks > 0) { \
-            ggml_cuda_mixed_ar_rs_pipe_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
-                reinterpret_cast<const T *>(tensor->data), \
-                reinterpret_cast<T *>(tensor->data), \
-                reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-                (int) ne, arrival_slot, token, contribute, shards, (int) group->pipe_chunks, acc); \
-        } else if (use_rs) { \
-            ggml_cuda_mixed_ar_rs_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
-                reinterpret_cast<const T *>(tensor->data), \
-                reinterpret_cast<T *>(tensor->data), \
-                reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-                (int) ne, arrival_slot, token, contribute, shards, acc); \
-        } else if (use_stream) { \
-            ggml_cuda_mixed_ar_stream_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
-                reinterpret_cast<const T *>(tensor->data), \
-                reinterpret_cast<T *>(tensor->data), \
-                reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-                (int) ne, arrival_slot, token, contribute, stream_chunk); \
-        } else { \
-            ggml_cuda_mixed_ar_kernel<T><<<dim3((unsigned) group->blocks), dim3(256), 0, stream>>>( \
-                reinterpret_cast<const T *>(tensor->data), \
-                reinterpret_cast<T *>(tensor->data), \
-                reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-                (int) ne, arrival_slot, token, contribute); \
-        }
-
         // Cumulative weights; the kernel divides the vector count by them.
         ggml_cuda_ar_shards shards = {};
         {
@@ -2091,13 +2608,35 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             shards.cum[group->n_ranks] = cum;
         }
         ggml_cuda_ar_phase_acc * acc = i < group->phase_acc.size() ? group->phase_acc[i] : nullptr;
+        // Once, so the phase percentages can be turned into bytes per second and
+        // compared against what the transport probe says the link will give.
+        if (acc) {
+            static bool said = false;
+            if (!said) {
+                said = true;
+                GGML_LOG_WARN("mixed_ar_shape backend=%s type=%s elements=%lld bytes=%zu ranks=%zu\n",
+                              ggml_backend_name(group->backends[i]), ggml_type_name(tensor->type),
+                              (long long) ne, ggml_nbytes(tensor), group->n_ranks);
+            }
+        }
         switch (tensor->type) {
-            case GGML_TYPE_F32:  LAUNCH_MIXED_AR(float);       break;
-            case GGML_TYPE_F16:  LAUNCH_MIXED_AR(half);        break;
-            case GGML_TYPE_BF16: LAUNCH_MIXED_AR(nv_bfloat16); break;
+            case GGML_TYPE_F32:
+                ggml_cuda_mixed_ar_launch<float>(group, i, rank, tensor, slot_data,
+                    arrival_slot, token, contribute, shards, acc, stream,
+                    use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
+                break;
+            case GGML_TYPE_F16:
+                ggml_cuda_mixed_ar_launch<half>(group, i, rank, tensor, slot_data,
+                    arrival_slot, token, contribute, shards, acc, stream,
+                    use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
+                break;
+            case GGML_TYPE_BF16:
+                ggml_cuda_mixed_ar_launch<nv_bfloat16>(group, i, rank, tensor, slot_data,
+                    arrival_slot, token, contribute, shards, acc, stream,
+                    use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
+                break;
             default: return false;
         }
-#undef LAUNCH_MIXED_AR
 
         CUDA_CHECK(cudaGetLastError());
         const size_t event_index = i * GGML_CUDA_MIXED_AR_SLOTS + slot;

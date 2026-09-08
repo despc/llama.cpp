@@ -17,7 +17,7 @@ struct ggml_cuda_ar_pipeline;
 // never signals.  Version 7 adds the probe rendezvous: the two runtimes measure
 // the link in separate libraries, so without a meeting point each of them times
 // a link the other is not using, which is not the link the collective runs on.
-static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 8;
+static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 11;
 static constexpr size_t GGML_CUDA_MIXED_AR_SLOTS = 2;
 static constexpr size_t GGML_CUDA_MIXED_AR_RANK_BYTES = 64 * 1024 * 1024;
 // Signal-slot stride and the largest grid a group may launch.  The grid itself
@@ -44,6 +44,20 @@ enum ggml_cuda_mixed_ar_signal_word {
     GGML_CUDA_MIXED_AR_SIG_PIPE_TOKEN = 5,   // validates the two counts below
     GGML_CUDA_MIXED_AR_SIG_PIPE_PUB   = 6,   // chunks published, per block
     GGML_CUDA_MIXED_AR_SIG_PIPE_RED   = 7,   // chunks reduced, per block
+    // The phase-split reduce-scatter waits in a one-block kernel between phase
+    // launches instead of grid-wide inside one, so these live in block 0's slot
+    // only and cost one word per peer rather than one per peer per block.
+    GGML_CUDA_MIXED_AR_SIG_SPLIT_PUB  = 8,
+    GGML_CUDA_MIXED_AR_SIG_SPLIT_RED  = 9,
+    // Separating the collective under test from the reference it is compared
+    // against, so no rank starts the second while a peer is still reading the
+    // first.  Verification only.
+    GGML_CUDA_MIXED_AR_SIG_VERIFY_A   = 10,
+    GGML_CUDA_MIXED_AR_SIG_VERIFY_B   = 11,
+    // Counters rather than tokens, so a collective split into parts needs three
+    // words instead of two per part: how many parts this rank has published, how
+    // many it has reduced, and the token that says both belong to this call.
+    GGML_CUDA_MIXED_AR_SIG_SPLIT_TOKEN = 12,
 };
 
 // Which kernel a group runs.  Chosen once, on the host, and handed to every rank
@@ -66,7 +80,7 @@ struct ggml_cuda_mixed_ar_group_config {
     size_t data_bytes;
     size_t slots;
     size_t rank_bytes;
-    size_t blocks;          // the grid to launch; <= GGML_CUDA_MIXED_AR_BLOCKS
+    size_t blocks;          // grid for the small paths; <= GGML_CUDA_MIXED_AR_BLOCKS
     size_t signal_stride;
     // Negotiated once for the whole communicator, not re-derived per runtime.
     // Every rank picks the algorithm from these and the tensor's size, so the
@@ -75,6 +89,18 @@ struct ggml_cuda_mixed_ar_group_config {
     uint64_t rs_min_bytes;      // 0 disables reduce-scatter
     uint32_t stream_chunk;
     uint32_t pipe_chunks;        // 0 disables the pipelined reduce-scatter
+    // The reduce-scatter's own grid, kept apart from the small path's.  Decode
+    // runs the flat kernel and has no business changing size when a prefill
+    // experiment does.
+    size_t rs_blocks;
+    uint32_t rs_split;           // 1: run the phases as separate launches
+    // Parts the collective is cut into so one part's publication can run beside
+    // the previous part's reduction and gather, on a second stream.  Publication
+    // only stores and the gather only loads, and the link carries both at once
+    // better than either alone.  0 disables it.
+    uint32_t duplex_parts;
+    uint32_t duplex_noaux;       // same parts on one stream: the control for the above
+    uint32_t verify;             // 1: compare every result against the flat kernel
     // Relative share of the reduction each rank owns, in rank order.  Integers,
     // so every rank derives identical boundaries from them; all ones is an even
     // split.  This is not the weight split: it decides who reduces an element,

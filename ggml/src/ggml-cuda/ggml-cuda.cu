@@ -1427,7 +1427,7 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
         ggml_cuda_set_device(dev[i]);
         // Both directions land in dbuf, and the read side is the larger one.
         ok = ok && cudaMalloc(&dbuf[i], 3*bytes) == cudaSuccess;
-        ok = ok && cudaHostAlloc(&hsend[i], bytes, cudaHostAllocPortable) == cudaSuccess;
+        ok = ok && cudaHostAlloc(&hsend[i], 3*bytes, cudaHostAllocPortable) == cudaSuccess;
         ok = ok && cudaHostAlloc(&hrecv[i], 3*bytes, cudaHostAllocPortable) == cudaSuccess;
         ok = ok && cudaStreamCreate(&ssend[i]) == cudaSuccess;
         ok = ok && cudaStreamCreate(&srecv[i]) == cudaSuccess;
@@ -1467,6 +1467,29 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
                 ggml_cuda_set_device(dev[i]);
                 if (st) { cudaStreamSynchronize(ssend[i]); }
                 if (ld) { cudaStreamSynchronize(srecv[i]); }
+            }
+        };
+        // The collective's real pattern: what one card reads is what another card
+        // is writing, in the same pinned allocation.  The probe so far gave every
+        // device its own buffer for each direction, which is the one thing the
+        // collective never has -- and it is the obvious suspect for why
+        // overlapping the directions there loses 6% instead of gaining 34%.
+        auto run_shared = [&](int blocks, int r) {
+            for (size_t i = 0; i < n; ++i) {
+                const size_t other = (i + 1) % n;
+                ggml_cuda_set_device(dev[i]);
+                for (int k = 0; k < r; ++k) {
+                    ggml_cuda_host_store_kernel<<<blocks, 256, 0, ssend[i]>>>(
+                        (int4 *) hsend[i], (const int4 *) dbuf[i], bytes / sizeof(int4));
+                    ggml_cuda_host_load_kernel<<<blocks, 256, 0, srecv[i]>>>(
+                        (int4 *) dbuf[i], (const int4 *) hsend[other], ld_bytes[i] / sizeof(int4),
+                        (int4 *) dbuf[i]);
+                }
+            }
+            for (size_t i = 0; i < n; ++i) {
+                ggml_cuda_set_device(dev[i]);
+                cudaStreamSynchronize(ssend[i]);
+                cudaStreamSynchronize(srecv[i]);
             }
         };
         auto run_2k = [&](bool st, bool ld, int blocks, int r) {
@@ -1581,6 +1604,13 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
             // Both the split and the grid size move this, so sweep both rather
             // than carry a ratio over from an older measurement.  64 is where the
             // sweep stops, not a maximum anyone has established.
+            const double sh_bo = sweep([&](int r){ run_shared(blocks, r); });
+            if (ok && sh_bo > 0 && k_bo > 0) {
+                GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s | shared buf %2d blk | "
+                              "                            both %5.2f GB/s  (own buffers %5.2f)\n",
+                              GGML_CUDA_NAME, bytes >> 20, ratio_tag, blocks,
+                              (moved_st+moved_ld)/sh_bo, (moved_st+moved_ld)/k_bo);
+            }
             for (int num = 1; num <= 3; ++num) {
                 const int n_store = std::max(1, blocks * num / 4);
                 const double r_bo = sweep([&](int r){ run_roles(blocks, n_store, r); });
@@ -1708,6 +1738,21 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     // its devices cannot hold resident.
     const size_t mixed_ar_blocks = (size_t) std::min<uint64_t>(GGML_CUDA_MIXED_AR_BLOCKS,
         std::max<uint64_t>(1, ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_BLOCKS", 8)));
+    // The reduce-scatter's grid, separate from the small path's: decode runs the
+    // flat kernel and has no business changing size when a prefill experiment
+    // does.  And the phase-split variant, which keeps the volumes and the
+    // arithmetic but moves the waiting out of the working grid, so the cost of
+    // the grid-wide barrier can be told apart from the cost of a large grid.
+    const size_t mixed_ar_rs_blocks = (size_t) std::min<uint64_t>(GGML_CUDA_MIXED_AR_BLOCKS,
+        std::max<uint64_t>(1, ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_RS_BLOCKS", mixed_ar_blocks)));
+    const uint32_t mixed_ar_rs_split = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_RS_SPLIT") ? 1 : 0;
+    // Parts to overlap: publication of part q+1 beside the reduction and gather
+    // of part q, on a second stream.  0 disables it.
+    const uint32_t mixed_ar_duplex = (uint32_t) ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_DUPLEX_PARTS", 0);
+    const uint32_t mixed_ar_noaux = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_DUPLEX_NOAUX") ? 1 : 0;
+    // Compares every collective against the flat kernel elementwise.  Doubles
+    // the traffic, so it is for checking, not for measuring.
+    const uint32_t mixed_ar_verify = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_VERIFY") ? 1 : 0;
 
     uint32_t mixed_ar_shares[GGML_CUDA_MIXED_AR_MAX_RANKS];
     for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
@@ -1810,6 +1855,7 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
             mixed_ar_blocks, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
             mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk, mixed_ar_pipe,
+            mixed_ar_rs_blocks, mixed_ar_rs_split, mixed_ar_duplex, mixed_ar_noaux, mixed_ar_verify,
             {},
             (char *) ret->mixed_host + shared_bytes, probe_bytes,
             (uint32_t) ranks_by_registry.size(),

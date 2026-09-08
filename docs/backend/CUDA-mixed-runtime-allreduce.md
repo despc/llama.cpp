@@ -1671,3 +1671,87 @@ a role-split reduce-scatter is only worth building if it drops the grid-wide
 barrier, because the grid size it needs is exactly the grid size that barrier
 cannot afford. A consumer must wait on the specific producers of the chunk it is
 about to read, not on everyone.
+
+### Duplex, built and measured to a conclusion
+
+The question was whether the link's ability to carry both directions at once can
+be turned into prefill. It can be built, it is bit-exact, and it loses. The
+reason is not the one this document kept guessing at, and every guess that turned
+out wrong was retired by a measurement rather than an argument.
+
+**The barrier was the cause of the large-grid collapse.** The control the review
+asked for -- the same phases, the same volumes, the same arithmetic, with the
+waiting moved out of the working grid into a one-block kernel between launches --
+makes the grid size stop mattering:
+
+| grid | one kernel, grid-wide barrier | phases as launches, gate between |
+|---|---:|---:|
+| 8 | 390.3 | 392.2 |
+| 16 | 387.2 | 391.9 |
+| 32 | 343.0 | 391.0 |
+| 64 | 270.3 | 390.0 |
+
+So the suspicion was right, and it is now a measurement: 64 blocks cost 31% with
+the grid-wide barrier and nothing without it. But the second half of that table
+is the more useful half -- **a larger grid buys the collective nothing either.**
+
+**Because every phase already runs the link flat out in one direction.** With the
+tensor shape logged and the phase times measured, publication moves 3.41 GB/s a
+card against the probe's 3.29 store ceiling, and the gather 2.89 against 2.83.
+There is no unused bandwidth in a phase to give more blocks. The only thing left
+unused is the other direction.
+
+**So the directions were overlapped.** The tensor is cut into parts and part
+q+1's publication runs on a second stream beside part q's reduction and gather;
+readiness is a count rather than a flag, so three signal words carry any number
+of parts, and the publishing stream announces without waiting, since publication
+depends on no peer. Verified elementwise against the flat kernel: 965,345,280
+elements per rank, zero differences, on all four cards, at every setting.
+
+It is slower, and taking it apart says exactly why:
+
+| | one stream, no overlap | two streams, overlap | what overlap did |
+|---|---:|---:|---:|
+| no parts | 392.5 | -- | -- |
+| 2 parts | 366.0 | 354.4 | -3.2% |
+| 4 parts | 343.8 | 355.7 | +3.5% |
+
+Overlap works. At four parts it is worth +3.5%. But overlap requires parts, and
+parts cost 6.8% at two and 12.4% at four -- measured with the identical part
+structure on a single stream, where nothing can overlap. The thing that makes the
+gain possible costs several times the gain.
+
+**What the parts actually cost.** Not launch overhead: at four parts the extra
+gates are about 2300 more launches over a prefill, some 23 ms against 3.6 s. It
+is the straggle. Each part adds two cross-card synchronisation rounds, and these
+ranks are far apart -- the Blackwells finish their share about 1.7x faster than
+the Teslas, and they already spend 8-12% of a collective waiting. Every extra
+round makes the fast ranks stop and wait again, at roughly 320 microseconds of
+rank skew per round. Two rounds per part, four parts, 384 collectives in a
+prefill.
+
+**Two hypotheses this killed on the way.** That kernel-issued access might not
+get the duplex the copy engines do -- measured, it does, 1.65x against 1.85x.
+And that the collective's pattern of reading pages another card is writing might
+be what destroys the overlap -- measured with a probe variant where each device
+loads exactly what its neighbour is storing, and it costs nothing at all: 6.55
+against 6.57 GB/s at eight blocks, 8.01 against 8.07 at sixty-four.
+
+**The conclusion.** The duplex headroom is real -- 1.11x at the collective's grid
+of eight, 1.37x at sixty-four -- and it is smaller than the price of the
+partitioning needed to reach it on ranks this uneven. Nothing in the collective is
+left to make faster by moving bytes differently: each phase saturates its
+direction, the reduction is bit-exact and minimal, and the only remaining
+resource costs more to unlock than it yields. The next gain, if there is one, is
+not in the transport. It is in making the ranks less uneven, which is a placement
+and share question, or in not sending the bytes at all.
+
+Everything here is off by default. The deployed configuration is unchanged:
+the single-kernel reduce-scatter at eight blocks, 35/35/17/13.
+`GGML_CUDA_MIXED_AR_RS_SPLIT=1` is the phase-split variant, equal in speed and
+free of the grid-wide barrier and its residency requirement;
+`GGML_CUDA_MIXED_AR_DUPLEX_PARTS=n` overlaps publication;
+`GGML_CUDA_MIXED_AR_DUPLEX_NOAUX=1` is the control that separates partitioning
+from overlap; `GGML_CUDA_MIXED_AR_VERIFY=1` compares every collective against the
+flat kernel elementwise; `GGML_CUDA_MIXED_AR_RS_BLOCKS=n` sets the
+reduce-scatter's grid without touching the small path decode runs on.
