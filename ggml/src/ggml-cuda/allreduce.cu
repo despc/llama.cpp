@@ -1416,8 +1416,17 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
     // the tail is shorter than a vector; it belongs to the last shard's owner
     const bool owns_tail = rank == n_ranks - 1;
 
-    // 1. publish the whole contribution
+    // 1. publish the contribution -- except this rank's own shard, which nobody
+    //    reads.  A peer reducing shard p reads this slot at region p, never at
+    //    region `rank`, and this rank takes its own values from sendbuf; the region
+    //    is then overwritten with the total in phase 2.  Publishing it was a full
+    //    copy of w*N across the link for no reader.
+    const int mine_lo = shard_lo(rank);
+    const int mine_hi = shard_lo(rank + 1);
     for (int i = gtid; i < count_vec; i += gnt) {
+        if (i >= mine_lo && i < mine_hi) {
+            continue;
+        }
         const int off = i * ELEMS_PER_VEC;
         T wire[ELEMS_PER_VEC];
 #pragma unroll
@@ -1426,7 +1435,8 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         }
         ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
     }
-    if (bid == 0 && tid < count - tail) {
+    // the tail belongs to the last shard's owner, so only the others publish it
+    if (!owns_tail && bid == 0 && tid < count - tail) {
         host_mine[tail + tid] = contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f);
     }
 

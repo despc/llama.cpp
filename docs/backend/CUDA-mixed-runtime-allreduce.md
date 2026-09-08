@@ -1386,11 +1386,15 @@ Gen3 x4 at 3.3 GB/s against the Blackwells' 7.15.
 what retired the streamed publish-to-reduce overlap after it had been started:
 overlap converts waiting into work, and there is no waiting here.
 
-**Publish and gather together are 63%, and both are pure transfer.** Publication
-cannot be reduced at all -- every element is reduced by one owner who needs every
-rank's contribution, so all of N must cross. Gather shrinks only by owning a
-larger share, which grows the reduce; that trade is what 35/35/15/15 was measured
-to balance.
+**Publish and gather together are 63%, and both are pure transfer.**
+
+This section first said publication could not be reduced at all, because every
+element is reduced by one owner who needs every rank's contribution. That is true
+of the *other* ranks' contributions and was wrong about a rank's own: a peer
+reducing shard p reads this rank's slot at region p, never at region `rank`, and
+the owner takes its own values from `sendbuf`. Nobody ever read the region a rank
+published for its own shard, and it was then overwritten with the total. It is no
+longer published -- see below.
 
 Kernel work is 12% of the wall, so there is nothing left to win there. What
 remains is bytes on the link, and the three routes to fewer of them are
@@ -1405,3 +1409,48 @@ and two cards sit on x4 whichever pair they are -- but Teslas on the x8 ports
 together with Gen4 on the x4 ports would remove that floor and is worth 1.84x on
 the collective by the same model. Whether those ports can run Gen4 is a firmware
 question, not a software one.
+
+### A rank no longer publishes its own shard, 2026-09-08
+
+Phase 1 used to write the whole contribution to host memory. The region covering
+a rank's own shard had no reader: peers reducing shard p read that rank's slot at
+region p, the owner reads its own values from `sendbuf`, and phase 2 overwrites
+the region with the total anyway. It was `w*N` crossing the link for nobody.
+
+Skipping it costs nothing in arithmetic -- no value moves and no sum changes -- and
+the tail follows the same rule, published by everyone except the rank that owns
+it.
+
+Prefill went 391.3 to 411.6 tokens/s at unchanged shares, and the curve was
+re-swept because the balance moves when a phase changes:
+
+| shares | t/s | | shares | t/s |
+| --- | ---: | --- | --- | ---: |
+| 20/20/30/30 | 392.1 | | 30/30/20/20 | 408.6 |
+| 25/25/25/25 | 400.3 | | 35/35/15/15 | 411.6 |
+| 40/40/10/10 | 387.2 | | **35/35/17/13** | **413.7** |
+
+The optimum stayed at the same place and the whole curve rose. Splitting the two
+Teslas unevenly is worth a further 0.6%, small but reproducible to a tenth of a
+token per second across interleaved runs -- the deployment takes 35/35/17/13.
+
+Every setting returns the same output hash as the meta backend, which is what
+establishes that the skipped region really had no reader: had anything consumed
+it, the sums would have been short a contribution and the hash would have moved.
+
+Total against where the 27B started this session: **241 -> 414 tokens/s** of
+prefill, all of it bit-identical to the reference reduction.
+
+### Still open
+
+Two things the review raised that are not done. Whether the link can carry both
+directions at once has not been measured: the phase profile shows only 2.7% of
+waiting, which says there is no idle time to overlap into, but it does not say
+whether sending the next chunk while receiving the previous one is faster than
+doing them in sequence. That needs a transport probe at the real sizes with all
+four cards active, not the sequential 128 MiB copies the P2P probe does. The
+historical duplex result is suggestive but was measured on the compressed path
+and its numbers do not transfer.
+
+And the shares will want re-measuring again after any further change to the
+transport, for the same reason they moved here.
