@@ -1828,3 +1828,30 @@ overlap requires cutting the collective into parts, and on ranks 1.7x apart each
 part costs more in synchronisation than the overlap returns. That arithmetic does
 not improve with a cleverer kernel -- three were written -- it improves only if
 the ranks stop being uneven. Do not start here again without that having changed.
+
+## Per-layer participation, 2026-09-09
+
+The collective was finished as transport: every phase saturated its direction and
+the only unused resource cost more to reach than it returned. What was left was
+not moving the same bytes faster but moving fewer of them, and that meant asking
+who has to take part in each layer at all.
+
+Four cards of two speeds do not want the same shape everywhere. The Blackwell
+pair reduces a layer between themselves far faster than four cards can; the
+Teslas are worth more as owners of whole layers -- holding weights and KV the
+Blackwells have no room for -- than as participants in every reduction. The
+split state applied one `--tensor-split` to every tensor, so neither was
+expressible.
+
+It came in three parts, and only the third and second together paid.
+
+**Placement.** `llama_meta_device_get_split_state` already knows the layer;
+making the per-device share a function of it is a few lines. `LLAMA_META_TP`
+names the devices that share an unowned layer, `LLAMA_META_OWN` the layers a
+device or a set owns outright. A device with no share gets a zero-length slice,
+and the meta backend already clears that node's compute flag and zeroes its
+contribution, so nothing about what an operation means had to change.
+
+**On its own it was worth nothing, and the measurement says why.** With 40 layers
+on the Blackwell pair and 25 owned by the Teslas, the collective still ran 384
+time

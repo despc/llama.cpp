@@ -2449,6 +2449,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     auto & bcj = backend_ctx->backend_configs[j];
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+
+                    // Does this device need the result at all?  It does if it
+                    // computes anything in the next subgraph.  If it does not,
+                    // the next collective rewrites its copy before anything reads
+                    // it, so fetching this one moves bytes nobody looks at.  On a
+                    // split where one card owns a few layers that is most of its
+                    // inbound traffic.
+                    ggml_cgraph * cgraph_next = bcj.cgraphs[i + 1].cgraph_main;
+                    bool needed = false;
+                    for (int k = 0; k < cgraph_next->n_nodes && !needed; k++) {
+                        needed = (cgraph_next->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                    }
+                    if (needed) {
+                        nodes.back()->flags |= GGML_TENSOR_FLAG_NEEDED;
+                    } else {
+                        nodes.back()->flags &= ~GGML_TENSOR_FLAG_NEEDED;
+                    }
                 }
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
             }

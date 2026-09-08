@@ -667,6 +667,12 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // ...is needed by the device it lives on.  Set by the meta backend on the
+        // node a collective produces, from whether that device computes anything
+        // in the next subgraph.  A device that computes nothing there has its copy
+        // rewritten by the next collective anyway, so fetching this one is pure
+        // traffic -- which on a four-card split is most of what crosses the link.
+        GGML_TENSOR_FLAG_NEEDED  = 32,
     };
 
     enum ggml_tri_type {

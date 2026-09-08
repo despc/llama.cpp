@@ -380,7 +380,10 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 // reduction.
 //
 // LLAMA_META_TP     which devices share the layers nobody owns outright, e.g. "0,1"
-// LLAMA_META_OWN    layers owned whole by one device, e.g. "8-11:2,20-23:3"
+// LLAMA_META_OWN    layers owned by a named set, e.g. "8-11:2,20-23:3" for one
+//                   device each, or "8-11:2+3" for a pair to share them -- which
+//                   halves that stage's compute at the cost of a collective
+//                   between the two, and is worth measuring either way
 //
 // Unset leaves the behaviour exactly as before.  A device with no share of a
 // tensor gets a zero-length slice, which is what makes this expressible without
@@ -388,7 +391,7 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct llama_meta_participation {
     bool                 active = false;
     std::vector<bool>    tp;        // devices sharing an unowned layer
-    std::vector<int>     owner;     // per layer, -1 when unowned
+    std::vector<uint32_t> owner;    // per layer, device bitmask, 0 when unowned
 };
 
 static const llama_meta_participation & llama_meta_get_participation(size_t n_devices, uint32_t n_layer) {
@@ -399,7 +402,7 @@ static const llama_meta_participation & llama_meta_get_participation(size_t n_de
     }
     parsed = true;
     p.tp.assign(n_devices, true);
-    p.owner.assign(n_layer, -1);
+    p.owner.assign(n_layer, 0u);
 
     const char * tp_spec = getenv("LLAMA_META_TP");
     if (tp_spec && *tp_spec) {
@@ -429,14 +432,28 @@ static const llama_meta_participation & llama_meta_get_participation(size_t n_de
             const std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
             const size_t colon = item.find(':');
             if (colon != std::string::npos) {
-                const int dev = atoi(item.substr(colon + 1).c_str());
+                // one device, or several joined by '+' to share the layer
+                uint32_t devs = 0;
+                const std::string dev_spec = item.substr(colon + 1);
+                size_t dp = 0;
+                while (dp <= dev_spec.size()) {
+                    const size_t plus = dev_spec.find('+', dp);
+                    const int d = atoi(dev_spec.substr(dp, plus == std::string::npos ? std::string::npos : plus - dp).c_str());
+                    if (d >= 0 && (size_t) d < n_devices) {
+                        devs |= 1u << d;
+                    }
+                    if (plus == std::string::npos) {
+                        break;
+                    }
+                    dp = plus + 1;
+                }
                 const std::string range = item.substr(0, colon);
                 const size_t dash = range.find('-');
                 const int lo = atoi(range.substr(0, dash).c_str());
                 const int hi = dash == std::string::npos ? lo : atoi(range.substr(dash + 1).c_str());
                 for (int il = lo; il <= hi && il < (int) n_layer; ++il) {
-                    if (il >= 0 && dev >= 0 && (size_t) dev < n_devices) {
-                        p.owner[il] = dev;
+                    if (il >= 0 && devs != 0) {
+                        p.owner[il] = devs;
                         p.active = true;
                     }
                 }
@@ -459,7 +476,7 @@ static const llama_meta_participation & llama_meta_get_participation(size_t n_de
         for (size_t d = 0; d < n_devices; ++d) {
             std::string owned;
             for (uint32_t il = 0; il < n_layer; ++il) {
-                if (p.owner[il] == (int) d) {
+                if ((p.owner[il] >> d) & 1u) {
                     owned += (owned.empty() ? "" : ",") + std::to_string(il);
                 }
             }
@@ -898,14 +915,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // do not hold this layer, so their slice comes out empty.
         const llama_meta_participation & part = llama_meta_get_participation(ud->n_devices, hparams.n_layer());
         const bool is_layer_tensor = tensor_name.substr(0, 4) == "blk." || tensor_name.substr(0, 6) == "cache_";
-        const int owner = part.active && is_layer_tensor && tc.il < part.owner.size() ? part.owner[tc.il] : -1;
+        const uint32_t owner = part.active && is_layer_tensor && tc.il < part.owner.size() ? part.owner[tc.il] : 0u;
         auto share = [&](size_t d) -> float {
             const float base = tensor_split == nullptr ? 0.0f : tensor_split[d];
             if (!part.active || !is_layer_tensor) {
                 return base;
             }
-            if (owner >= 0) {
-                return d == (size_t) owner ? 1.0f : 0.0f;
+            if (owner != 0) {
+                // An owning set shares the layer evenly.  Uneven shares inside a
+                // set put the boundary where one tensor's granularity rounds it
+                // one way and another's rounds it the other, and the meta
+                // backend's consistency check catches that as a mismatch between
+                // a tensor and its axis-0 reference.
+                return ((owner >> d) & 1u) ? 1.0f : 0.0f;
             }
             return part.tp[d] ? base : 0.0f;
         };

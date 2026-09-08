@@ -1007,7 +1007,13 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
         int                         count,
         uint32_t *                  arrival_slot,
         uint32_t                    token,
-        bool                        contribute) {
+        bool                        contribute,
+        // Ranks holding a slice of this tensor.  The rest contribute exact
+        // zeros, which the butterfly folds away without changing a bit, so
+        // skipping them is the same arithmetic and less traffic.  The
+        // verification reference passes all ones so it stays independent.
+        uint32_t                    active_mask,
+        uint32_t                    needed_mask) {
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
     constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(uint32_t));
 
@@ -1020,7 +1026,9 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
     const int tail      = count_vec * ELEMS_PER_VEC;
     T * host_mine  = slot_data + (size_t) rank * rank_stride;
 
-    for (int i = gtid; i < count_vec; i += gnt) {
+    const bool i_am_active = (active_mask >> rank) & 1u;
+    const bool i_need_it   = (needed_mask >> rank) & 1u;
+    for (int i = i_am_active ? gtid : count_vec; i < count_vec; i += gnt) {
         const int off = i * ELEMS_PER_VEC;
         T wire[ELEMS_PER_VEC];
 #pragma unroll
@@ -1030,7 +1038,7 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
         }
         ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
     }
-    if (bid == 0 && tid < count - tail) {
+    if (i_am_active && bid == 0 && tid < count - tail) {
         host_mine[tail + tid] = contribute ? sendbuf[tail + tid]
                                            : ggml_cuda_cast<T>(0.0f);
     }
@@ -1046,8 +1054,8 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
         __threadfence_system();
 
         for (int peer = 0; peer < n_ranks; ++peer) {
-            if (peer == rank) {
-                continue;
+            if (peer == rank || !((active_mask >> peer) & 1u)) {
+                continue;   // publishes nothing: nothing to await
             }
             const uint32_t * peer_signal = arrival_slot +
                 ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS +
@@ -1065,38 +1073,47 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
     __syncthreads();
     __threadfence_system();
 
-    for (int i = gtid; i < count_vec; i += gnt) {
+    for (int i = i_need_it ? gtid : count_vec; i < count_vec; i += gnt) {
         const int off = i * ELEMS_PER_VEC;
         T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
+        int n_act = 0;
         for (int peer = 0; peer < n_ranks; ++peer) {
+            if (!((active_mask >> peer) & 1u)) {
+                continue;
+            }
             if (peer == rank) {
 #pragma unroll
                 for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                    wire[peer][k] = contribute ? sendbuf[off + k]
-                                               : ggml_cuda_cast<T>(0.0f);
+                    wire[n_act][k] = contribute ? sendbuf[off + k]
+                                                : ggml_cuda_cast<T>(0.0f);
                 }
             } else {
                 const T * host_peer = slot_data + (size_t) peer * rank_stride;
-                ggml_cuda_memcpy_1<sizeof(wire[peer])>(wire[peer], &host_peer[off]);
+                ggml_cuda_memcpy_1<sizeof(wire[n_act])>(wire[n_act], &host_peer[off]);
             }
+            ++n_act;
         }
 #pragma unroll
         for (int k = 0; k < ELEMS_PER_VEC; ++k) {
             T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
-            for (int peer = 0; peer < n_ranks; ++peer) {
+            for (int peer = 0; peer < n_act; ++peer) {
                 v[peer] = wire[peer][k];
             }
-            recvbuf[off + k] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+            recvbuf[off + k] = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
         }
     }
-    if (bid == 0 && tid < count - tail) {
+    if (i_need_it && bid == 0 && tid < count - tail) {
         T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+        int n_act = 0;
         for (int peer = 0; peer < n_ranks; ++peer) {
-            v[peer] = peer == rank
+            if (!((active_mask >> peer) & 1u)) {
+                continue;
+            }
+            v[n_act++] = peer == rank
                 ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
                 : (slot_data + (size_t) peer * rank_stride)[tail + tid];
         }
-        recvbuf[tail + tid] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+        recvbuf[tail + tid] = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
     }
 }
 
@@ -1378,6 +1395,20 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         uint32_t                    token,
         bool                        contribute,
         ggml_cuda_ar_shards         shards,
+        // Which ranks hold a slice of this tensor.  A rank whose slice is empty
+        // contributes exact zeros, and adding an exact zero changes no sum, so
+        // leaving it out is bit-identical to summing it in -- which is what makes
+        // this safe to do at all.  It must not publish, must own no shard, and
+        // must not be waited for; it still needs the result, so it still gathers.
+        uint32_t                    active_mask,
+        // Ranks that will actually read this result.  One that computes nothing
+        // in the next subgraph has its copy rewritten by the next collective
+        // before anything looks at it, so gathering here moves bytes nobody
+        // reads -- on a split where a card owns a few layers, most of its
+        // inbound traffic.  It still publishes and still reduces its own shard:
+        // other ranks need those.
+        uint32_t                    needed_mask,
+        int                         tail_owner,
         ggml_cuda_ar_phase_acc *    acc) {
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
     constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(uint32_t));
@@ -1414,8 +1445,11 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         return total ? (int) ((int64_t) shards.cum[r] * count_vec / (int64_t) total) : 0;
     };
 
-    // the tail is shorter than a vector; it belongs to the last shard's owner
-    const bool owns_tail = rank == n_ranks - 1;
+    // the tail is shorter than a vector; it belongs to the last shard's owner,
+    // which is the highest active rank rather than the highest rank
+    const bool owns_tail = rank == tail_owner;
+    const bool i_am_active = (active_mask >> rank) & 1u;
+    const bool i_need_it   = (needed_mask >> rank) & 1u;
 
     // 1. publish the contribution -- except this rank's own shard, which nobody
     //    reads.  A peer reducing shard p reads this slot at region p, never at
@@ -1424,7 +1458,7 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
     //    copy of w*N across the link for no reader.
     const int mine_lo = shard_lo(rank);
     const int mine_hi = shard_lo(rank + 1);
-    for (int i = gtid; i < count_vec; i += gnt) {
+    for (int i = i_am_active ? gtid : count_vec; i < count_vec; i += gnt) {
         if (i >= mine_lo && i < mine_hi) {
             continue;
         }
@@ -1436,11 +1470,15 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         }
         ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
     }
-    // the tail belongs to the last shard's owner, so only the others publish it
-    if (!owns_tail && bid == 0 && tid < count - tail) {
+    // the tail belongs to the last shard's owner, so only the other active
+    // ranks publish it
+    if (i_am_active && !owns_tail && bid == 0 && tid < count - tail) {
         host_mine[tail + tid] = contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f);
     }
 
+    // Only active ranks publish and only active ranks own a shard, so only they
+    // are worth waiting for.  Everyone still signals: an inactive rank costs one
+    // word and saves the branch on the reading side.
     auto barrier = [&](int word) {
         __threadfence_system();
         __syncthreads();
@@ -1456,6 +1494,9 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
             // at once, which group_init checks against this kernel's occupancy
             // rather than asserting from the grid being small.
             for (int peer = 0; peer < n_ranks; ++peer) {
+                if (peer != rank && !((active_mask >> peer) & 1u)) {
+                    continue;   // publishes nothing, owns nothing: nothing to await
+                }
                 for (int b = 0; b < (int) gridDim.x; ++b) {
                     if (peer == rank && b == bid) {
                         continue;
@@ -1487,37 +1528,49 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
     for (int i = shard_lo(rank) + gtid; i < shard_lo(rank + 1); i += gnt) {
         const int off = i * ELEMS_PER_VEC;
         T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
+        // Compacted to the ranks that published.  The ones left out contributed
+        // exact zeros, and the butterfly folds an exact zero away without
+        // changing a bit, so the sum is the same one the full tree produces.
+        int n_act = 0;
         for (int peer = 0; peer < n_ranks; ++peer) {
+            if (!((active_mask >> peer) & 1u)) {
+                continue;
+            }
             if (peer == rank) {
 #pragma unroll
                 for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                    wire[peer][k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
+                    wire[n_act][k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
                 }
             } else {
                 const T * host_peer = slot_data + (size_t) peer * rank_stride;
-                ggml_cuda_memcpy_1<sizeof(wire[peer])>(wire[peer], &host_peer[off]);
+                ggml_cuda_memcpy_1<sizeof(wire[n_act])>(wire[n_act], &host_peer[off]);
             }
+            ++n_act;
         }
         T out[ELEMS_PER_VEC];
 #pragma unroll
         for (int k = 0; k < ELEMS_PER_VEC; ++k) {
             T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
-            for (int peer = 0; peer < n_ranks; ++peer) {
+            for (int peer = 0; peer < n_act; ++peer) {
                 v[peer] = wire[peer][k];
             }
-            out[k] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+            out[k] = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
             recvbuf[off + k] = out[k];
         }
         ggml_cuda_memcpy_1<sizeof(out)>(&host_mine[off], out);
     }
     if (owns_tail && bid == 0 && tid < count - tail) {
         T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+        int n_act = 0;
         for (int peer = 0; peer < n_ranks; ++peer) {
-            v[peer] = peer == rank
+            if (!((active_mask >> peer) & 1u)) {
+                continue;
+            }
+            v[n_act++] = peer == rank
                 ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
                 : (slot_data + (size_t) peer * rank_stride)[tail + tid];
         }
-        const T total = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+        const T total = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
         recvbuf[tail + tid] = total;
         host_mine[tail + tid] = total;
     }
@@ -1527,8 +1580,9 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
     barrier(GGML_CUDA_MIXED_AR_SIG_RS_REDUCED);
     phase(&ggml_cuda_ar_phase_acc::wait_red);
 
-    // 3. collect the shards this rank did not reduce
-    for (int peer = 0; peer < n_ranks; ++peer) {
+    // 3. collect the shards this rank did not reduce -- unless nothing here will
+    //    read them
+    for (int peer = 0; i_need_it && peer < n_ranks; ++peer) {
         if (peer == rank) {
             continue;
         }
@@ -1543,9 +1597,9 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
             }
         }
     }
-    if (!owns_tail && bid == 0 && tid < count - tail) {
+    if (i_need_it && !owns_tail && bid == 0 && tid < count - tail) {
         recvbuf[tail + tid] =
-            (slot_data + (size_t) (n_ranks - 1) * rank_stride)[tail + tid];
+            (slot_data + (size_t) tail_owner * rank_stride)[tail + tid];
     }
 
     phase(&ggml_cuda_ar_phase_acc::gather);
@@ -1920,7 +1974,8 @@ template <typename T>
 static void ggml_cuda_mixed_ar_launch(
         ggml_cuda_mixed_ar_group * group, size_t i, int rank, ggml_tensor * tensor,
         void * slot_data_v, uint32_t * arrival_slot, uint32_t token, bool contribute,
-        const ggml_cuda_ar_shards & shards, ggml_cuda_ar_phase_acc * acc,
+        const ggml_cuda_ar_shards & shards, uint32_t active_mask, uint32_t needed_mask,
+        int tail_owner, ggml_cuda_ar_phase_acc * acc,
         cudaStream_t stream, bool use_rs, bool use_stream, int stream_chunk,
         size_t rank_stride, int ne) {
     const int n_ranks = (int) group->n_ranks;
@@ -1938,7 +1993,7 @@ static void ggml_cuda_mixed_ar_launch(
         if (use_rs) {
             ggml_cuda_mixed_ar_rs_kernel<T><<<big, 256, 0, stream>>>(
                 data, data, slot_data, rank, n_ranks, rank_stride, ne,
-                arrival_slot, token, contribute, shards, acc);
+                arrival_slot, token, contribute, shards, active_mask, needed_mask, tail_owner, acc);
         } else if (use_stream) {
             ggml_cuda_mixed_ar_stream_kernel<T><<<small, 256, 0, stream>>>(
                 data, data, slot_data, rank, n_ranks, rank_stride, ne,
@@ -1946,7 +2001,7 @@ static void ggml_cuda_mixed_ar_launch(
         } else {
             ggml_cuda_mixed_ar_kernel<T><<<small, 256, 0, stream>>>(
                 data, data, slot_data, rank, n_ranks, rank_stride, ne,
-                arrival_slot, token, contribute);
+                arrival_slot, token, contribute, active_mask, needed_mask);
         }
     };
 
@@ -1966,9 +2021,21 @@ static void ggml_cuda_mixed_ar_launch(
     meet(GGML_CUDA_MIXED_AR_SIG_VERIFY_A);
     CUDA_CHECK(cudaMemcpyAsync(group->verify_out[i], data, nbytes, cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(data, group->verify_in[i], nbytes, cudaMemcpyDeviceToDevice, stream));
+    // Every rank whole, whatever the mask says: the reference has to be
+    // independent of the thing it is checking.
+    //
+    // And a different token, which is not cosmetic.  When the path under test is
+    // the flat kernel too -- which it is during decode -- the reference would
+    // otherwise reuse the arrival word the tested call already set, so its
+    // barrier would pass without waiting and it would read whatever the slot
+    // happened to hold.  With everyone publishing the same bytes that was
+    // invisible; with a mask, a rank that published nothing leaves the previous
+    // call's data there and the reference reads it.
     ggml_cuda_mixed_ar_kernel<T><<<small, 256, 0, stream>>>(
         data, data, slot_data, rank, n_ranks, rank_stride, ne,
-        arrival_slot, token, contribute);
+        arrival_slot, token ^ 0x80000000u, contribute,
+        n_ranks >= 32 ? ~0u : ((1u << n_ranks) - 1),
+        n_ranks >= 32 ? ~0u : ((1u << n_ranks) - 1));
     meet(GGML_CUDA_MIXED_AR_SIG_VERIFY_B);
     ggml_cuda_mixed_ar_cmp_kernel<T><<<64, 256, 0, stream>>>(
         reinterpret_cast<const T *>(group->verify_out[i]), data, ne, group->verify_counters[i]);
@@ -2015,13 +2082,49 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         uint32_t * arrival_slot = reinterpret_cast<uint32_t *>(base + group->data_bytes +
             slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE);
 
-        // Cumulative weights; the kernel divides the vector count by them.
+        // Which ranks hold a slice of this tensor.  Derived from the same
+        // per-rank flags in both runtimes, so both reach the same mask; a rank
+        // with an empty slice contributes exact zeros, so leaving it out of the
+        // reduction is bit-identical to summing it in.
+        uint32_t active_mask = 0;
+        for (size_t r = 0; r < group->n_ranks; ++r) {
+            if (tensors[r] && (tensors[r]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                active_mask |= 1u << r;
+            }
+        }
+        // Nothing to reduce and no owner to gather from; let every rank behave as
+        // it did before rather than inventing a meaning for it.
+        if (active_mask == 0) {
+            active_mask = (group->n_ranks >= 32) ? ~0u : ((1u << group->n_ranks) - 1);
+        }
+        // Who will read the result.  Under verification everyone does: the
+        // reference writes the whole result everywhere, so a rank that skipped
+        // the gather would show up as a difference that is not one.
+        uint32_t needed_mask = 0;
+        for (size_t r = 0; r < group->n_ranks; ++r) {
+            if (tensors[r] && (tensors[r]->flags & GGML_TENSOR_FLAG_NEEDED)) {
+                needed_mask |= 1u << r;
+            }
+        }
+        if (needed_mask == 0 || group->verify) {
+            needed_mask = (group->n_ranks >= 32) ? ~0u : ((1u << group->n_ranks) - 1);
+        }
+        int tail_owner = 0;
+        for (size_t r = 0; r < group->n_ranks; ++r) {
+            if ((active_mask >> r) & 1u) {
+                tail_owner = (int) r;
+            }
+        }
+        // Cumulative weights; the kernel divides the vector count by them.  An
+        // inactive rank owns nothing, so the shards fall to those that do.
         ggml_cuda_ar_shards shards = {};
         {
             uint32_t cum = 0;
             for (size_t r = 0; r < group->n_ranks; ++r) {
                 shards.cum[r] = cum;
-                cum += group->shard_weight[r] ? group->shard_weight[r] : 1;
+                if ((active_mask >> r) & 1u) {
+                    cum += group->shard_weight[r] ? group->shard_weight[r] : 1;
+                }
             }
             shards.cum[group->n_ranks] = cum;
         }
@@ -2029,18 +2132,18 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         switch (tensor->type) {
             case GGML_TYPE_F32:
                 ggml_cuda_mixed_ar_launch<float>(group, i, rank, tensor, slot_data,
-                    arrival_slot, token, contribute, shards, acc, stream,
-                    use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
+                    arrival_slot, token, contribute, shards, active_mask, needed_mask,
+                    tail_owner, acc, stream, use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
                 break;
             case GGML_TYPE_F16:
                 ggml_cuda_mixed_ar_launch<half>(group, i, rank, tensor, slot_data,
-                    arrival_slot, token, contribute, shards, acc, stream,
-                    use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
+                    arrival_slot, token, contribute, shards, active_mask, needed_mask,
+                    tail_owner, acc, stream, use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
                 break;
             case GGML_TYPE_BF16:
                 ggml_cuda_mixed_ar_launch<nv_bfloat16>(group, i, rank, tensor, slot_data,
-                    arrival_slot, token, contribute, shards, acc, stream,
-                    use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
+                    arrival_slot, token, contribute, shards, active_mask, needed_mask,
+                    tail_owner, acc, stream, use_rs, use_stream, stream_chunk, rank_stride, (int) ne);
                 break;
             default: return false;
         }
