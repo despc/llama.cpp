@@ -75,7 +75,6 @@
 #include <array>
 #include <atomic>
 #include <charconv>
-#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -89,7 +88,6 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
-#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -985,25 +983,6 @@ struct ggml_backend_cuda_mixed_ar_group {
     ggml_cuda_mixed_ar_group_free_t free = nullptr;
     ggml_cuda_mixed_ar_group_prepare_t prepare = nullptr;
     ggml_cuda_mixed_ar_group_enqueue_t enqueue = nullptr;
-    ggml_cuda_mixed_ar_group_enqueue_hier_t enqueue_hier = nullptr;
-    ggml_cuda_mixed_ar_group_profile_collect_t profile_collect = nullptr;
-    std::vector<int> ranks;
-    uint64_t cpu_prepare_calls = 0;
-    uint64_t cpu_enqueue_calls = 0;
-    double cpu_prepare_ms = 0.0;
-    double cpu_enqueue_ms = 0.0;
-    double cpu_prepare_max_ms = 0.0;
-    double cpu_enqueue_max_ms = 0.0;
-};
-
-struct ggml_backend_cuda_mixed_ar_profile_accum {
-    uint64_t calls = 0;
-    uint64_t wire_bytes = 0;
-    double local_ms = 0.0;
-    double total_ms = 0.0;
-    double publish_ms = 0.0;
-    double wait_ms = 0.0;
-    double reduce_ms = 0.0;
 };
 
 struct ggml_backend_cuda_comm_context {
@@ -1012,9 +991,9 @@ struct ggml_backend_cuda_comm_context {
     std::vector<ggml_backend_t> backends;
     std::vector<int>            dev_ids;
 
-    // Set by the init chain (comm_init_{nccl, internal, none}) to one of
-    // try_allreduce_{nccl, internal, butterfly}.  nccl needs `comms`,
-    // internal needs `ar_pipeline`, butterfly needs nothing.  Per-call
+    // Set by comm_init_{nccl, internal, mixed, none}. NCCL needs `comms`,
+    // internal needs `ar_pipeline`, mixed needs `mixed_groups`.
+    // The meta-backend fallback needs no CUDA communication resources. Per-call
     // failures return false; the meta backend's generic implementation then
     // handles that call.
     try_allreduce_fn            try_allreduce = nullptr;
@@ -1022,95 +1001,33 @@ struct ggml_backend_cuda_comm_context {
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
     std::vector<ggml_backend_cuda_mixed_ar_group> mixed_groups;
-    void *                     mixed_host = nullptr;
-    size_t                     mixed_host_bytes = 0;
-    size_t                     mixed_bf16_threshold = 1;
-    bool                       mixed_hierarchical = false;
-    bool                       mixed_device_slots = true;
-    uint64_t                   mixed_call_count = 0;
-    size_t                     mixed_hier_threshold = 1024 * 1024;
-    int                        mixed_profile_level = 0;
-    bool                       mixed_cpu_profile = false;
-    ggml_backend_cuda_mixed_ar_profile_accum mixed_profile_critical;
-    std::array<ggml_backend_cuda_mixed_ar_profile_accum, GGML_CUDA_MAX_DEVICES> mixed_profile_ranks = {};
-    std::map<size_t, ggml_backend_cuda_mixed_ar_profile_accum> mixed_profile_sizes;
+    void * mixed_host = nullptr;
+    uint32_t mixed_call_count = 0;
+
+    void clear_mixed() {
+        for (auto & group : mixed_groups) {
+            group.free(group.context);
+        }
+        mixed_groups.clear();
+        if (mixed_host) {
+            ggml_aligned_free(mixed_host, GGML_CUDA_MIXED_AR_SLOTS * backends.size() *
+                (GGML_CUDA_MIXED_AR_RANK_BYTES + GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE));
+            mixed_host = nullptr;
+        }
+    }
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
-    void clear_mixed() {
-        if (mixed_profile_critical.calls > 0) {
-            const auto & total = mixed_profile_critical;
-            const double accounted = total.local_ms + total.publish_ms + total.wait_ms + total.reduce_ms;
-            GGML_LOG_WARN("mixed_ar_profile summary: calls=%" PRIu64 " wire=%.2f MiB critical=%.3f ms "
-                          "local=%.3f publish=%.3f wait=%.3f read_add=%.3f other=%.3f\n",
-                          total.calls, total.wire_bytes / (1024.0 * 1024.0), total.total_ms,
-                          total.local_ms, total.publish_ms, total.wait_ms, total.reduce_ms,
-                          total.total_ms - accounted);
-            for (size_t rank = 0; rank < mixed_profile_ranks.size(); ++rank) {
-                const auto & acc = mixed_profile_ranks[rank];
-                if (acc.calls == 0) {
-                    continue;
-                }
-                GGML_LOG_WARN("mixed_ar_profile rank=%zu calls=%" PRIu64 " total=%.3f ms "
-                              "local=%.3f publish=%.3f wait=%.3f read_add=%.3f\n",
-                              rank, acc.calls, acc.total_ms, acc.local_ms,
-                              acc.publish_ms, acc.wait_ms, acc.reduce_ms);
-            }
-            for (const auto & item : mixed_profile_sizes) {
-                const auto & acc = item.second;
-                GGML_LOG_WARN("mixed_ar_profile size=%zu bytes calls=%" PRIu64 " critical=%.3f ms "
-                              "local=%.3f publish=%.3f wait=%.3f read_add=%.3f\n",
-                              item.first, acc.calls, acc.total_ms, acc.local_ms,
-                              acc.publish_ms, acc.wait_ms, acc.reduce_ms);
-            }
-        }
-        if (mixed_cpu_profile) {
-            for (const auto & group : mixed_groups) {
-                std::string rank_list;
-                for (int rank : group.ranks) {
-                    if (!rank_list.empty()) {
-                        rank_list += ',';
-                    }
-                    rank_list += std::to_string(rank);
-                }
-                GGML_LOG_WARN("mixed_ar_cpu_profile ranks=[%s] prepare=%" PRIu64 "/%.3f ms (max %.3f) "
-                              "enqueue=%" PRIu64 "/%.3f ms (max %.3f)\n",
-                              rank_list.c_str(), group.cpu_prepare_calls, group.cpu_prepare_ms,
-                              group.cpu_prepare_max_ms, group.cpu_enqueue_calls, group.cpu_enqueue_ms,
-                              group.cpu_enqueue_max_ms);
-            }
-        }
-        for (auto & group : mixed_groups) {
-            if (group.context && group.free) {
-                group.free(group.context);
-            }
-        }
-        mixed_groups.clear();
-        if (mixed_host) {
-            ggml_aligned_free(mixed_host, mixed_host_bytes);
-            mixed_host = nullptr;
-        }
-        mixed_host_bytes = 0;
-        mixed_call_count = 0;
-        mixed_hierarchical = false;
-        mixed_device_slots = true;
-        mixed_profile_level = 0;
-        mixed_cpu_profile = false;
-        mixed_profile_critical = {};
-        mixed_profile_ranks = {};
-        mixed_profile_sizes.clear();
-    }
-
     ~ggml_backend_cuda_comm_context() {
+        clear_mixed();
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
-        clear_mixed();
     }
 };
 
@@ -1240,136 +1157,6 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);
 }
 
-static bool ggml_backend_cuda_comm_allreduce_mixed(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends >= 2);
-    GGML_ASSERT(!comm_ctx->mixed_groups.empty());
-
-    if (!tensors[0]) {
-        return false;
-    }
-    const int64_t ne = ggml_nelements(tensors[0]);
-    const ggml_type type = tensors[0]->type;
-    if (ne == 0) {
-        return true;
-    }
-    if (ne > std::numeric_limits<int>::max() ||
-        (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16)) {
-        return false;
-    }
-
-    for (size_t i = 0; i < n_backends; ++i) {
-        if (!tensors[i] || ggml_nelements(tensors[i]) != ne || tensors[i]->type != type ||
-            !ggml_is_contiguously_allocated(tensors[i])) {
-            return false;
-        }
-    }
-
-    const bool use_bf16 = type == GGML_TYPE_F32 && comm_ctx->mixed_bf16_threshold > 0 &&
-        ggml_nbytes(tensors[0]) >= comm_ctx->mixed_bf16_threshold;
-    const size_t wire_bytes = (size_t) ne * ggml_type_size(use_bf16 ? GGML_TYPE_BF16 : type);
-    if (wire_bytes > GGML_CUDA_MIXED_AR_RANK_BYTES) {
-        return false;
-    }
-
-    const size_t slot = comm_ctx->mixed_call_count % GGML_CUDA_MIXED_AR_SLOTS;
-    if (!comm_ctx->mixed_device_slots) {
-        for (auto & group : comm_ctx->mixed_groups) {
-            const auto cpu_begin = comm_ctx->mixed_cpu_profile
-                ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            if (!group.prepare(group.context, slot)) {
-                GGML_LOG_ERROR("%s: failed waiting for mixed AllReduce slot %zu\n", __func__, slot);
-                return false;
-            }
-            if (comm_ctx->mixed_cpu_profile) {
-                const double elapsed_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - cpu_begin).count();
-                ++group.cpu_prepare_calls;
-                group.cpu_prepare_ms += elapsed_ms;
-                group.cpu_prepare_max_ms = std::max(group.cpu_prepare_max_ms, elapsed_ms);
-            }
-        }
-    }
-
-    ++comm_ctx->mixed_call_count;
-    const int token = (int) comm_ctx->mixed_call_count;
-    const bool use_hier = comm_ctx->mixed_hierarchical && wire_bytes >= comm_ctx->mixed_hier_threshold;
-    for (auto & group : comm_ctx->mixed_groups) {
-        auto enqueue = use_hier ? group.enqueue_hier : group.enqueue;
-        const auto cpu_begin = comm_ctx->mixed_cpu_profile
-            ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (!enqueue || !enqueue(group.context, tensors, slot, token, use_bf16)) {
-            GGML_ABORT("mixed AllReduce enqueue failed after dispatch began");
-        }
-        if (comm_ctx->mixed_cpu_profile) {
-            const double elapsed_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - cpu_begin).count();
-            ++group.cpu_enqueue_calls;
-            group.cpu_enqueue_ms += elapsed_ms;
-            group.cpu_enqueue_max_ms = std::max(group.cpu_enqueue_max_ms, elapsed_ms);
-        }
-    }
-
-    if (comm_ctx->mixed_profile_level > 0) {
-        std::array<ggml_cuda_mixed_ar_rank_profile, GGML_CUDA_MAX_DEVICES> entries = {};
-        std::array<bool, GGML_CUDA_MAX_DEVICES> seen = {};
-        for (auto & group : comm_ctx->mixed_groups) {
-            ggml_cuda_mixed_ar_group_profile profile = {};
-            if (!group.profile_collect || !group.profile_collect(group.context, &profile)) {
-                GGML_ABORT("mixed AllReduce profile collection failed");
-            }
-            for (size_t i = 0; i < profile.n_entries; ++i) {
-                const auto & entry = profile.entries[i];
-                if (entry.rank < 0 || entry.rank >= (int) n_backends) {
-                    GGML_ABORT("mixed AllReduce profile returned invalid rank");
-                }
-                entries[entry.rank] = entry;
-                seen[entry.rank] = true;
-            }
-        }
-
-        const ggml_cuda_mixed_ar_rank_profile * critical = nullptr;
-        for (size_t rank = 0; rank < n_backends; ++rank) {
-            if (!seen[rank]) {
-                GGML_ABORT("mixed AllReduce profile omitted a rank");
-            }
-            const auto & entry = entries[rank];
-            auto & acc = comm_ctx->mixed_profile_ranks[rank];
-            ++acc.calls;
-            acc.wire_bytes += wire_bytes;
-            acc.local_ms += entry.local_ms;
-            acc.total_ms += entry.total_ms;
-            acc.publish_ms += entry.publish_ms;
-            acc.wait_ms += entry.wait_ms;
-            acc.reduce_ms += entry.reduce_ms;
-            if (!critical || entry.total_ms > critical->total_ms) {
-                critical = &entry;
-            }
-            if (comm_ctx->mixed_profile_level >= 2) {
-                GGML_LOG_INFO("mixed_ar_profile call=%" PRIu64 " bytes=%zu rank=%zu "
-                              "total=%.3f local=%.3f publish=%.3f wait=%.3f read_add=%.3f\n",
-                              comm_ctx->mixed_call_count, wire_bytes, rank, entry.total_ms,
-                              entry.local_ms, entry.publish_ms, entry.wait_ms, entry.reduce_ms);
-            }
-        }
-
-        GGML_ASSERT(critical != nullptr);
-        auto accumulate_critical = [wire_bytes, critical](ggml_backend_cuda_mixed_ar_profile_accum & acc) {
-            ++acc.calls;
-            acc.wire_bytes += wire_bytes;
-            acc.local_ms += critical->local_ms;
-            acc.total_ms += critical->total_ms;
-            acc.publish_ms += critical->publish_ms;
-            acc.wait_ms += critical->wait_ms;
-            acc.reduce_ms += critical->reduce_ms;
-        };
-        accumulate_critical(comm_ctx->mixed_profile_critical);
-        accumulate_critical(comm_ctx->mixed_profile_sizes[wire_bytes]);
-    }
-    return true;
-}
-
 // ---------------------------------------------------------------------------
 // Per-call dispatch -- three variants, one per backend.  Each is set as
 // comm_ctx->try_allreduce by the matching init step.  Per-call failure
@@ -1386,11 +1173,6 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
-}
-
-static bool ggml_backend_cuda_comm_try_allreduce_mixed(
-        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
-    return ggml_backend_cuda_comm_allreduce_mixed(comm_ctx, tensors);
 }
 
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
@@ -1411,147 +1193,6 @@ static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {
 // ---------------------------------------------------------------------------
 static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * ret) {
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
-}
-
-static uint64_t ggml_backend_cuda_comm_env_u64(const char * name, uint64_t default_value) {
-    const char * value = getenv(name);
-    if (!value || value[0] == '\0') {
-        return default_value;
-    }
-    char * end = nullptr;
-    const unsigned long long parsed = strtoull(value, &end, 10);
-    return end != value ? (uint64_t) parsed : default_value;
-}
-
-static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * ret) {
-    const size_t n_ranks = ret->backends.size();
-    if (n_ranks < 2 || n_ranks > GGML_CUDA_MAX_DEVICES) {
-        return false;
-    }
-
-    std::map<ggml_backend_reg_t, std::vector<int>> ranks_by_registry;
-    for (size_t rank = 0; rank < n_ranks; ++rank) {
-        ggml_backend_reg_t registry = ggml_backend_dev_backend_reg(
-            ggml_backend_get_device(ret->backends[rank]));
-        ranks_by_registry[registry].push_back((int) rank);
-    }
-    ret->mixed_hierarchical = ranks_by_registry.size() == 2;
-    ret->mixed_profile_level = (int) ggml_backend_cuda_comm_env_u64("GGML_CUDA_MIXED_AR_PROFILE", 0);
-    ret->mixed_cpu_profile = ggml_backend_cuda_comm_env_u64("GGML_CUDA_MIXED_AR_CPU_PROFILE", 0) != 0;
-    ret->mixed_device_slots = ggml_backend_cuda_comm_env_u64("GGML_CUDA_MIXED_AR_DEVICE_SLOTS", 1) != 0;
-
-    const size_t data_bytes = GGML_CUDA_MIXED_AR_SLOTS * n_ranks * GGML_CUDA_MIXED_AR_RANK_BYTES;
-    const size_t arrival_offset = (data_bytes + GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1) &
-                                  ~(GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1);
-    const size_t arrival_bytes = GGML_CUDA_MIXED_AR_SLOTS * n_ranks *
-                                 GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE;
-    const size_t departure_offset = (arrival_offset + arrival_bytes + GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1) &
-                                    ~(GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1);
-    const size_t departure_bytes = arrival_bytes;
-    const size_t trace_offset = (departure_offset + departure_bytes + GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1) &
-                                ~(GGML_CUDA_MIXED_AR_SIGNAL_STRIDE - 1);
-    const size_t trace_bytes = ret->mixed_profile_level > 0
-        ? n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * sizeof(ggml_cuda_mixed_ar_trace_record)
-        : 0;
-    ret->mixed_host_bytes = trace_offset + trace_bytes;
-    ret->mixed_host = ggml_aligned_malloc(ret->mixed_host_bytes);
-    if (!ret->mixed_host) {
-        return false;
-    }
-    memset(ret->mixed_host, 0, ret->mixed_host_bytes);
-    ret->mixed_bf16_threshold = ggml_backend_cuda_comm_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
-    // Wire size at which the striped hierarchical path takes over from the flat
-    // one.  Decode's collectives are ~10 KiB and sit far below the default.
-    ret->mixed_hier_threshold = ggml_backend_cuda_comm_env_u64(
-        "GGML_CUDA_MIXED_AR_HIER_THRESHOLD", 1024 * 1024);
-
-    for (const auto & item : ranks_by_registry) {
-        ggml_backend_reg_t registry = item.first;
-        const std::vector<int> & ranks = item.second;
-        auto init = reinterpret_cast<ggml_cuda_mixed_ar_group_init_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_init"));
-        auto free = reinterpret_cast<ggml_cuda_mixed_ar_group_free_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_free"));
-        auto prepare = reinterpret_cast<ggml_cuda_mixed_ar_group_prepare_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_prepare"));
-        auto enqueue = reinterpret_cast<ggml_cuda_mixed_ar_group_enqueue_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_enqueue"));
-        auto enqueue_hier = reinterpret_cast<ggml_cuda_mixed_ar_group_enqueue_hier_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_enqueue_hier"));
-        auto profile_collect = reinterpret_cast<ggml_cuda_mixed_ar_group_profile_collect_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_profile_collect"));
-        if (!init || !free || !prepare || !enqueue || !enqueue_hier || !profile_collect) {
-            GGML_LOG_WARN("%s: backend registry %s lacks the mixed AllReduce lane API\n",
-                          __func__, ggml_backend_reg_name(registry));
-            ret->clear_mixed();
-            return false;
-        }
-
-        std::vector<ggml_backend_t> local_backends;
-        local_backends.reserve(ranks.size());
-        for (int rank : ranks) {
-            local_backends.push_back(ret->backends[rank]);
-        }
-        const int leader_rank = ranks.front();
-        int peer_leader_rank = -1;
-        if (ret->mixed_hierarchical) {
-            for (const auto & peer_item : ranks_by_registry) {
-                if (peer_item.first != registry) {
-                    peer_leader_rank = peer_item.second.front();
-                    break;
-                }
-            }
-        }
-        const ggml_cuda_mixed_ar_group_config config = {
-            GGML_CUDA_MIXED_AR_ABI_VERSION,
-            local_backends.data(),
-            ranks.data(),
-            local_backends.size(),
-            n_ranks,
-            ret->mixed_host,
-            ret->mixed_host_bytes,
-            data_bytes,
-            arrival_offset,
-            departure_offset,
-            trace_offset,
-            ret->mixed_bf16_threshold,
-            ret->mixed_profile_level > 0,
-            ret->mixed_device_slots,
-            ret->mixed_hierarchical,
-            leader_rank,
-            peer_leader_rank,
-        };
-        void * context = init(&config);
-        if (!context) {
-            GGML_LOG_WARN("%s: failed to initialize mixed AllReduce group for %s\n",
-                          __func__, ggml_backend_reg_name(registry));
-            ret->clear_mixed();
-            return false;
-        }
-        ggml_backend_cuda_mixed_ar_group group;
-        group.context = context;
-        group.free = free;
-        group.prepare = prepare;
-        group.enqueue = enqueue;
-        group.enqueue_hier = enqueue_hier;
-        group.profile_collect = profile_collect;
-        group.ranks = ranks;
-        ret->mixed_groups.push_back(std::move(group));
-    }
-
-    ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_mixed;
-    GGML_LOG_INFO("%s: initialized mapped-host mixed AllReduce: %zu ranks in %zu runtime groups, %.2f MiB shared\n",
-                  __func__, n_ranks, ret->mixed_groups.size(), ret->mixed_host_bytes / (1024.0 * 1024.0));
-    if (ret->mixed_profile_level > 0) {
-        GGML_LOG_WARN("%s: mixed AllReduce profiling enabled (level %d); each large reduction is synchronized\n",
-                      __func__, ret->mixed_profile_level);
-    }
-    if (ret->mixed_cpu_profile) {
-        GGML_LOG_WARN("%s: mixed AllReduce CPU profiling enabled\n", __func__);
-    }
-    GGML_LOG_INFO("%s: mixed AllReduce slot reuse: %s\n", __func__,
-                  ret->mixed_device_slots ? "device tokens" : "CPU events");
-    return true;
 }
 
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
@@ -1600,11 +1241,131 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
-// Top-level init.  Picks one of the three init paths based on
+static bool ggml_backend_cuda_comm_allreduce_mixed(
+        ggml_backend_cuda_comm_context * comm_ctx, ggml_tensor ** tensors) {
+    if (!tensors || !tensors[0]) {
+        return false;
+    }
+    const auto type = tensors[0]->type;
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if ((type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) ||
+        ne < 0 || (uint64_t) ne > GGML_CUDA_MIXED_AR_RANK_BYTES / ggml_type_size(type)) {
+        return false;
+    }
+    for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+        if (!tensors[i] || tensors[i]->type != type || ggml_nelements(tensors[i]) != ne ||
+            !ggml_is_contiguously_allocated(tensors[i]) || ggml_nbytes(tensors[i]) > GGML_CUDA_MIXED_AR_RANK_BYTES ||
+            (ne > 0 && !tensors[i]->data)) {
+            return false;
+        }
+    }
+    if (ne == 0) {
+        return true;
+    }
+
+    const size_t slot = comm_ctx->mixed_call_count % GGML_CUDA_MIXED_AR_SLOTS;
+    // Retire all readers in all runtimes before any rank overwrites this slot.
+    for (auto & group : comm_ctx->mixed_groups) {
+        if (!group.prepare(group.context, slot)) {
+            GGML_ABORT("mixed AllReduce slot retirement failed");
+        }
+    }
+    // Equality-only tokens may wrap: the previous users of this slot are done.
+    const uint32_t token = ++comm_ctx->mixed_call_count;
+    for (auto & group : comm_ctx->mixed_groups) {
+        if (!group.enqueue(group.context, tensors, slot, token)) {
+            GGML_ABORT("mixed AllReduce enqueue failed after dispatch began");
+        }
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * ret) {
+    const size_t n_ranks = ret->backends.size();
+    if (n_ranks < 2 || n_ranks > GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    std::map<ggml_backend_reg_t, std::vector<int>> ranks_by_registry;
+    for (size_t rank = 0; rank < n_ranks; ++rank) {
+        auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(ret->backends[rank]));
+        ranks_by_registry[registry].push_back((int) rank);
+    }
+    const size_t data_bytes = GGML_CUDA_MIXED_AR_SLOTS * n_ranks * GGML_CUDA_MIXED_AR_RANK_BYTES;
+    const size_t shared_bytes = data_bytes + GGML_CUDA_MIXED_AR_SLOTS * n_ranks *
+        GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE;
+    ret->mixed_host = ggml_aligned_malloc(shared_bytes);
+    if (!ret->mixed_host) {
+        return false;
+    }
+    memset(ret->mixed_host, 0, shared_bytes);
+
+    for (const auto & item : ranks_by_registry) {
+        const auto registry = item.first;
+        const auto & ranks = item.second;
+        auto init = reinterpret_cast<ggml_cuda_mixed_ar_group_init_t>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_init"));
+        auto free = reinterpret_cast<ggml_cuda_mixed_ar_group_free_t>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_free"));
+        auto prepare = reinterpret_cast<ggml_cuda_mixed_ar_group_prepare_t>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_prepare"));
+        auto enqueue = reinterpret_cast<ggml_cuda_mixed_ar_group_enqueue_t>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_mixed_ar_group_enqueue"));
+        if (!init || !free || !prepare || !enqueue) {
+            ret->clear_mixed();
+            return false;
+        }
+        std::vector<ggml_backend_t> local_backends;
+        for (int rank : ranks) {
+            local_backends.push_back(ret->backends[rank]);
+        }
+        const ggml_cuda_mixed_ar_group_config config = {
+            GGML_CUDA_MIXED_AR_ABI_VERSION,
+            local_backends.data(), ranks.data(), local_backends.size(), n_ranks,
+            ret->mixed_host, shared_bytes, data_bytes,
+            GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
+            GGML_CUDA_MIXED_AR_BLOCKS, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
+        };
+        void * context = init(&config);
+        if (!context) {
+            GGML_LOG_WARN("%s: mixed AllReduce unavailable or ABI mismatch in %s\n",
+                          __func__, ggml_backend_reg_name(registry));
+            ret->clear_mixed();
+            return false;
+        }
+        ret->mixed_groups.push_back({context, free, prepare, enqueue});
+    }
+    ret->try_allreduce = ggml_backend_cuda_comm_allreduce_mixed;
+    GGML_LOG_INFO("%s: mixed AllReduce enabled: %zu ranks, native tensor wire (no compression), event-protected slots\n",
+                  __func__, n_ranks);
+    return true;
+}
+
+// Top-level init.  Picks one of the supported init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
-// any fallback.  Unrecognised env values warn and fall through to the
-// platform default.
+// any fallback. Unrecognised env values select the meta-backend fallback.
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    const char * env = getenv("GGML_CUDA_ALLREDUCE");
+    // Mixed AllReduce is opt-in, including on systems with separate drivers.
+    if (env && std::string(env) == "mixed") {
+        auto * ret = new ggml_backend_cuda_comm_context;
+        ret->backends.assign(backends, backends + n_backends);
+        if (!ggml_backend_cuda_comm_init_mixed(ret)) {
+            GGML_LOG_WARN("mixed AllReduce initialization failed; using meta-backend AllReduce\n");
+            ggml_backend_cuda_comm_init_none(ret);
+        }
+        return ret;
+    }
+    // CUDA registries can use separate drivers despite sharing the CUDA GUID.
+    // Let the meta backend reduce across registries without wire conversion.
+    if (n_backends > 1) {
+        const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[0]));
+        for (size_t i = 1; i < n_backends; ++i) {
+            if (ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i])) != registry) {
+                GGML_LOG_INFO("%s: separate CUDA runtimes; using meta-backend AllReduce\n", __func__);
+                return nullptr;
+            }
+        }
+    }
     for (size_t i = 0; i < n_backends; i++) {
         if (!ggml_backend_is_cuda(backends[i])) {
             return nullptr;
@@ -1613,31 +1374,6 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
 
     auto * ret = new ggml_backend_cuda_comm_context;
     ret->backends.assign(backends, backends + n_backends);
-
-    std::set<ggml_backend_reg_t> registries;
-    for (size_t i = 0; i < n_backends; ++i) {
-        registries.insert(ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[i])));
-    }
-
-    const char * env = getenv("GGML_CUDA_ALLREDUCE");
-    const bool request_mixed = (env && std::string(env) == "mixed") || (!env && registries.size() > 1);
-    if (request_mixed || registries.size() > 1) {
-        if (env && std::string(env) == "none") {
-            ggml_backend_cuda_comm_init_none(ret);
-            return ret;
-        }
-        if (env && std::string(env) != "mixed" && std::string(env) != "none") {
-            GGML_LOG_WARN("%s AllReduce cannot span %zu CUDA runtimes; trying mixed mapped-host AllReduce\n",
-                          env, registries.size());
-        }
-        if (ggml_backend_cuda_comm_init_mixed(ret)) {
-            return ret;
-        }
-        GGML_LOG_WARN("mixed AllReduce initialization failed; falling back to meta-backend butterfly\n");
-        ggml_backend_cuda_comm_init_none(ret);
-        return ret;
-    }
-
     ret->dev_ids.reserve(n_backends);
     for (size_t i = 0; i < n_backends; i++) {
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
@@ -1656,11 +1392,6 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_nccl(ret);
         } else if (env_str == "internal") {
             ggml_backend_cuda_comm_init_internal(ret);
-        } else if (env_str == "mixed") {
-            if (!ggml_backend_cuda_comm_init_mixed(ret)) {
-                GGML_LOG_WARN("mixed AllReduce initialization failed; falling back to internal AllReduce\n");
-                ggml_backend_cuda_comm_init_internal(ret);
-            }
         } else if (env_str == "none") {
             ggml_backend_cuda_comm_init_none(ret);
         } else {
@@ -2293,23 +2024,24 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
-// returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_MMQ_PREFILL]
 // Volta has FP16 tensor cores but not the Turing MMA that MMQ is tuned for, so
 // ggml_cuda_should_use_mmq() rejects any batch of MMQ_DP4A_MAX_BATCH_SIZE tokens
-// or more on it.  For a 512-expert MoE that sends every prefill expert
-// projection into the fallback at the bottom of ggml_cuda_mul_mat_id(): the ids
-// are copied to the host, the stream is synchronised twice, a host loop walks
-// experts x tokens x selected experts, and each populated expert costs its own
-// ggml_cuda_mul_mat() launch -- and the graph is disqualified from CUDA capture.
-// This takes the grouped MMQ path instead.
+// or more on it.  For a 512-expert MoE that sends every prefill expert projection
+// into the fallback at the bottom of ggml_cuda_mul_mat_id(): the ids are copied to
+// the host, the stream is synchronised twice, a host loop walks experts x tokens,
+// each populated expert costs its own ggml_cuda_mul_mat() launch -- 284199 of them
+// over one 5000-token prefill -- and the graph cannot be captured.  This takes the
+// grouped MMQ path instead.  Decode is untouched: it leaves through MMVQ, far
+// below this batch size.
 //
-// Opt-in and diagnostic: the batch-size rule is a tuning heuristic, and whether
-// grouped MMQ actually beats the fallback on this hardware is what we are
-// measuring.  Decode and speculative verification are untouched; they leave
-// through the MMVQ path above, far below this batch size.
+// On by default; GGML_CUDA_MMID_MMQ_PREFILL=0 restores the fallback.  It selects a
+// different kernel for the same arithmetic rather than approximating it, and
+// greedy output was byte-identical with it on and off, but it is a dispatch change
+// and the switch is here so that can be re-checked rather than assumed.
 static bool ggml_cuda_mmid_prefill_mmq(const ggml_tensor * src0, const int cc, const int64_t ne11) {
-    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_MMID_MMQ_PREFILL");
+    static const bool enabled = !getenv("GGML_CUDA_MMID_MMQ_PREFILL") ||
+                                 ggml_env_flag_enabled("GGML_CUDA_MMID_MMQ_PREFILL");
 
     if (!enabled || !ggml_is_quantized(src0->type)) {
         return false;
@@ -2325,77 +2057,7 @@ static bool ggml_cuda_mmid_prefill_mmq(const ggml_tensor * src0, const int cc, c
     return ggml_cuda_should_use_mmq(src0->type, cc, /*ne11 =*/ 1, /*n_experts =*/ src0->ne[2]);
 }
 
-// Which route each MUL_MAT_ID takes, opt-in via GGML_CUDA_MMID_ROUTE_PROFILE.
-// The fallback at the bottom of ggml_cuda_mul_mat_id() is expensive and easy to
-// enter without noticing, so this counts routes rather than guessing from the
-// dispatch source, and reports the fallback's per-expert launch count -- the
-// figure that decides whether grouping is worth it.
-enum ggml_cuda_mmid_route {
-    GGML_CUDA_MMID_ROUTE_MMVQ = 0,
-    GGML_CUDA_MMID_ROUTE_MMVF,
-    GGML_CUDA_MMID_ROUTE_MMQ,
-    GGML_CUDA_MMID_ROUTE_MMQ_PREFILL,
-    GGML_CUDA_MMID_ROUTE_MMF,
-    GGML_CUDA_MMID_ROUTE_FALLBACK,
-    GGML_CUDA_MMID_ROUTE_COUNT,
-};
-
-static const char * ggml_cuda_mmid_route_name(ggml_cuda_mmid_route route) {
-    switch (route) {
-        case GGML_CUDA_MMID_ROUTE_MMVQ:        return "mmvq";
-        case GGML_CUDA_MMID_ROUTE_MMVF:        return "mmvf";
-        case GGML_CUDA_MMID_ROUTE_MMQ:         return "mmq";
-        case GGML_CUDA_MMID_ROUTE_MMQ_PREFILL: return "mmq-prefill";
-        case GGML_CUDA_MMID_ROUTE_MMF:         return "mmf";
-        case GGML_CUDA_MMID_ROUTE_FALLBACK:    return "fallback";
-        default:                               return "?";
-    }
-}
-
-struct ggml_cuda_mmid_route_stat {
-    int64_t calls = 0;
-    int64_t tokens = 0;
-    int64_t inner_launches = 0; // fallback only: one ggml_cuda_mul_mat per populated expert
-};
-
-struct ggml_cuda_mmid_route_table {
-    std::mutex mutex;
-    // keyed by device, route and quantisation type of the expert weights
-    std::map<std::tuple<int, int, int>, ggml_cuda_mmid_route_stat> stats;
-
-    void add(int device, ggml_cuda_mmid_route route, ggml_type type, int64_t tokens, int64_t inner = 0) {
-        std::lock_guard<std::mutex> lock(mutex);
-        ggml_cuda_mmid_route_stat & stat = stats[{ device, (int) route, (int) type }];
-        stat.calls          += 1;
-        stat.tokens         += tokens;
-        stat.inner_launches += inner;
-    }
-
-    ~ggml_cuda_mmid_route_table() {
-        std::lock_guard<std::mutex> lock(mutex);
-        for (const auto & [key, stat] : stats) {
-            const auto [device, route, type] = key;
-            GGML_LOG_WARN("cuda_mmid_route backend=%s device=%d route=%-11s type=%-8s calls=%-8" PRId64 " mean_tokens=%7.1f inner_launches=%" PRId64 "\n",
-                          GGML_CUDA_NAME, device, ggml_cuda_mmid_route_name((ggml_cuda_mmid_route) route),
-                          ggml_type_name((ggml_type) type), stat.calls,
-                          stat.calls ? (double) stat.tokens / stat.calls : 0.0, stat.inner_launches);
-        }
-    }
-};
-
-static ggml_cuda_mmid_route_table g_cuda_mmid_routes;
-
-static bool ggml_cuda_mmid_route_profile_enabled() {
-    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_MMID_ROUTE_PROFILE");
-    return enabled;
-}
-
-static void ggml_cuda_mmid_route_record(int device, ggml_cuda_mmid_route route, ggml_type type, int64_t tokens, int64_t inner = 0) {
-    if (ggml_cuda_mmid_route_profile_enabled()) {
-        g_cuda_mmid_routes.add(device, route, type, tokens, inner);
-    }
-}
-
+// returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
@@ -2449,29 +2111,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_MMVQ, src0->type, ne12);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_MMVF, src0->type, ne12);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
             }
         }
 
-        const bool mmq_prefill = ggml_cuda_mmid_prefill_mmq(src0, cc, ne12);
-        if (mmq_prefill || ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mmid_route_record(ctx.device,
-                mmq_prefill ? GGML_CUDA_MMID_ROUTE_MMQ_PREFILL : GGML_CUDA_MMID_ROUTE_MMQ, src0->type, ne12);
+        if (ggml_cuda_mmid_prefill_mmq(src0, cc, ne12) ||
+            ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_MMF, src0->type, ne12);
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2540,7 +2197,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
-    int64_t populated_experts = 0;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
         if (tokens_per_expert[i02] == 0) {
             continue;
@@ -2583,12 +2239,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
         CUDA_CHECK(cudaGetLastError());
-        populated_experts++;
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
     }
-    ggml_cuda_mmid_route_record(ctx.device, GGML_CUDA_MMID_ROUTE_FALLBACK, src0->type, ne12, populated_experts);
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
@@ -3064,7 +2718,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
-    if (!ggml_backend_is_cuda(backend_src)) {
+    const bool same_registry =
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_src)) ==
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_dst));
+    if (!ggml_backend_is_cuda(backend_src) || !same_registry) {
         if (ggml_backend_buffer_is_host(buf_src) || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
             return false;
         }
@@ -6394,6 +6051,18 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_init") == 0) {
+        return (void *) ggml_cuda_mixed_ar_group_init;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_free") == 0) {
+        return (void *) ggml_cuda_mixed_ar_group_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_prepare") == 0) {
+        return (void *) ggml_cuda_mixed_ar_group_prepare;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_enqueue") == 0) {
+        return (void *) ggml_cuda_mixed_ar_group_enqueue;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
@@ -6402,24 +6071,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
-    }
-    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_init") == 0) {
-        return (void *)ggml_cuda_mixed_ar_group_init;
-    }
-    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_free") == 0) {
-        return (void *)ggml_cuda_mixed_ar_group_free;
-    }
-    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_prepare") == 0) {
-        return (void *)ggml_cuda_mixed_ar_group_prepare;
-    }
-    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_enqueue") == 0) {
-        return (void *)ggml_cuda_mixed_ar_group_enqueue;
-    }
-    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_enqueue_hier") == 0) {
-        return (void *)ggml_cuda_mixed_ar_group_enqueue_hier;
-    }
-    if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_profile_collect") == 0) {
-        return (void *)ggml_cuda_mixed_ar_group_profile_collect;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

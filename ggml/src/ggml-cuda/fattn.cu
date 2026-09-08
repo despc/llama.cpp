@@ -122,27 +122,6 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-
-    // Compacting the mask costs one pass over the whole cache regardless of how many
-    // queries there are, so it is repaid by the queries that then skip the unselected
-    // positions.  At one or two queries -- decode, and speculative verification --
-    // it is not repaid, so leave those to the dense kernels.
-    if (Q->ne[1] < 16) {
-        return false;
-    }
-
-    // 256/256 is off unless asked for.  Enabling it was neutral on prefill here --
-    // only the two Blackwells can take the path and they hold about a sixth of the
-    // GPU time -- and appeared to cost generation, but that measurement was taken
-    // against binaries carrying an unconditional profiler synchronisation and has
-    // to be redone.  A run-time switch keeps both arms in one binary.
-    if (Q->ne[0] == 256 && K->ne[0] == 256) {
-        static const bool sparse_256 = ggml_env_flag_enabled("GGML_CUDA_FATTN_SPARSE_256");
-        if (!sparse_256) {
-            return false;
-        }
-    }
-
     return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
@@ -216,21 +195,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
-
-    // The sparse path puts one query column in each block, so its grouping is the
-    // only thing left to choose, and 8 is the only 256/256 grouping any tile table
-    // configures.  Volta's rule below would pick 4, which has no configuration at
-    // all.  Volta cannot reach the sparse path anyway -- its MMA fragments are
-    // fixed at 32 columns -- but keeping the choice here means the grouping is
-    // decided in one place if that ever changes.
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, 8)) {
-        if (use_gqa_opt && gqa_ratio > 4 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst)) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
-            return;
-        }
-    }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {

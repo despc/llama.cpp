@@ -1,5 +1,19 @@
 # CUDA mixed-runtime tensor parallelism
 
+## Current native-type mode (2026-09-08)
+
+Mixed AllReduce is off by default. Different CUDA runtimes use the meta-backend reduction unless `GGML_CUDA_ALLREDUCE=mixed` is explicitly set before startup. `GGML_CUDA_ALLREDUCE=none` disables the specialized collective without disabling tensor parallelism.
+
+The opt-in mixed path transmits the tensor's original F32, F16, or BF16 representation. In particular, F32 is not converted to BF16 or INT8. Every rank accumulates in FP32 in the same global-rank order. There are no hierarchical pair sums, compressed streams, or requantized totals. Old compression flags have no effect on this path.
+
+Two slots are protected by completion events across all runtime groups. ABI version 5 includes the wire layout, so both CUDA backend libraries must be rebuilt together. No build, runtime test, throughput result, or quality result has been obtained for this revision. Native transmission does not imply bit identity with a different floating-point reduction tree.
+
+See [CUDA numerical optimization rollback](CUDA-numerics-rollback.md) for scope and deployment limits.
+
+## Historical compressed implementation (removed)
+
+The remaining sections record the removed implementation. Their flags, tuning values, quality claims, and measurements are not guidance for the native-type mode above.
+
 This fork supports tensor-parallel AllReduce across CUDA devices that cannot be opened by one CUDA runtime. The original target system has two Blackwell GPUs on the normal NVIDIA driver and one V100 on a separately loaded driver:
 
 | Global rank | Device | Runtime group | Tensor split |

@@ -33,21 +33,7 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
     // perform argsort in chunks up to approximately this size (currently 64MB)
     // to avoid excessive temporary buffers memory usage
-    static const size_t prefill_chunk_bytes = []() -> size_t {
-        const char * value = std::getenv("GGML_CUDA_SORT_PREFILL_CHUNK_MIB");
-        if (!value) {
-            return 1 << 26;
-        }
-        char * end = nullptr;
-        const long mib = std::strtol(value, &end, 10);
-        if (end == value || *end != '\0' || mib < 1 || mib > 64) {
-            GGML_LOG_WARN("GGML_CUDA_SORT_PREFILL_CHUNK_MIB must be between 1 and 64; using 64\n");
-            return 1 << 26;
-        }
-        return (size_t) mib << 20;
-    }();
-    // Keep the decode and short speculative verification paths unchanged.
-    const size_t chunk_bytes = nrows > 8 ? prefill_chunk_bytes : (1 << 26);
+    const int chunk_bytes = 1 << 26;
 
     // calculate how many rows will fit in one chunk (must be at least one)
     const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);

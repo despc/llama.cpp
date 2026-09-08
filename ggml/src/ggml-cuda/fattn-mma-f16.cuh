@@ -1757,13 +1757,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    // qwen4exp's 256/256 heads are compiled in but disabled at run time: the
-    // kernel variant exists so the path can be toggled inside one binary, which is
-    // the only way to attribute what it costs.  shall_use_sparse() decides whether
-    // it is used; see GGML_CUDA_FATTN_SPARSE_256.
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
-           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
-           (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8);
+           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>

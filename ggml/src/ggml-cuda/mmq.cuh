@@ -4,9 +4,6 @@
 
 #include <climits>
 #include <cstdint>
-#include <tuple>
-#include <mutex>
-#include <map>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
@@ -248,6 +245,15 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     if (blackwell_mma_available(cc)) {
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
+    // Volta reaches here.  Upstream sends anything at or above Volta to the Ampere
+    // tables, but Volta has no Turing MMA and runs the DP4A layout, whose tiles are
+    // shaped differently -- so it was being given a configuration for a layout it
+    // does not execute.  Turing is the real boundary.
+    //
+    // This has no runtime switch, and cannot have one: the host picks the launch
+    // configuration here while the device-side overload below picks it from
+    // __CUDA_ARCH__ at compile time, and the two must agree.  A flag would
+    // desynchronise them.
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
@@ -1470,48 +1476,6 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
-// Which column tile each MUL_MAT_ID actually got, opt-in via
-// GGML_CUDA_MMQ_MMID_J_PROFILE.  The fitting rule is not written to be
-// Volta-only -- it fires wherever the batch-sized tile is at least twice the
-// expert's share -- so which devices and shapes it changes is a measurement,
-// not an assumption.
-struct ggml_cuda_mmq_J_stat {
-    int64_t calls = 0;
-    int64_t tokens = 0;
-};
-
-struct ggml_cuda_mmq_J_table {
-    std::mutex mutex;
-    // device, quantisation, tile width, whether the fitting rule chose it
-    std::map<std::tuple<int, int, int, int>, ggml_cuda_mmq_J_stat> stats;
-
-    void add(int device, ggml_type type, int J, bool fitted, int64_t tokens) {
-        std::lock_guard<std::mutex> lock(mutex);
-        ggml_cuda_mmq_J_stat & stat = stats[{ device, (int) type, J, fitted ? 1 : 0 }];
-        stat.calls  += 1;
-        stat.tokens += tokens;
-    }
-
-    ~ggml_cuda_mmq_J_table() {
-        std::lock_guard<std::mutex> lock(mutex);
-        for (const auto & [key, stat] : stats) {
-            const auto [device, type, J, fitted] = key;
-            GGML_LOG_WARN("cuda_mmq_J backend=%s device=%d type=%-8s J=%-4d fitted=%d calls=%-8lld mean_tokens=%.1f\n",
-                          GGML_CUDA_NAME, device, ggml_type_name((ggml_type) type), J, fitted,
-                          (long long) stat.calls, stat.calls ? (double) stat.tokens / stat.calls : 0.0);
-        }
-    }
-};
-
-static ggml_cuda_mmq_J_table g_cuda_mmq_J;
-
-static void ggml_cuda_mmq_J_record(ggml_type type, int J, bool fitted, int64_t tokens) {
-    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_MMQ_MMID_J_PROFILE");
-    if (enabled) {
-        g_cuda_mmq_J.add(ggml_cuda_get_device(), type, J, fitted, tokens);
-    }
-}
-
 template <ggml_type type, bool fallback>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id    = ggml_cuda_get_device();
@@ -1561,7 +1525,6 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         // expert's share -- at a large share the wide tile is the better choice and
         // measurably so.
         if (J_fit > 0 && J_wide >= 2*J_fit && !mma_layout) {
-            ggml_cuda_mmq_J_record(type, J_fit, /*fitted =*/ true, args.ncols_max);
             switch (J_fit) {
                 case   8: launch_mul_mat_q<type,   8, fallback>(ctx, args, stream); return;
                 case  16: launch_mul_mat_q<type,  16, fallback>(ctx, args, stream); return;
@@ -1596,7 +1559,6 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         }
     }
 
-    ggml_cuda_mmq_J_record(type, J_best, /*fitted =*/ false, args.ncols_max);
 
     switch (J_best) {
         case   8:
