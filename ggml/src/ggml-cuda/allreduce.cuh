@@ -14,8 +14,10 @@ struct ggml_cuda_ar_pipeline;
 // of algorithm into the config so both runtimes cannot pick different ones.
 // Matching buffer sizes never implied a matching protocol; a rank running flat
 // while its peer runs reduce-scatter would wait forever for a phase the other
-// never signals.
-static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 6;
+// never signals.  Version 7 adds the probe rendezvous: the two runtimes measure
+// the link in separate libraries, so without a meeting point each of them times
+// a link the other is not using, which is not the link the collective runs on.
+static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 7;
 static constexpr size_t GGML_CUDA_MIXED_AR_SLOTS = 2;
 static constexpr size_t GGML_CUDA_MIXED_AR_RANK_BYTES = 64 * 1024 * 1024;
 static constexpr size_t GGML_CUDA_MIXED_AR_BLOCKS = 8;
@@ -73,6 +75,11 @@ struct ggml_cuda_mixed_ar_group_config {
     // split.  This is not the weight split: it decides who reduces an element,
     // never which values are summed, so it cannot change a result.
     uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS];
+    // Where the runtimes meet to start a timed region together, and how many of
+    // them to expect.  Probing only: the collective never touches this.
+    void * probe_host;
+    size_t probe_bytes;
+    uint32_t probe_peers;
 };
 
 // Cumulative shard weights, so the kernel can derive lo[r]..lo[r+1) itself with
@@ -84,12 +91,17 @@ struct ggml_cuda_ar_shards {
 };
 
 using ggml_cuda_mixed_ar_group_init_t = void * (*)(const ggml_cuda_mixed_ar_group_config *);
+// The duplex probe is entered per registry from its own thread.  It cannot run
+// from group_init: the runtimes are initialised one after another on one thread,
+// so a rendezvous inside that loop is a rendezvous with nobody.
+using ggml_cuda_probe_duplex_t = void (*)(ggml_backend_t *, size_t, void *, size_t, uint32_t);
 using ggml_cuda_mixed_ar_group_free_t = void (*)(void *);
 using ggml_cuda_mixed_ar_group_prepare_t = bool (*)(void *, size_t);
 using ggml_cuda_mixed_ar_group_enqueue_t = bool (*)(void *, ggml_tensor **, size_t, uint32_t);
 
 void ggml_cuda_probe_p2p(ggml_backend_t * backends, size_t n);
-void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n);
+void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
+                            void * probe_host, size_t probe_bytes, uint32_t probe_peers);
 void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * config);
 void ggml_cuda_mixed_ar_group_free(void * context);
 bool ggml_cuda_mixed_ar_group_prepare(void * context, size_t slot);

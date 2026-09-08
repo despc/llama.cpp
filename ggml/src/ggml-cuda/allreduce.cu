@@ -1864,7 +1864,9 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->pipe_chunks = config->pipe_chunks;
     // Runs in this library's namespace, so it sees this stack's devices.
     ggml_cuda_probe_p2p(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
-    ggml_cuda_probe_duplex(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
+    // No duplex probe here: group_init runs once per registry on the same thread,
+    // so a rendezvous placed in it can only ever time out.  It is entered from
+    // comm_init_mixed on a thread per registry instead.
     for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
         group->shard_weight[i] = config->shard_weight[i] ? config->shard_weight[i] : 0;
     }

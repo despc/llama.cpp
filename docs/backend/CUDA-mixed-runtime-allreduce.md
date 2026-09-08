@@ -1480,8 +1480,9 @@ transport, for the same reason they moved here.
 
 ### The pipeline, built and not paying -- and why
 
-Built behind `GGML_CUDA_MIXED_AR_PIPE_CHUNKS`, off by default. Correct: every
-chunk count returns the same hash as the phase kernel and the meta backend.
+Built behind `GGML_CUDA_MIXED_AR_PIPE_CHUNKS`, off by default. Passes the checks
+we have: every chunk count returns the same hash as the phase kernel and the meta
+backend, which is a matching continuation, not a tensor comparison.
 Slower: 402.7 tokens/s at 8 chunks, 397.4 at 16, 396.3 at 32, against 413.7 for
 the phase kernel it was meant to beat.
 
@@ -1497,26 +1498,114 @@ announcing a chunk immediately after publishing it drains the store queue before
 any load is issued, and the two directions never coexist. Moving the fence after
 the reads was worth nothing measurable, which is the clue to the real problem.
 
-**The duplex headroom is real and this structure cannot reach it.** The first
-probe measured the copy engines and could have been dismissed as the wrong
-mechanism -- the collective uses kernel-issued loads and stores, not DMA. Measured
-rather than assumed: kernel-issued access gives 10.00 GB/s with both directions
-against 6.07 in sequence, 1.65x, nearly the copy engines' 1.85x. So the headroom
-is available to the path we actually use.
+**The link will carry both directions, under conditions that are not ours.** The
+first probe measured the copy engines and could have been dismissed as the wrong
+mechanism, since the collective uses kernel-issued loads and stores rather than
+DMA. Measured rather than assumed: kernel-issued access gave 10.00 GB/s with both
+directions against 6.07 in sequence, 1.65x, nearly the copy engines' 1.85x.
 
-What the probe does that the pipeline does not is run the two directions as two
-concurrent kernels on separate streams. In the pipeline one block publishes and
-then reads, in that order; the stores are posted and do drain in the background,
-but by the end of a chunk's publication most of them have landed, so the reads
-that follow overlap only the tail of the store stream.
+That number is a property of the transport probe, not a forecast for the
+collective, and two conditions separate them. The probe drove one pair of cards
+while the other pair was idle -- and the two runtimes probe from separate
+libraries, so neither ever saw the contention on the shared root complex and host
+DRAM that this document has recorded as a limit since the beginning. And it ran
+the directions as two kernels on two streams, which a fused collective cannot do.
+The collective also has dependencies, a reduction, readiness signals, and unequal
+volumes in the two directions, none of which the probe carries.
 
-The structure that would reach it splits blocks by role -- some publishing, others
-reducing and gathering, running at the same time, which is what the probe does
-with two kernels. The ratio to aim at is the measured one, 8.1 s of publish
-against 12.1 s of reduce plus gather, so roughly three blocks to five. That needs
-global chunk boundaries rather than per-block ones, since publishers and
-consumers would no longer be the same blocks, and a consumer would poll every
-publisher block of every peer instead of one.
+**Why the pipeline does not reach it is a hypothesis, not a diagnosis.** The
+appealing story is that a block publishes and then reads, in that order, so the
+posted stores have mostly landed by the time the reads issue. But blocks of the
+same grid are not in lockstep, so serial order within one block does not by
+itself mean the GPU has no overlap. There are at least two other candidates, and
+the fence experiment separates none of them: the kernel hands each block a
+contiguous stripe of the whole tensor and each owner a contiguous shard, so with
+a Tesla share of 13-17% only a few blocks do its reduction while the rest carry a
+different load and still wait; and the per-chunk readiness traffic costs
+something on its own.
 
-Not attempted here. The current pipeline is left in place, off, as the scaffold
-for it rather than as a candidate.
+**Next step is a probe, not a rewrite.** Test the proposed cure apart from the
+disease: one kernel whose blocks have different roles, some storing and some
+loading independent buffers, swept over several splits and several grid sizes,
+against the two-kernel form -- and repeated with all four cards loaded together at
+the collective's real volumes and its real direction ratio, which is nearer 1.7
+reads per write than 1:1. If the advantage survives both, move roles into the
+reduce-scatter; if it does not, the variant closes on a measurement.
+
+No ratio is proposed here. Three-to-five would come from phase times measured
+before the publication and share changes, and throughput is not linear in the
+block count anyway -- a few blocks may already saturate a direction, or may not
+issue enough requests to fill it. A correction to the comments in the code, too:
+the reducing blocks do not only read, they also publish the finished sum, so
+"publishers carry the outgoing traffic and the rest the incoming" is an
+approximation, not the split.
+
+**The risk that construction carries** is a hang from block scheduling: if waiting
+blocks occupy the machine before the producers are resident, nothing progresses.
+"There are only a few blocks" is not an argument. It needs a co-residency
+guarantee that can be checked on both architectures, or a construction that does
+not depend on one -- and two separate kernels spinning on each other are no safer
+by default.
+
+The current pipeline is left in place, off, as scaffolding rather than as a
+candidate. "Correct" above should be read as "passed the checks we have":
+matching output is not a tensor comparison, and tails, empty shares, and signal
+reuse are exactly where it would not be.
+
+### The role-split probe: the cure, measured apart from the disease
+
+Two questions, asked before building anything: can one grid whose blocks have
+different jobs reach the duplex that two kernels on two streams reach, and does
+any of it survive all four cards being on the link at once at the collective's
+real direction ratio?
+
+Getting the second question asked at all took fixing the probe twice. The
+rendezvous could not work where it first sat: `group_init` is entered once per
+registry from a single thread, so a meeting point inside it waits for a
+participant that has not been called yet -- the Tesla side had not reached the
+probe while the Blackwell side was already waiting for it. It now runs from
+`comm_init_mixed` after every runtime is up, on a thread each. And the device
+buffer was sized for one direction while the read side, at ratio 1.7, copied
+more than that into it: the copy failed and the line reported 39404 GB/s, which
+is the shape a wrong answer takes when nothing checks it.
+
+Both answers are yes. Teslas, 21 MiB, 1.7 reads per write, all four cards
+driven together:
+
+| blocks | two kernels | best role split | sequential | best/seq |
+|--------|-------------|-----------------|------------|----------|
+| 8      | 6.44        | 6.34 (2:6)      | 5.96       | 1.06x    |
+| 16     | 6.76        | 6.93 (4:12)     | 5.96       | 1.16x    |
+| 32     | 6.98        | 7.60 (8:24)     | 5.96       | 1.28x    |
+| 64     | 7.69        | **8.67 (16:48)**| 5.96       | **1.45x**|
+
+The contention this document has warned about since the beginning is real and
+now has a number. Symmetric traffic, two kernels, 64 blocks: 10.00 against 6.07
+with the Tesla pair alone, 8.78 against 6.08 with all four cards, so 1.65x falls
+to 1.44x. About a eighth of the headroom is the other pair's. The role split
+earns it back -- 64 blocks at 16:48 gives 10.65, above the isolated two-kernel
+figure.
+
+**The grid size decides this, not the split.** The collective launches
+`GGML_CUDA_MIXED_AR_BLOCKS` = 8, and at eight blocks the role split is worth
+1.06x on a Tesla, which is noise. Everything appears from 32 blocks up, and the
+optimum differs by architecture: Blackwell peaks at 32 (20.97 against 13.01,
+1.61x), Tesla at 64. So the first thing a role-split reduce-scatter needs is not
+a protocol, it is a bigger grid -- and that walks straight into the residency
+question, since more blocks make co-residency harder to guarantee, not easier.
+
+**Give the reads most of the grid.** Every read-heavy split beats the even one
+and every write-heavy one: 2:6, 4:12, 8:24, 16:48, in that order, at every size
+and both ratios. That is a mechanism rather than a fitted number -- stores are
+posted and cost little to issue, while loads need many outstanding requests
+before the latency is covered. It replaces the three-to-five this document
+previously proposed, which came from phase times measured before the publication
+and share changes.
+
+What the probe does not measure is the waiting. Its two roles never synchronise;
+the collective's would, on every chunk. So these figures are a ceiling for the
+construction, not a forecast for it, and the gap between them is exactly the
+readiness traffic and the residency risk. The copy engines put a further ceiling
+above both: under the same four-card contention they reach 11.10 against 5.61
+sequential, 1.98x, so kernel-issued access is leaving something on the table that
+no arrangement of blocks has recovered.
