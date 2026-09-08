@@ -1477,3 +1477,46 @@ and receiving at once, so the real figure will be lower than 1.85x.
 
 And the shares will want re-measuring again after any further change to the
 transport, for the same reason they moved here.
+
+### The pipeline, built and not paying -- and why
+
+Built behind `GGML_CUDA_MIXED_AR_PIPE_CHUNKS`, off by default. Correct: every
+chunk count returns the same hash as the phase kernel and the meta backend.
+Slower: 402.7 tokens/s at 8 chunks, 397.4 at 16, 396.3 at 32, against 413.7 for
+the phase kernel it was meant to beat.
+
+Two things were learned on the way, one of them a correction to this document.
+
+**Vectorised access is not optional.** The first version read peers element by
+element inside the chunk loop instead of a whole vector per peer, and ran at 142
+tokens/s -- a third of the phase kernel. Four times the transactions over a Gen3
+x4 link costs about what it sounds like.
+
+**The fence placement is load-bearing.** `advertise` ends with a system fence, so
+announcing a chunk immediately after publishing it drains the store queue before
+any load is issued, and the two directions never coexist. Moving the fence after
+the reads was worth nothing measurable, which is the clue to the real problem.
+
+**The duplex headroom is real and this structure cannot reach it.** The first
+probe measured the copy engines and could have been dismissed as the wrong
+mechanism -- the collective uses kernel-issued loads and stores, not DMA. Measured
+rather than assumed: kernel-issued access gives 10.00 GB/s with both directions
+against 6.07 in sequence, 1.65x, nearly the copy engines' 1.85x. So the headroom
+is available to the path we actually use.
+
+What the probe does that the pipeline does not is run the two directions as two
+concurrent kernels on separate streams. In the pipeline one block publishes and
+then reads, in that order; the stores are posted and do drain in the background,
+but by the end of a chunk's publication most of them have landed, so the reads
+that follow overlap only the tail of the store stream.
+
+The structure that would reach it splits blocks by role -- some publishing, others
+reducing and gathering, running at the same time, which is what the probe does
+with two kernels. The ratio to aim at is the measured one, 8.1 s of publish
+against 12.1 s of reduce plus gather, so roughly three blocks to five. That needs
+global chunk boundaries rather than per-block ones, since publishers and
+consumers would no longer be the same blocks, and a consumer would poll every
+publisher block of every peer instead of one.
+
+Not attempted here. The current pipeline is left in place, off, as the scaffold
+for it rather than as a candidate.

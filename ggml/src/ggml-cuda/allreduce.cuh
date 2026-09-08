@@ -34,6 +34,9 @@ enum ggml_cuda_mixed_ar_signal_word {
     GGML_CUDA_MIXED_AR_SIG_STREAM_TOKEN = 2,   // validates the count above
     GGML_CUDA_MIXED_AR_SIG_RS_PUBLISHED = 3,
     GGML_CUDA_MIXED_AR_SIG_RS_REDUCED = 4,
+    GGML_CUDA_MIXED_AR_SIG_PIPE_TOKEN = 5,   // validates the two counts below
+    GGML_CUDA_MIXED_AR_SIG_PIPE_PUB   = 6,   // chunks published, per block
+    GGML_CUDA_MIXED_AR_SIG_PIPE_RED   = 7,   // chunks reduced, per block
 };
 
 // Which kernel a group runs.  Chosen once, on the host, and handed to every rank
@@ -64,6 +67,7 @@ struct ggml_cuda_mixed_ar_group_config {
     uint64_t stream_min_bytes;  // 0 disables streaming
     uint64_t rs_min_bytes;      // 0 disables reduce-scatter
     uint32_t stream_chunk;
+    uint32_t pipe_chunks;        // 0 disables the pipelined reduce-scatter
     // Relative share of the reduction each rank owns, in rank order.  Integers,
     // so every rank derives identical boundaries from them; all ones is an even
     // split.  This is not the weight split: it decides who reduces an element,

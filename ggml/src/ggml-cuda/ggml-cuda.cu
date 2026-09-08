@@ -1291,6 +1291,25 @@ static uint64_t ggml_cuda_mixed_ar_env(const char * name, uint64_t fallback) {
     return end != v ? (uint64_t) parsed : fallback;
 }
 
+// Kernel-issued host access, which is what the collective actually does.  The
+// duplex figures below it are for the copy engines; an SM reading and writing
+// mapped host memory is a different mechanism, and whether it overlaps the two
+// directions has to be asked separately.
+static __global__ void ggml_cuda_host_store_kernel(int4 * __restrict__ dst, const int4 * __restrict__ src, size_t n) {
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+static __global__ void ggml_cuda_host_load_kernel(int4 * __restrict__ dst, const int4 * __restrict__ src, size_t n, int4 * sink) {
+    int4 acc = make_int4(0,0,0,0);
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const int4 v = src[i];
+        acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+    }
+    if (acc.x == 0x7fffffff) { *sink = acc; }   // never taken; keeps the loads alive
+    GGML_UNUSED(dst);
+}
+
 // Can the link carry both directions at once?
 //
 // The phase profile says the critical rank waits 2.7% of a collective, which
@@ -1357,6 +1376,44 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n) {
                           GGML_CUDA_NAME, bytes >> 20, reps, n,
                           moved/t[0], moved/t[1], 2.0*moved/t[2],
                           2.0*moved/(t[0]+t[1]));
+        }
+        // the same question for kernel-issued access, which is the collective's path
+        if (ok) {
+            const size_t vecs = bytes / sizeof(int4);
+            auto runk = [&](bool st, bool ld) {
+                for (size_t i = 0; i < n; ++i) {
+                    ggml_cuda_set_device(dev[i]);
+                    for (int k = 0; k < reps; ++k) {
+                        if (st) {
+                            ggml_cuda_host_store_kernel<<<64, 256, 0, ssend[i]>>>(
+                                (int4 *) hsend[i], (const int4 *) dbuf[i], vecs);
+                        }
+                        if (ld) {
+                            ggml_cuda_host_load_kernel<<<64, 256, 0, srecv[i]>>>(
+                                (int4 *) dbuf[i], (const int4 *) hrecv[i], vecs, (int4 *) dbuf[i]);
+                        }
+                    }
+                }
+                for (size_t i = 0; i < n; ++i) {
+                    ggml_cuda_set_device(dev[i]);
+                    if (st) { cudaStreamSynchronize(ssend[i]); }
+                    if (ld) { cudaStreamSynchronize(srecv[i]); }
+                }
+            };
+            runk(true, true);
+            double k[3];
+            for (int mode = 0; mode < 3; ++mode) {
+                const int64_t t0 = ggml_time_us();
+                runk(mode != 1, mode != 0);
+                k[mode] = (ggml_time_us() - t0) / 1e6;
+            }
+            const double moved = (double) bytes * reps * n / 1e9;
+            GGML_LOG_WARN("duplex_probe backend=%s %zu MiB kernel-issued      | "
+                          "store %5.2f GB/s  load %5.2f GB/s  both %5.2f GB/s aggregate "
+                          "(sequential would be %5.2f)
+",
+                          GGML_CUDA_NAME, bytes >> 20,
+                          moved/k[0], moved/k[1], 2.0*moved/k[2], 2.0*moved/(k[0]+k[1]));
         }
         for (size_t i = 0; i < n; ++i) {
             if (ssend[i]) { cudaStreamDestroy(ssend[i]); }
@@ -1461,6 +1518,10 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     // ranks' share is a strict win for them.  Integers in rank order, e.g.
     // GGML_CUDA_MIXED_AR_SHARES=35,35,15,15.  Default even, which reproduces the
     // previous behaviour exactly.
+    // Pipelined reduce-scatter: publish chunk c while reducing c-1 and gathering
+    // c-2, so the link carries both directions at once.  0 disables it.
+    const uint32_t mixed_ar_pipe = (uint32_t) ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_PIPE_CHUNKS", 0);
+
     uint32_t mixed_ar_shares[GGML_CUDA_MIXED_AR_MAX_RANKS];
     for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
         mixed_ar_shares[i] = 1;
@@ -1536,7 +1597,7 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             ret->mixed_host, shared_bytes, data_bytes,
             GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
             GGML_CUDA_MIXED_AR_BLOCKS, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
-            mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk,
+            mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk, mixed_ar_pipe,
             {},
         };
         for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {

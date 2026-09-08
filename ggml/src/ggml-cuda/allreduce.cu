@@ -1345,6 +1345,222 @@ static __device__ __forceinline__ unsigned long long ggml_cuda_ar_now() {
     return t;
 }
 
+// Pipelined reduce-scatter.  Same arithmetic, both directions of the link at once.
+//
+// The phase kernel below runs publish, reduce and gather in that order, and each
+// is one-directional: publish only writes to host, reduce and gather only read.
+// The link is full duplex -- measured at 11.22 GB/s with both directions running
+// against 6.08 for the same bytes in sequence -- so half of it sits idle
+// throughout. Publishing is the only outbound traffic, 8.1 s of a 20.8 s
+// collective against 12.1 s of inbound, so overlapping the two costs the larger
+// rather than the sum.
+//
+// Each block owns a contiguous stripe and runs the whole pipeline over it, so a
+// block waits only on the same block index of its peers: three polls, no
+// grid-wide barrier, and no assumption about how many blocks are resident.
+//
+// Depth three, per step c: publish chunk c, reduce chunk c-1 once peers have
+// published it, gather chunk c-2 once its owners have reduced it. The stores for
+// c are posted before the loads for c-1 are issued, which is what puts traffic in
+// both directions at the same time.
+//
+// Arithmetic is untouched: chunks partition elements, never the operands of a
+// sum, and every element is still reduced once by its shard's owner with the same
+// butterfly.
+template <typename T>
+static __global__ void ggml_cuda_mixed_ar_rs_pipe_kernel(
+        const T *                   sendbuf,
+        T *                         recvbuf,
+        T * __restrict__            slot_data,
+        int                         rank,
+        int                         n_ranks,
+        size_t                      rank_stride,
+        int                         count,
+        uint32_t *                  arrival_slot,
+        uint32_t                    token,
+        bool                        contribute,
+        ggml_cuda_ar_shards         shards,
+        int                         n_chunks,
+        ggml_cuda_ar_phase_acc *    acc) {
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
+    constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(uint32_t));
+
+    const int tid = threadIdx.x;
+    const int nt  = blockDim.x;
+    const int bid = blockIdx.x;
+    const int nb  = gridDim.x;
+
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+
+    // this block's stripe of the whole tensor
+    const int per_block = (count_vec + nb - 1) / nb;
+    const int b_lo = min(bid * per_block, count_vec);
+    const int b_hi = min(b_lo + per_block, count_vec);
+
+    auto shard_lo = [&](int r) {
+        const uint32_t total = shards.cum[n_ranks];
+        return total ? (int) ((int64_t) shards.cum[r] * count_vec / (int64_t) total) : 0;
+    };
+
+    T * host_mine = slot_data + (size_t) rank * rank_stride;
+    uint32_t * my_sig = arrival_slot + ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+
+    if (tid == 0) {
+        *(volatile uint32_t *) (my_sig + GGML_CUDA_MIXED_AR_SIG_PIPE_PUB) = 0;
+        *(volatile uint32_t *) (my_sig + GGML_CUDA_MIXED_AR_SIG_PIPE_RED) = 0;
+        __threadfence_system();
+        *(volatile uint32_t *) (my_sig + GGML_CUDA_MIXED_AR_SIG_PIPE_TOKEN) = token;
+        __threadfence_system();
+    }
+    __syncthreads();
+
+    const int chunk_vec = (b_hi - b_lo + n_chunks - 1) / max(1, n_chunks);
+    auto c_lo = [&](int c) { return min(b_lo + c * chunk_vec, b_hi); };
+
+    auto progress = [&](int peer, int word) {
+        const uint32_t * ps = arrival_slot +
+            ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+        return *(const volatile uint32_t *) (ps + GGML_CUDA_MIXED_AR_SIG_PIPE_TOKEN) == token
+            ? (int) *(const volatile uint32_t *) (ps + word) : 0;
+    };
+    __shared__ int sh_min;
+    auto wait_all = [&](int word, int upto) {
+        if (tid == 0) {
+            for (;;) {
+                int m = 1 << 30;
+                for (int p = 0; p < n_ranks; ++p) {
+                    if (p != rank) { m = min(m, progress(p, word)); }
+                }
+                if (m >= upto) { sh_min = m; break; }
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+                __nanosleep(80);
+#else
+                NO_DEVICE_CODE;
+#endif
+            }
+        }
+        __syncthreads();
+        __threadfence_system();
+    };
+    auto advertise = [&](int word, int v) {
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+            *(volatile uint32_t *) (my_sig + word) = (uint32_t) v;
+            __threadfence_system();
+        }
+        __syncthreads();
+    };
+
+    // publish everything in this chunk except the part this rank owns -- nobody
+    // reads a rank's own region before it is overwritten with the total
+    const int mine_lo = shard_lo(rank), mine_hi = shard_lo(rank + 1);
+    auto publish = [&](int c) {
+        for (int i = c_lo(c) + tid; i < c_lo(c + 1); i += nt) {
+            if (i >= mine_lo && i < mine_hi) { continue; }
+            const int off = i * ELEMS_PER_VEC;
+            T w[ELEMS_PER_VEC];
+#pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                w[k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
+            }
+            ggml_cuda_memcpy_1<sizeof(w)>(&host_mine[off], w);
+        }
+    };
+    auto reduce = [&](int c) {
+        const int lo = max(c_lo(c), mine_lo), hi = min(c_lo(c + 1), mine_hi);
+        for (int i = lo + tid; i < hi; i += nt) {
+            const int off = i * ELEMS_PER_VEC;
+            // whole vectors per peer: scalar reads here cost four times the
+            // transactions over the link and measured three times slower overall
+            T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
+            for (int p = 0; p < n_ranks; ++p) {
+                if (p == rank) {
+#pragma unroll
+                    for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                        wire[p][k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
+                    }
+                } else {
+                    const T * host_peer = slot_data + (size_t) p * rank_stride;
+                    ggml_cuda_memcpy_1<sizeof(wire[p])>(wire[p], &host_peer[off]);
+                }
+            }
+            T out[ELEMS_PER_VEC];
+#pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+                for (int p = 0; p < n_ranks; ++p) { v[p] = wire[p][k]; }
+                out[k] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+                recvbuf[off + k] = out[k];
+            }
+            ggml_cuda_memcpy_1<sizeof(out)>(&host_mine[off], out);
+        }
+    };
+    auto gather = [&](int c) {
+        for (int p = 0; p < n_ranks; ++p) {
+            if (p == rank) { continue; }
+            const int lo = max(c_lo(c), shard_lo(p)), hi = min(c_lo(c + 1), shard_lo(p + 1));
+            const T * host_peer = slot_data + (size_t) p * rank_stride;
+            for (int i = lo + tid; i < hi; i += nt) {
+                const int off = i * ELEMS_PER_VEC;
+                T g[ELEMS_PER_VEC];
+                ggml_cuda_memcpy_1<sizeof(g)>(g, &host_peer[off]);
+#pragma unroll
+                for (int k = 0; k < ELEMS_PER_VEC; ++k) { recvbuf[off + k] = g[k]; }
+            }
+        }
+    };
+
+    // the tail is shorter than a vector and belongs to the last shard's owner;
+    // it rides along with the final chunk
+    const bool owns_tail = rank == n_ranks - 1;
+
+    // Order matters more than it looks.  advertise() ends with a system fence, so
+    // announcing a chunk immediately after publishing it drains the store queue
+    // before any load is issued and the two directions never coexist -- measured
+    // at 405 against 414 for the phase kernel, i.e. the pipeline paying its
+    // synchronisation and buying nothing.  Publishing first, then reading, then
+    // fencing and announcing leaves the stores in flight across the loads.
+    for (int c = 0; c < n_chunks + 2; ++c) {
+        if (c < n_chunks) {
+            publish(c);
+            if (c == n_chunks - 1 && !owns_tail && bid == 0 && tid < count - tail) {
+                host_mine[tail + tid] = contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f);
+            }
+        }
+        if (c >= 1 && c - 1 < n_chunks) {
+            wait_all(GGML_CUDA_MIXED_AR_SIG_PIPE_PUB, c);
+            reduce(c - 1);
+            if (c - 1 == n_chunks - 1 && owns_tail && bid == 0 && tid < count - tail) {
+                T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+                for (int p = 0; p < n_ranks; ++p) {
+                    v[p] = p == rank
+                        ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
+                        : (slot_data + (size_t) p * rank_stride)[tail + tid];
+                }
+                const T t = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
+                recvbuf[tail + tid] = t; host_mine[tail + tid] = t;
+            }
+        }
+        if (c >= 2) {
+            wait_all(GGML_CUDA_MIXED_AR_SIG_PIPE_RED, c - 1);
+            gather(c - 2);
+            if (c - 2 == n_chunks - 1 && !owns_tail && bid == 0 && tid < count - tail) {
+                recvbuf[tail + tid] =
+                    (slot_data + (size_t) (n_ranks - 1) * rank_stride)[tail + tid];
+            }
+        }
+        if (c < n_chunks) {
+            advertise(GGML_CUDA_MIXED_AR_SIG_PIPE_PUB, c + 1);
+        }
+        if (c >= 1 && c - 1 < n_chunks) {
+            advertise(GGML_CUDA_MIXED_AR_SIG_PIPE_RED, c);
+        }
+    }
+    GGML_UNUSED(acc);
+}
+
 // Reduce-scatter followed by all-gather.  Same arithmetic, less traffic.
 //
 // The kernels above have every rank reduce the whole tensor, so each one pulls
@@ -1558,6 +1774,7 @@ struct ggml_cuda_mixed_ar_group {
     uint64_t rs_min_bytes = 0;
     uint32_t stream_chunk = 8;
     uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS] = {};
+    uint32_t pipe_chunks = 0;
     std::vector<ggml_cuda_ar_phase_acc *> phase_acc;   // per backend, device memory
     size_t data_bytes = 0;
     void * shared_host = nullptr;
@@ -1644,6 +1861,7 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->stream_min_bytes = config->stream_min_bytes;
     group->rs_min_bytes = config->rs_min_bytes;
     group->stream_chunk = config->stream_chunk ? config->stream_chunk : 1;
+    group->pipe_chunks = config->pipe_chunks;
     // Runs in this library's namespace, so it sees this stack's devices.
     ggml_cuda_probe_p2p(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
     ggml_cuda_probe_duplex(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
@@ -1781,7 +1999,13 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             slot * group->n_ranks * GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE);
 
 #define LAUNCH_MIXED_AR(T) \
-        if (use_rs) { \
+        if (use_rs && group->pipe_chunks > 0) { \
+            ggml_cuda_mixed_ar_rs_pipe_kernel<T><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
+                reinterpret_cast<const T *>(tensor->data), \
+                reinterpret_cast<T *>(tensor->data), \
+                reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
+                (int) ne, arrival_slot, token, contribute, shards, (int) group->pipe_chunks, acc); \
+        } else if (use_rs) { \
             ggml_cuda_mixed_ar_rs_kernel<T><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
                 reinterpret_cast<const T *>(tensor->data), \
                 reinterpret_cast<T *>(tensor->data), \
