@@ -1188,3 +1188,102 @@ two-stage variants are gone from source, not disabled, along with the environmen
 variables that selected them. `GGML_CUDA_ALLREDUCE` is the only remaining choice:
 `mixed` for the kernel above, `none` for the meta backend's own reduction. With
 CUDA and V100_CUDA in separate registries an unset variable behaves as `none`.
+
+## Restoring prefill without the compression, 2026-09-08
+
+The numerical rollback removed eight things at once. They were not one kind of
+thing: some traded exactness for speed, and some only changed how bytes move.
+This is the second group put back, and what happened when it was.
+
+### The profile decided what to work on
+
+A 10k prefill of the 27B, per-operation profiler on:
+
+| op | GPU ms, summed over four devices | share |
+| --- | ---: | ---: |
+| MUL_MAT | 6180.8 | 67.3% |
+| GATED_DELTA_NET | 1143.9 | 12.5% |
+| FLASH_ATTN_EXT | 622.8 | 6.8% |
+| RMS_NORM | 395.0 | 4.3% |
+| everything else | ~840 | 9% |
+
+Per device: CUDA0 1625, CUDA1 1829, V100_CUDA0 3013, V100_CUDA1 2712 ms.
+
+Tensor parallelism runs the cards concurrently, so the compute cost is the
+busiest device -- **3.0 s** -- against **35.6 s** of wall. Compute is about 8% of
+a prefill and the collective is nearly all the rest. That retired kernel-level
+work before it was started: there is no 92% hiding in the matmuls.
+
+With no P2P between these cards every byte crosses PCIe twice through mapped
+host memory, so the collective's cost is bytes, and the question became which
+bytes can be removed without touching the arithmetic.
+
+### What was restored
+
+**Streaming publication with a duplex drain.** The kernel wrote its whole
+contribution, signalled, and only then read anyone else's, so nothing moved
+inbound until the slowest publisher finished and one direction of a full-duplex
+link sat idle. Each block now publishes in steps, advertises progress, and folds
+in whatever peers have already advertised. Prefill 241.5 -> 281 tokens/s.
+
+The chunk is vectors per thread per step. Swept: 1 -> 208.3, 2 -> 258.8,
+4 -> 275.5, 8 -> 281.1, 16 -> 272.8. Signalling too often spends more on system
+fences than the earlier drain recovers. Default 8.
+
+**Reduce-scatter with all-gather.** Every rank used to reduce the whole tensor
+and therefore pull every peer's contribution: N out, 3N in. Each now reduces one
+shard and the finished shards are exchanged: N + N/4 out, 3N/4 + 3N/4 in. That is
+2.75N against 4N, and 1.5N of reads against 3N in the direction that dominates.
+Prefill 281.6 -> **371.1 tokens/s**, against 187.5 for the meta backend.
+
+Both are transport. Steps partition elements and shards partition elements;
+neither ever splits the operands of a sum. Every output element is still reduced
+exactly once, by one rank, with the same butterfly over the same values, so all
+of it stays bit-identical -- confirmed over 2000 generated tokens, same hash for
+the meta backend, the single-shot kernel, streaming, and reduce-scatter.
+
+### What was tried and rejected, with numbers
+
+**Republishing to a leader, twice.** One rank reduces and broadcasts the total so
+the others read one payload instead of three. On the single-shot kernel: 241.6 ->
+65.8 tokens/s. Rebuilt on top of streaming, where the removed code said it
+belonged: 281.9 -> 72.1. Both correct, both catastrophic. Concentrating the
+reduction makes three ranks wait for one, and that is slower than four ranks
+reducing redundantly in parallel. The removed code's own comment predicted the
+first failure -- "only worth it because both sides stream it per chunk" -- and was
+read before the attempt without being applied. Reduce-scatter is the same traffic
+saving with the work distributed instead of concentrated, which is why it works.
+
+**Staggering the gather order** so ranks do not all read peer 0's region first:
+273.8 against 281.9. No win, reverted.
+
+### The threshold, and why it is not arbitrary
+
+`GGML_CUDA_MIXED_AR_RS_MIN_BYTES`, default 256 KiB; below it the single-shot
+kernel runs. The collective's tensor is `n_embd * n_tokens * 4`, and this model
+has n_embd 5120 over 65 layers:
+
+| | tokens | bytes |
+| --- | ---: | ---: |
+| decode | 1 | 20 KB |
+| MTP verification | 2-4 | 40-80 KB |
+| prefill at ubatch 1024 | 1024 | 21 MB |
+
+The two regimes are 260x apart and the threshold sits in the empty space between
+them, so its exact value changes nothing. It was chosen by argument -- two extra
+grid-wide barriers need a tensor large enough to repay them -- and then measured:
+with the threshold at zero, so reduce-scatter also runs at decode, generation
+falls from 66.14 to 50.84 tokens/s at unchanged prefill. The argument was right
+and is now a measurement.
+
+### The bug that looked like a result
+
+The first reduce-scatter was faster and wrong. Its barrier waited only on each
+peer's block of the same index, while the phases stripe by global thread, so a
+block could read bytes that another block had not published yet. The server ran,
+the text was coherent, the speed was up -- and the output hash differed from the
+reference. Nothing else would have caught it.
+
+The barrier is now grid-wide across every rank and block; eight blocks are
+resident together, so it cannot deadlock. This is the case the bit-identity
+discipline exists for: under "no difference was detected" it would have shipped.
