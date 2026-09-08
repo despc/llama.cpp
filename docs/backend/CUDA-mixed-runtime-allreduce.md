@@ -1855,3 +1855,54 @@ contribution, so nothing about what an operation means had to change.
 **On its own it was worth nothing, and the measurement says why.** With 40 layers
 on the Blackwell pair and 25 owned by the Teslas, the collective still ran 384
 time
+### Sharing rather than owning, and where it landed
+
+Giving a Tesla a layer outright means one slow card computes it while three
+wait. Giving the *pair* the layer halves that, at the cost of a two-rank
+collective between them -- and the two are on the same driver stack, so it is
+still host memory, but it is two ranks rather than four and both are the same
+speed. Prefill barely notices; generation does:
+
+| layers the Teslas take | prefill | generation |
+|---|---:|---:|
+| one Tesla each, 12 layers | 628.8 | 66.5 |
+| shared by the pair, 16 layers | 591.9 | 73.1 |
+| shared by the pair, 14 | 606.8 | 72.6 |
+| **shared by the pair, 12** | **625.0** | **78.4** |
+| the same at `-ub 512`, 10 | 634.0 | 74.9 |
+
+The last row buys 1.4% of prefill for 4.7% of generation, and a server generates
+continuously and prefills once a request, so the deployed split is the fourth.
+`-ub 512` also frees enough compute buffer for two more layers on the Blackwells,
+which is why it can hold ten KV layers where 1024 holds twelve.
+
+Against the four-way split this replaces: **prefill 369.5 -> 627.1, generation
+63.3 -> 78.5**. Everything verified elementwise against the reference reduction,
+and clearing both variables restores the previous behaviour exactly, output hash
+included.
+
+**Where the collective's time goes now.** It costs 1602 ms on the critical rank
+against 2786 before, and the shape has changed completely:
+
+| rank | total | publish | wait_pub | reduce | wait_red | gather |
+|---|---:|---:|---:|---:|---:|---:|
+| 5080 | 1454 | 16.2% | 28.6% | 19.6% | 11.4% | 24.2% |
+| 5070 Ti | 1421 | 16.5% | 27.2% | 20.1% | 11.5% | 24.7% |
+| V100 SXM2 | 1602 | 5.6% | 7.4% | 9.4% | 3.6% | **74.0%** |
+| V100 PCIe | 1593 | 7.4% | 7.5% | 7.1% | 12.8% | **65.3%** |
+
+The Teslas now spend two thirds of their collective gathering. They publish and
+reduce almost nothing -- they own twelve layers out of sixty-five -- so what is
+left is fetching results, and the next thing worth attacking is which of those
+fetches are real. The `NEEDED` flag already drops the ones for layers they take
+no part in; what remains is the pair fetching each other's half, plus the
+activation each needs to start its own layer.
+
+**What this does not reach.** A real `-sm layer` run does 942 tokens/s of prefill
+against this 627, and 47.6 of generation against 78.5. Expressing pure layer
+splitting through this mask gives 550.7 -- worse than either -- because a
+collective with one participant still publishes to host memory and the next
+owner reads it back, where layer splitting copies device to device once. So the
+hybrid is the better trade for a server and the worse one for a batch prefill,
+and the gap to `-sm layer` on prefill is a transfer the collective makes and a
+copy does not.
