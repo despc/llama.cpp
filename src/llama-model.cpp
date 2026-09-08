@@ -368,6 +368,109 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
+// Per-layer participation: which devices hold a given layer, and in what
+// proportion.
+//
+// The split state below applies one --tensor-split to every tensor, so every
+// device holds a slice of every layer and every layer ends in a collective over
+// all of them.  On four cards of two speeds that is the wrong shape: the two
+// Blackwells reduce a layer between themselves far faster than four cards can,
+// and the Teslas are worth more as owners of whole layers -- holding weights and
+// KV that the Blackwells have no room for -- than as participants in every
+// reduction.
+//
+// LLAMA_META_TP     which devices share the layers nobody owns outright, e.g. "0,1"
+// LLAMA_META_OWN    layers owned whole by one device, e.g. "8-11:2,20-23:3"
+//
+// Unset leaves the behaviour exactly as before.  A device with no share of a
+// tensor gets a zero-length slice, which is what makes this expressible without
+// changing what any operation means.
+struct llama_meta_participation {
+    bool                 active = false;
+    std::vector<bool>    tp;        // devices sharing an unowned layer
+    std::vector<int>     owner;     // per layer, -1 when unowned
+};
+
+static const llama_meta_participation & llama_meta_get_participation(size_t n_devices, uint32_t n_layer) {
+    static llama_meta_participation p;
+    static bool parsed = false;
+    if (parsed) {
+        return p;
+    }
+    parsed = true;
+    p.tp.assign(n_devices, true);
+    p.owner.assign(n_layer, -1);
+
+    const char * tp_spec = getenv("LLAMA_META_TP");
+    if (tp_spec && *tp_spec) {
+        p.tp.assign(n_devices, false);
+        std::string spec(tp_spec);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            size_t comma = spec.find(',', pos);
+            const int d = atoi(spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos).c_str());
+            if (d >= 0 && (size_t) d < n_devices) {
+                p.tp[d] = true;
+                p.active = true;
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+    }
+
+    const char * own_spec = getenv("LLAMA_META_OWN");
+    if (own_spec && *own_spec) {
+        std::string spec(own_spec);
+        size_t pos = 0;
+        while (pos < spec.size()) {
+            const size_t comma = spec.find(',', pos);
+            const std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            const size_t colon = item.find(':');
+            if (colon != std::string::npos) {
+                const int dev = atoi(item.substr(colon + 1).c_str());
+                const std::string range = item.substr(0, colon);
+                const size_t dash = range.find('-');
+                const int lo = atoi(range.substr(0, dash).c_str());
+                const int hi = dash == std::string::npos ? lo : atoi(range.substr(dash + 1).c_str());
+                for (int il = lo; il <= hi && il < (int) n_layer; ++il) {
+                    if (il >= 0 && dev >= 0 && (size_t) dev < n_devices) {
+                        p.owner[il] = dev;
+                        p.active = true;
+                    }
+                }
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+    }
+
+    if (p.active) {
+        std::string tp_str;
+        for (size_t d = 0; d < n_devices; ++d) {
+            if (p.tp[d]) {
+                tp_str += (tp_str.empty() ? "" : ",") + std::to_string(d);
+            }
+        }
+        LLAMA_LOG_INFO("%s: per-layer participation: shared layers on {%s}\n", __func__, tp_str.c_str());
+        for (size_t d = 0; d < n_devices; ++d) {
+            std::string owned;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (p.owner[il] == (int) d) {
+                    owned += (owned.empty() ? "" : ",") + std::to_string(il);
+                }
+            }
+            if (!owned.empty()) {
+                LLAMA_LOG_INFO("%s: device %zu owns layers %s outright\n", __func__, d, owned.c_str());
+            }
+        }
+    }
+    return p;
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
@@ -790,10 +893,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
+        // The share each device takes of this tensor.  Normally --tensor-split
+        // for all of them; with a participation mask, zero for the devices that
+        // do not hold this layer, so their slice comes out empty.
+        const llama_meta_participation & part = llama_meta_get_participation(ud->n_devices, hparams.n_layer());
+        const bool is_layer_tensor = tensor_name.substr(0, 4) == "blk." || tensor_name.substr(0, 6) == "cache_";
+        const int owner = part.active && is_layer_tensor && tc.il < part.owner.size() ? part.owner[tc.il] : -1;
+        auto share = [&](size_t d) -> float {
+            const float base = tensor_split == nullptr ? 0.0f : tensor_split[d];
+            if (!part.active || !is_layer_tensor) {
+                return base;
+            }
+            if (owner >= 0) {
+                return d == (size_t) owner ? 1.0f : 0.0f;
+            }
+            return part.tp[d] ? base : 0.0f;
+        };
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(share((j + tc.rotation) % ud->n_devices));
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
