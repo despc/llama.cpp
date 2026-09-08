@@ -1291,6 +1291,75 @@ static uint64_t ggml_cuda_mixed_ar_env(const char * name, uint64_t fallback) {
     return end != v ? (uint64_t) parsed : fallback;
 }
 
+// Is a direct device-to-device route available inside this registry, and is it
+// worth anything?  The collective moves every byte through mapped host memory
+// because these cards have no P2P across the two driver stacks -- but within one
+// stack the answer is a property of the chipset, not of the software, and it has
+// to be measured rather than assumed.  Opt-in via GGML_CUDA_P2P_PROBE; runs once.
+void ggml_cuda_probe_p2p(ggml_backend_t * backends, size_t n) {
+    static bool done = false;
+    if (done || !ggml_env_flag_enabled("GGML_CUDA_P2P_PROBE") || n < 2) {
+        return;
+    }
+    done = true;   // group_init runs more than once; enabling peer access twice is an error
+    const size_t bytes = 128ull << 20;
+    for (size_t a = 0; a < n; ++a) {
+        for (size_t b = a + 1; b < n; ++b) {
+            const int da = static_cast<ggml_backend_cuda_context *>(backends[a]->context)->device;
+            const int db = static_cast<ggml_backend_cuda_context *>(backends[b]->context)->device;
+            int can_ab = 0, can_ba = 0;
+            cudaDeviceCanAccessPeer(&can_ab, da, db);
+            cudaDeviceCanAccessPeer(&can_ba, db, da);
+            GGML_LOG_WARN("p2p_probe backend=%s %d<->%d canAccessPeer %s/%s\n",
+                          GGML_CUDA_NAME, da, db, can_ab ? "yes" : "no", can_ba ? "yes" : "no");
+            void * pa = nullptr; void * pb = nullptr; void * ph = nullptr;
+            ggml_cuda_set_device(da);
+            if (cudaMalloc(&pa, bytes) != cudaSuccess) { continue; }
+            ggml_cuda_set_device(db);
+            if (cudaMalloc(&pb, bytes) != cudaSuccess) { cudaFree(pa); continue; }
+            if (cudaHostAlloc(&ph, bytes, cudaHostAllocPortable) != cudaSuccess) { ph = nullptr; }
+            cudaEvent_t e0, e1;
+            ggml_cuda_set_device(da);
+            cudaEventCreate(&e0); cudaEventCreate(&e1);
+            float ms = 0.0f;
+            if (can_ab && can_ba) {
+                ggml_cuda_set_device(da);
+                if (cudaDeviceEnablePeerAccess(db, 0) == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); }
+                ggml_cuda_set_device(db);
+                if (cudaDeviceEnablePeerAccess(da, 0) == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); }
+                ggml_cuda_set_device(da);
+                cudaMemcpyPeer(pb, db, pa, da, bytes);
+                cudaEventRecord(e0);
+                for (int k = 0; k < 5; ++k) { cudaMemcpyPeer(pb, db, pa, da, bytes); }
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                GGML_LOG_WARN("p2p_probe backend=%s %d->%d peer   %6.2f GB/s\n",
+                              GGML_CUDA_NAME, da, db, 5.0*bytes/1e9/(ms/1000.0));
+            }
+            if (ph) {
+                ggml_cuda_set_device(da);
+                cudaMemcpy(ph, pa, bytes, cudaMemcpyDeviceToHost);
+                cudaEventRecord(e0);
+                for (int k = 0; k < 5; ++k) { cudaMemcpy(ph, pa, bytes, cudaMemcpyDeviceToHost); }
+                cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms, e0, e1);
+                GGML_LOG_WARN("p2p_probe backend=%s %d    d2h    %6.2f GB/s\n",
+                              GGML_CUDA_NAME, da, 5.0*bytes/1e9/(ms/1000.0));
+                ggml_cuda_set_device(db);
+                cudaEvent_t f0, f1; cudaEventCreate(&f0); cudaEventCreate(&f1);
+                cudaMemcpy(pb, ph, bytes, cudaMemcpyHostToDevice);
+                cudaEventRecord(f0);
+                for (int k = 0; k < 5; ++k) { cudaMemcpy(pb, ph, bytes, cudaMemcpyHostToDevice); }
+                cudaEventRecord(f1); cudaEventSynchronize(f1); cudaEventElapsedTime(&ms, f0, f1);
+                GGML_LOG_WARN("p2p_probe backend=%s %d    h2d    %6.2f GB/s\n",
+                              GGML_CUDA_NAME, db, 5.0*bytes/1e9/(ms/1000.0));
+                cudaEventDestroy(f0); cudaEventDestroy(f1);
+                cudaFreeHost(ph);
+            }
+            cudaEventDestroy(e0); cudaEventDestroy(e1);
+            cudaFree(pa); cudaFree(pb);
+        }
+    }
+}
+
 static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * ret) {
     // Streaming and reduce-scatter are transport, measured byte-identical to the
     // single-shot kernel.  Below a threshold the collective is latency-bound and

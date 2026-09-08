@@ -1303,3 +1303,54 @@ reference. Nothing else would have caught it.
 The barrier is now grid-wide across every rank and block; eight blocks are
 resident together, so it cannot deadlock. This is the case the bit-identity
 discipline exists for: under "no difference was detected" it would have shipped.
+
+### P2P: available on one pair, and slower than the host
+
+The collective moves every byte through mapped host memory. Whether a direct
+device-to-device route would be better is a property of the chipset, so it was
+measured rather than assumed, with a probe running inside each library's own
+namespace -- device ids repeat across the two stacks, so a probe in the wrong one
+silently reports the wrong pair.
+
+| route | GB/s |
+| --- | ---: |
+| Blackwell to Blackwell, peer | unavailable (`canAccessPeer` no, `nvidia-smi` reports CNS) |
+| Blackwell to host / host to Blackwell | 7.15 / 5.96 |
+| **V100 to V100, peer** | **1.38** |
+| V100 to host / host to V100 | 3.29 / 3.32 |
+
+The Tesla pair can do peer access and it runs at less than half the speed of the
+path already in use. Both pairs sit behind a host bridge -- `nvidia-smi topo -m`
+reports PHB, not a switch and not NVLink -- and ACS is on (`ReqRedir+`
+`CmpltRedir+`), so peer traffic is redirected up to the root complex and back
+down. That route is evidently worse than letting the root complex DMA to and from
+DRAM.
+
+So P2P is not a way out of the host path here. It would have to be re-checked if
+the cards moved to slots under a common switch, or if ACS were changed -- neither
+is a software decision, and neither should be made on the strength of an
+unmeasured expectation.
+
+The probe stays behind `GGML_CUDA_P2P_PROBE`, off by default and one-shot: it
+enables peer access, and `group_init` runs more than once, which crashed the
+server the first time it ran.
+
+### Where this leaves the collective
+
+The critical rank is the SXM2 Tesla, and it is not waiting: 291 ms of `wait_pub`
+and 394 ms of `wait_red` out of 20.8 s. The other 20.1 s is its own work --
+publish 8.1, reduce 4.1, gather 8.0 -- so there is no idle time on the critical
+path to overlap into, which is why a streamed publish-to-reduce overlap was
+started and then abandoned: it targets a wait that does not exist.
+
+Its traffic per collective is `2N + 3wN` for a share w: 2.75N at an even split,
+2.45N at 35/35/15/15, and 2.00N if it owned nothing. Publication is the floor --
+every element is reduced by one owner who needs every rank's contribution, so all
+of N must be published -- and driving w to zero was measured worse overall (345
+against 391 tokens/s) because the Blackwells become the bottleneck first.
+
+What remains would have to change the bytes or the topology: compression, which
+this deployment excludes on accuracy grounds and which is where the historical
+1000+ tokens/s came from; P2P, measured above and slower; or fewer collectives,
+which is a property of the model graph. Within the current constraints this is
+close to the floor.

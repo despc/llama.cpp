@@ -84,6 +84,7 @@ using ggml_cuda_mixed_ar_group_free_t = void (*)(void *);
 using ggml_cuda_mixed_ar_group_prepare_t = bool (*)(void *, size_t);
 using ggml_cuda_mixed_ar_group_enqueue_t = bool (*)(void *, ggml_tensor **, size_t, uint32_t);
 
+void ggml_cuda_probe_p2p(ggml_backend_t * backends, size_t n);
 void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * config);
 void ggml_cuda_mixed_ar_group_free(void * context);
 bool ggml_cuda_mixed_ar_group_prepare(void * context, size_t slot);
