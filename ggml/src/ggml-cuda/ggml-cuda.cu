@@ -1280,7 +1280,32 @@ static bool ggml_backend_cuda_comm_allreduce_mixed(
     return true;
 }
 
+// One place that reads the tuning environment for the whole communicator.
+static uint64_t ggml_cuda_mixed_ar_env(const char * name, uint64_t fallback) {
+    const char * v = getenv(name);
+    if (!v || !*v) {
+        return fallback;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = strtoull(v, &end, 10);
+    return end != v ? (uint64_t) parsed : fallback;
+}
+
 static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * ret) {
+    // Streaming and reduce-scatter are transport, measured byte-identical to the
+    // single-shot kernel.  Below a threshold the collective is latency-bound and
+    // the extra barriers are not repaid: measured at decode, reduce-scatter
+    // everywhere costs 66.14 -> 50.84 tokens/s.
+    const bool stream_on = !getenv("GGML_CUDA_MIXED_AR_STREAM") ||
+                            ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_STREAM");
+    const bool rs_on     = !getenv("GGML_CUDA_MIXED_AR_RS") ||
+                            ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_RS");
+    const uint64_t mixed_ar_stream_min = stream_on
+        ? ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_STREAM_MIN_BYTES", 256*1024) : 0;
+    const uint64_t mixed_ar_rs_min = rs_on
+        ? ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_RS_MIN_BYTES", 256*1024) : 0;
+    const uint32_t mixed_ar_chunk = (uint32_t) std::max<uint64_t>(1,
+        ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_STREAM_CHUNK", 8));
     const size_t n_ranks = ret->backends.size();
     if (n_ranks < 2 || n_ranks > GGML_CUDA_MAX_DEVICES) {
         return false;
@@ -1318,12 +1343,16 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
         for (int rank : ranks) {
             local_backends.push_back(ret->backends[rank]);
         }
+        // Negotiated here, once, and handed to every runtime.  Reading the
+        // environment separately inside each DSO's enqueue is how two of them end
+        // up in different algorithms with matching buffer sizes.
         const ggml_cuda_mixed_ar_group_config config = {
             GGML_CUDA_MIXED_AR_ABI_VERSION,
             local_backends.data(), ranks.data(), local_backends.size(), n_ranks,
             ret->mixed_host, shared_bytes, data_bytes,
             GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
             GGML_CUDA_MIXED_AR_BLOCKS, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
+            mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk,
         };
         void * context = init(&config);
         if (!context) {

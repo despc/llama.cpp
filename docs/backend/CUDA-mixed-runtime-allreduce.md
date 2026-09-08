@@ -1170,9 +1170,19 @@ Measured on the 27B tensor-parallel deployment across four GPUs, greedy,
 prefill likewise matched (`756a2b7872419b29`). Mixed is 55% faster on generation
 and 31% on prefill while producing the same bits.
 
-That is the distinction this project learned to insist on: not "no difference was
-detected" but "a difference cannot arise". Compact attention was removed because
-it only ever reached the first of those. This reaches the second.
+The structural argument is that a difference cannot arise: the tree, the operand
+order and the per-step rounding all match, and under reduce-scatter each element
+is reduced once by one rank.
+
+**The hash does not prove that.** An identical continuation means the greedy pick
+matched at every position, and argmax absorbs logit differences that never reach
+the top of the distribution. It is strong evidence for the argument and not a
+substitute for it. Bit-identity of the collective's own output has not been
+measured, and the review that found the signal-word collision below is a reminder
+that a structural argument can be right about the arithmetic and wrong about
+everything around it. A direct test of the collective -- comparing the reduced
+tensor on every rank against the reference tree across sizes, modes, tails,
+inactive contributions and slot reuse -- is owed and not yet written.
 
 ### What the runs do not cover
 
@@ -1209,10 +1219,16 @@ A 10k prefill of the 27B, per-operation profiler on:
 
 Per device: CUDA0 1625, CUDA1 1829, V100_CUDA0 3013, V100_CUDA1 2712 ms.
 
-Tensor parallelism runs the cards concurrently, so the compute cost is the
-busiest device -- **3.0 s** -- against **35.6 s** of wall. Compute is about 8% of
-a prefill and the collective is nearly all the rest. That retired kernel-level
-work before it was started: there is no 92% hiding in the matmuls.
+Tensor parallelism runs the cards concurrently, so model compute costs at least
+the busiest device -- **3.0 s** -- against **35.6 s** of wall.
+
+That bounds compute from below and does not decompose the remaining 32 s: the
+maximum of per-device operation time is not the sum of the critical path's
+stages, and what is left holds publication, waiting, the reduction itself, the
+gather, launch overhead and host-side slot waits together. It was enough to
+retire kernel-level work -- there is no large win hiding in the matmuls -- and it
+is not enough to say the collective is 92%. Splitting those stages is what the
+next prototype should start from.
 
 With no P2P between these cards every byte crosses PCIe twice through mapped
 host memory, so the collective's cost is bytes, and the question became which

@@ -1040,7 +1040,8 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
 
     if (tid == 0) {
         uint32_t * my_signal = arrival_slot +
-            ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+            ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS +
+            GGML_CUDA_MIXED_AR_SIG_FLAT_ARRIVAL;
         *(volatile uint32_t *) my_signal = token;
         __threadfence_system();
 
@@ -1049,7 +1050,8 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
                 continue;
             }
             const uint32_t * peer_signal = arrival_slot +
-                ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
+                ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS +
+                GGML_CUDA_MIXED_AR_SIG_FLAT_ARRIVAL;
             while (*(const volatile uint32_t *) peer_signal != token) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
                 __nanosleep(100);
@@ -1153,9 +1155,9 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
     __shared__ int sh_peer_min;
     if (tid == 0) {
         // steps first, then the token that validates them
-        *(volatile uint32_t *) (my_sig + 1) = 0;
+        *(volatile uint32_t *) (my_sig + GGML_CUDA_MIXED_AR_SIG_STREAM_STEPS) = 0;
         __threadfence_system();
-        *(volatile uint32_t *) my_sig = token;
+        *(volatile uint32_t *) (my_sig + GGML_CUDA_MIXED_AR_SIG_STREAM_TOKEN) = token;
         __threadfence_system();
         sh_peer_min = 0;
     }
@@ -1215,8 +1217,9 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
                 }
                 const uint32_t * ps = arrival_slot +
                     ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
-                const int done = *(const volatile uint32_t *) ps == token
-                    ? (int) *(const volatile uint32_t *) (ps + 1) : 0;
+                const int done =
+                    *(const volatile uint32_t *) (ps + GGML_CUDA_MIXED_AR_SIG_STREAM_TOKEN) == token
+                    ? (int) *(const volatile uint32_t *) (ps + GGML_CUDA_MIXED_AR_SIG_STREAM_STEPS) : 0;
                 m = min(m, done);
             }
             sh_peer_min = m;
@@ -1237,7 +1240,7 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
         __threadfence_system();
         __syncthreads();
         if (tid == 0) {
-            *(volatile uint32_t *) (my_sig + 1) = (uint32_t) (step + 1);
+            *(volatile uint32_t *) (my_sig + GGML_CUDA_MIXED_AR_SIG_STREAM_STEPS) = (uint32_t) (step + 1);
             __threadfence_system();
         }
         __syncthreads();
@@ -1258,7 +1261,7 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
-        *(volatile uint32_t *) (my_sig + 1) = (uint32_t) (n_steps + 1);
+        *(volatile uint32_t *) (my_sig + GGML_CUDA_MIXED_AR_SIG_STREAM_STEPS) = (uint32_t) (n_steps + 1);
         __threadfence_system();
     }
     __syncthreads();
@@ -1292,8 +1295,8 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
                 }
                 const uint32_t * ps = arrival_slot +
                     ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
-                while (*(const volatile uint32_t *) ps != token ||
-                       *(const volatile uint32_t *) (ps + 1) < (uint32_t) (n_steps + 1)) {
+                while (*(const volatile uint32_t *) (ps + GGML_CUDA_MIXED_AR_SIG_STREAM_TOKEN) != token ||
+                       *(const volatile uint32_t *) (ps + GGML_CUDA_MIXED_AR_SIG_STREAM_STEPS) < (uint32_t) (n_steps + 1)) {
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
                     __nanosleep(100);
 #else
@@ -1415,7 +1418,7 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         __threadfence_system();
     };
 
-    barrier(0);
+    barrier(GGML_CUDA_MIXED_AR_SIG_RS_PUBLISHED);
 
     // 2. reduce this rank's shard, into recvbuf and back into its own slot.  Its
     //    own contribution there is read by nobody -- a peer only ever reads the
@@ -1458,7 +1461,7 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         host_mine[tail + tid] = total;
     }
 
-    barrier(1);
+    barrier(GGML_CUDA_MIXED_AR_SIG_RS_REDUCED);
 
     // 3. collect the shards this rank did not reduce
     for (int peer = 0; peer < n_ranks; ++peer) {
@@ -1484,6 +1487,9 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
 
 struct ggml_cuda_mixed_ar_group {
     size_t n_ranks = 0;
+    uint64_t stream_min_bytes = 0;
+    uint64_t rs_min_bytes = 0;
+    uint32_t stream_chunk = 8;
     size_t data_bytes = 0;
     void * shared_host = nullptr;
     bool host_registered = false;
@@ -1540,6 +1546,9 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
 
     auto * group = new ggml_cuda_mixed_ar_group;
     group->n_ranks = config->n_ranks;
+    group->stream_min_bytes = config->stream_min_bytes;
+    group->rs_min_bytes = config->rs_min_bytes;
+    group->stream_chunk = config->stream_chunk ? config->stream_chunk : 1;
     group->data_bytes = data_bytes;
     group->shared_host = config->shared_host;
     group->backends.assign(config->backends, config->backends + config->n_backends);
@@ -1639,35 +1648,14 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(group->backends[i]->context);
         const int64_t ne = ggml_nelements(tensor);
         const bool contribute = (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
-        // Streaming publication with the duplex drain.  Transport only: the same
-        // butterfly over the same values, so the result is bit-identical to the
-        // kernel it replaces.  On by default: measured 241.4 -> 281.1 tokens/s of
-        // prefill on the 27B four-GPU deployment with byte-identical output.
-        // GGML_CUDA_MIXED_AR_STREAM=0 falls back to the single-shot kernel.
-        //
-        // The chunk is how many vectors per thread a step publishes before it
-        // advertises progress.  Swept on that deployment: 1 -> 208.3, 2 -> 258.8,
-        // 4 -> 275.5, 8 -> 281.1, 16 -> 272.8.  Signalling too often spends more on
-        // system fences than the earlier drain wins back.  Below the byte threshold
-        // the single-shot kernel runs: decode's collectives are latency-bound.
-        static const bool stream_on = !getenv("GGML_CUDA_MIXED_AR_STREAM") ||
-                                       ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_STREAM");
-        static const int  stream_chunk = std::max<int>(1,
-            (int) ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_CHUNK", 8));
-        static const size_t stream_min =
-            ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_STREAM_MIN_BYTES", 256*1024);
-        const bool use_stream = stream_on && ggml_nbytes(tensor) >= stream_min;
-        // Reduce-scatter plus all-gather: 2.75N of host traffic against 4N, and
-        // half the reads.  Two barriers instead of one, so it needs a tensor large
-        // enough to repay them; below the threshold the single-shot kernel runs.
-        // Measured on the 27B four-GPU deployment: prefill 280.5 -> 371.1 tokens/s
-        // against the streaming kernel, 187.4 for the meta backend, all three
-        // byte-identical.  GGML_CUDA_MIXED_AR_RS=0 falls back to streaming.
-        static const bool rs_on = !getenv("GGML_CUDA_MIXED_AR_RS") ||
-                                   ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_RS");
-        static const size_t rs_min =
-            ggml_cuda_ar_env_u64("GGML_CUDA_MIXED_AR_RS_MIN_BYTES", 256*1024);
-        const bool use_rs = rs_on && group->n_ranks > 1 && ggml_nbytes(tensor) >= rs_min;
+        // Algorithm from the negotiated config, never from this runtime's own
+        // environment: both DSOs must reach the same answer for the same tensor.
+        const size_t nbytes = ggml_nbytes(tensor);
+        const int  stream_chunk = (int) group->stream_chunk;
+        const bool use_rs     = group->rs_min_bytes && group->n_ranks > 1 &&
+                                nbytes >= group->rs_min_bytes;
+        const bool use_stream = !use_rs && group->stream_min_bytes &&
+                                nbytes >= group->stream_min_bytes;
         const ggml_type wire_type = tensor->type;
         const size_t rank_stride = GGML_CUDA_MIXED_AR_RANK_BYTES / ggml_type_size(wire_type);
 

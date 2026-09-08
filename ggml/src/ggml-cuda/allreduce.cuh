@@ -9,8 +9,13 @@
 // Opaque pipeline context -- owns all pinned buffers, streams, and events.
 struct ggml_cuda_ar_pipeline;
 
-// Native-type mixed-runtime wire. Version 5 cannot load the old compressed ABI.
-static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 5;
+// Native-type mixed-runtime wire.  Version 6 adds streaming publication and
+// reduce-scatter, which use signal words version 5 did not, and moves the choice
+// of algorithm into the config so both runtimes cannot pick different ones.
+// Matching buffer sizes never implied a matching protocol; a rank running flat
+// while its peer runs reduce-scatter would wait forever for a phase the other
+// never signals.
+static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 6;
 static constexpr size_t GGML_CUDA_MIXED_AR_SLOTS = 2;
 static constexpr size_t GGML_CUDA_MIXED_AR_RANK_BYTES = 64 * 1024 * 1024;
 static constexpr size_t GGML_CUDA_MIXED_AR_BLOCKS = 8;
@@ -18,6 +23,27 @@ static constexpr size_t GGML_CUDA_MIXED_AR_BLOCKS = 8;
 // the butterfly tree is reduced in.
 static constexpr int GGML_CUDA_MIXED_AR_MAX_RANKS = GGML_CUDA_MAX_DEVICES;
 static constexpr size_t GGML_CUDA_MIXED_AR_SIGNAL_STRIDE = 64;
+
+// Words within one (rank, block) signal slot.  Every algorithm and phase gets its
+// own: they carry different things -- a token here, a step count there -- and a
+// step count of 3 left by one algorithm is indistinguishable from another's token
+// 3 when a slot is reused.  Sixteen words fit in the stride; five are used.
+enum ggml_cuda_mixed_ar_signal_word {
+    GGML_CUDA_MIXED_AR_SIG_FLAT_ARRIVAL = 0,
+    GGML_CUDA_MIXED_AR_SIG_STREAM_STEPS = 1,   // how many steps published
+    GGML_CUDA_MIXED_AR_SIG_STREAM_TOKEN = 2,   // validates the count above
+    GGML_CUDA_MIXED_AR_SIG_RS_PUBLISHED = 3,
+    GGML_CUDA_MIXED_AR_SIG_RS_REDUCED = 4,
+};
+
+// Which kernel a group runs.  Chosen once, on the host, and handed to every rank
+// through the config: each runtime deciding for itself from its own environment
+// and its own build is how two of them end up in different protocols.
+enum ggml_cuda_mixed_ar_algo {
+    GGML_CUDA_MIXED_AR_ALGO_FLAT = 0,
+    GGML_CUDA_MIXED_AR_ALGO_STREAM = 1,
+    GGML_CUDA_MIXED_AR_ALGO_RS = 2,
+};
 
 struct ggml_cuda_mixed_ar_group_config {
     uint32_t abi_version;
@@ -32,6 +58,12 @@ struct ggml_cuda_mixed_ar_group_config {
     size_t rank_bytes;
     size_t blocks;
     size_t signal_stride;
+    // Negotiated once for the whole communicator, not re-derived per runtime.
+    // Every rank picks the algorithm from these and the tensor's size, so the
+    // choice is a pure function of values all of them were handed.
+    uint64_t stream_min_bytes;  // 0 disables streaming
+    uint64_t rs_min_bytes;      // 0 disables reduce-scatter
+    uint32_t stream_chunk;
 };
 
 using ggml_cuda_mixed_ar_group_init_t = void * (*)(const ggml_cuda_mixed_ar_group_config *);
