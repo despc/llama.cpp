@@ -1,8 +1,13 @@
 # Flash-Next four-GPU optimization plan
 
-> 2026-09-08 source rollback: the retained Volta dispatch/tile optimizations, sparse execution overrides, and sort-workspace override described below have now been removed at the user's request. Their dispositions and throughput figures below are historical. See [CUDA numerical optimization rollback](CUDA-numerics-rollback.md) for the current source state and verification limits. No binaries have been rebuilt or deployed.
+> 2026-09-08: the numerical rollback described below stands. The three Volta
+> kernel-dispatch fixes were subsequently restored at the user's request, each
+> behind a flag defaulting on, after a direct A/B established that builds with and
+> without them produce byte-identical greedy output. Upstream was merged again,
+> everything was rebuilt, validated and deployed. See [CUDA numerical optimization
+> rollback](CUDA-numerics-rollback.md) for the rollback's own scope.
 
-Updated: 2026-09-07. Source reviewed: `79f26bba9`, after merging upstream `67672dc5b` and retaining `91a4d956e` (removal of compact attention).
+Updated: 2026-09-08. Source: `a1d813126`, after a second upstream merge (`c6f1ba481`), the numerical rollback (`7636cd2e4`) and the removal of compact attention (`91a4d956e`). This source is built and deployed.
 
 This document contains current constraints, a short record of completed work, and the remaining execution order. Earlier rankings, implementation diaries, and removed-path instructions are superseded. Their full record is available in this file at commit `91a4d956e` and its predecessors.
 
@@ -12,8 +17,8 @@ This document contains current constraints, a short record of completed work, an
 - Compact attention was removed from source and launchers, both prefill and decode. Do not restore it as part of this plan. The model's own sparse selection remains; the removed optimization was a different way to execute selected attention.
 - New optimizations must not introduce an accuracy tradeoff. Prefer removal of redundant copies, exact selection, and reuse of unchanged data. Reduced precision, changed reductions/routing, and tolerance-based quality claims do not meet this requirement.
 - The existing Volta dispatch fixes remain the accepted starting point. They can change arithmetic ordering in principle; historical matching greedy responses do not prove universal numerical equivalence. Keeping them is an existing decision, not permission to accept further numerical changes. Removing them requires a separate decision.
-- The upstream merge completed without textual conflicts. The merged source has not been built or benchmarked in this work. Historical rates and installed libraries must not be labeled as measurements of `79f26bba9`.
-- This update changes documentation only. It does not authorize replacing deployed binaries, stopping a user-owned server, changing hardware settings, or committing/pushing subsequent work without approval.
+- Both upstream merges completed without textual conflicts. The merged source has been built, validated and deployed; the figures in this document below the "Current measurements" heading are measurements of it. Anything labelled historical is not.
+- Deploying, committing and pushing were done at explicit request. They remain per-request actions, not standing permission. Do not stop a user-owned server or change hardware settings without one.
 
 ## Reference configuration
 
@@ -64,9 +69,9 @@ All rates below are historical measurements from before the latest upstream merg
 
 | Work | Result | Current disposition |
 | --- | --- | --- |
-| Grouped quantized `MUL_MAT_ID` on Volta (`2628dc82d`) | Removed the per-expert host-synchronizing fallback; historical 5k prefill 478 -> 613 t/s | Kept |
-| Correct Volta DP4A tile table (`efb8d872e`) | Fixed selection of a table for a different execution layout; 613 -> 811 t/s at 5k | Kept |
-| Per-expert column tile, DP4A-only J_FIT (`de3dbad40`, `9e8b48b5f`) | 811 -> 907 t/s in the isolated 5k comparison; applying the rule to Blackwell MMA had erased much of the gain | Kept; attribution investigation closed |
+| Grouped quantized `MUL_MAT_ID` on Volta (`2628dc82d`) | Removed the per-expert host-synchronizing fallback; historical 5k prefill 478 -> 613 t/s | Kept, `GGML_CUDA_MMID_MMQ_PREFILL=0` disables |
+| Correct Volta DP4A tile table (`efb8d872e`) | Fixed selection of a table for a different execution layout; 613 -> 811 t/s at 5k | Kept. No flag and cannot have one: the host picks the launch configuration and the device picks it from `__CUDA_ARCH__`, so a runtime switch would desynchronise them |
+| Per-expert column tile, DP4A-only J_FIT (`de3dbad40`, `9e8b48b5f`) | 811 -> 907 t/s in the isolated 5k comparison; applying the rule to Blackwell MMA had erased much of the gain | Kept, `GGML_CUDA_MMQ_MMID_J_FIT=0` disables |
 | Profiling and flag parsing | Removed unconditional per-ubatch synchronization costing about 1.2% generation; `FLAG=0` now means disabled | Kept; profiling is opt-in |
 | Owned-process harnesses | Replaced broad process killing and fixed-port PID adoption | Reuse these, not obsolete launch recipes |
 | Sort-workspace cap (R11) | Correctness checked; cap alone did not speed prefill at fixed microbatch. It enabled ubatch 640 at long context | Optional memory tool, not a default speed optimization |
@@ -80,9 +85,33 @@ The compact prototype exposed real bugs in allocation size, reference-mask shape
 
 Its historical quality evidence did not establish absence of regression: tiled PPL was 2.8943 versus 2.8929 on one documentation corpus; decode top-1 agreed at 21/24 positions, and the logprob comparison retained only 14/24 because of top-40 truncation. The 0.048% PPL difference is not an upper quality-loss bound, and the selected decode sample cannot bound all predictions. These results do not justify restoring the path.
 
-### Historical dense-attention reference
+### Current measurements
 
-These are the non-compact arm of a recorded comparison with retained dispatch fixes, not post-merge measurements. The isolated 907 t/s J_FIT result came from a different run.
+Taken on the deployed build (`a1d813126`), through the reference launcher with no
+environment overrides. Prompt of 10k tokens, 3000 tokens generated:
+
+| | Prefill, t/s | Generation, t/s |
+| --- | ---: | ---: |
+| deployed | 830.1 | 58.93 |
+| same build, the three Volta fixes removed | 460.0 | 58.81 |
+
+The fixes are worth 1.8x on prefill and nothing on generation, which is what they
+were expected to be: they change expert-matmul dispatch, and decode leaves through
+MMVQ far below the batch size that rule concerns.
+
+**Byte-identical output, confirmed three times.** Builds with the fixes, without
+them, and before the rollback all produce the same 3000-token continuation
+(`88ac9d8de8a2`). The last of those was a direct A/B on the same prompt. This is
+identity, not agreement within a tolerance, and it is the reason the fixes were
+restored under a policy that otherwise excludes anything which could reorder
+arithmetic. It is not a proof for all inputs, and the flags exist so it can be
+re-checked.
+
+### Historical dense-attention curve
+
+Recorded before the upstream merges, the non-compact arm of a comparison with the
+same dispatch fixes. Still the best full curve available; not a measurement of the
+current source.
 
 | Prompt tokens | Prefill, t/s |
 | ---: | ---: |
@@ -92,7 +121,9 @@ These are the non-compact arm of a recorded comparison with retained dispatch fi
 | 100001 | 475.0 |
 | 150001 | 377.1 |
 
-The old uninstrumented dense decode profile reference was about 21.43 t/s after 150k. Short-prefix generation was roughly 60-65 t/s across historical runs. Neither rate has been re-established for the merged source.
+The old uninstrumented dense decode reference was about 21.43 t/s after 150k, and
+short-prefix generation 60-65 t/s. The 10k point above is consistent with this
+curve; the rest has not been re-measured since the merges.
 
 ### Bottleneck evidence still useful for prioritization
 
@@ -108,28 +139,24 @@ P0-P5 below replace all earlier rankings. Parenthesized R/G identifiers only ide
 
 | Priority | Work | Expected value and gate |
 | --- | --- | --- |
-| P0 | Validate and freeze the merged-source baseline | Required before attributing new changes; bounded validation, not another instrumentation project |
+| ~~P0~~ | **Done.** Merged-source baseline built, validated and deployed | Prefill 830.1 t/s and generation 58.93 t/s at 10k/3k, output byte-identical to the pre-merge build. Future candidates compare against this. |
 | P1 | Exact TOP_K contract, tests, then selector (R12) | Best evidenced admissible long-context compute opportunity; preserve boundary-tie membership |
 | P2 | Remove redundant MTP handoffs and waits (G2/R13/G5) | Small targeted changes first; proceed on measured exposed cost |
 | P3 | Reduce peak-live temporary buffers and redundant copies (R4/R7/R9/R15/R16) | Memory/launch enabler; preserve arithmetic, ownership, and dependencies |
 | P4 | Reuse unchanged pooled indexer keys (R10) | Conditional long-context opportunity; invalidation and persistent memory are substantial costs |
 | P5 | Retry two-slot pipeline (R2) | Only after P3 demonstrates full-context headroom and a workable dependency schedule |
 
-### P0. Freeze the new baseline
+### P0. Freeze the new baseline -- done
 
-Upstream introduced changes relevant to this model:
+Both upstream merges were taken, built from one source revision for both CUDA
+backends, validated and deployed. The upstream changes flagged as relevant to this
+model were merged with them, including `5a6caa05f` (ggml_prec specification) from
+the second merge; none of them changed the output on the validation prompt, which
+came back byte-identical to the pre-merge build.
 
-- `5fdfa6282`: GDN Q/K normalization now uses `build_gdn_l2_norm`, with epsilon inside the root, instead of the previous clamped L2 norm. It changes the formula, not just speed. Source: `src/models/models.h` and `src/models/qwen4exp.cpp`.
-- `73ab7599b`: branchless Q4_K/Q5_K unpack in MMVQ, relevant to multi-row verification. Its L2-prefetch addition is gated to DGX Spark, not our GPUs. Do not implement the unpack optimization again.
-- `73a43d1f6` and `b74f590ea`: CUDA race/barrier fixes in MMID/MMF and flash attention.
-
-Build a separate candidate runtime using all available CPU threads, with no other task work while building. Keep the installed runtime unchanged. Verify executable and loaded-library identities for both CUDA namespaces.
-
-Run existing backend correctness coverage for changed paths on Volta and Blackwell. Establish uninstrumented prefill and sustained generation at representative short and long prefixes, including a full-context memory check. Reuse valid archived fixtures rather than rebuilding the historical experiment matrix.
-
-Record differences against the pre-merge build separately from future optimization comparisons. A changed response can now come from the upstream GDN correction; blindly demanding old token output would conflate a model correctness fix with an optimization regression. Future candidates compare against the validated merged baseline.
-
-Deliverable: an identified baseline build, effective configuration, raw timing/correctness results, and memory headroom. No promotion based only on an automatic textual merge.
+What was not done: the full 5k/30k/50k/100k/150k matrix was not re-run after the
+merges. One 10k/3k point was, and it agrees with the historical curve. A candidate
+that needs the long end will have to establish it.
 
 ### P1. Exact TOP_K before new attention work
 
@@ -225,6 +252,6 @@ No generic quality benchmark proves absence of regressions on all inputs. A futu
 - Harnesses: `/home/despc/llama.cpp/bench/harness.sh`, `longctx.sh`, `tg50.sh`, `census.sh`, and `greedy-diff.sh`. Check current behavior and process ownership before reuse.
 - Long-prompt fixtures: `/home/despc/llama.cpp/bench/prompt30k.json`, `prompt100k.json`, and `prompt150k.json`.
 - Old diary and temporary evidence paths: `git show 91a4d956e:docs/backend/CUDA-flash-next-prefill-plan.md`. Temporary artifact existence is not guaranteed; archive reused raw evidence in durable storage.
-- Earlier dense-27B tensor-parallel work is separate: [CUDA mixed-runtime AllReduce](CUDA-mixed-runtime-allreduce.md). Do not apply its bottleneck model to this layer-split workload.
+- Dense-27B tensor-parallel work is separate: [CUDA mixed-runtime AllReduce](CUDA-mixed-runtime-allreduce.md). Do not apply its bottleneck model to this layer-split workload. One result from it is worth knowing here, because it is the shape of answer this plan's policy asks for: the mixed AllReduce kernel now reduces on the same butterfly tree as the meta backend, with the same per-step rounding, and its output is bit-identical to the reference over 2000 generated tokens while running 55% faster. An optimisation that cannot change the result is admissible without a quality argument, because there is nothing left to measure.
 
 Next concrete work: P0 baseline validation, then P1 selection-contract tests before implementing faster TOP_K. No GPU experiments or runtime changes were performed for this cleanup.

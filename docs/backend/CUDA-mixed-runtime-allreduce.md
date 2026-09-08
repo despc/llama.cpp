@@ -1139,3 +1139,52 @@ to fill a real fraction of the context. `bench/prompt30k.json` and
 `bench/prompt100k.json` exist for that.
 
 The [2026-09-06 Flash-Next prefill plan](CUDA-flash-next-prefill-plan.md) records the opt-in bounded sort workspace experiment, its successful 150k prompt run, the deployment stop point, and further optimization options for the four-GPU layer-split configuration. The earlier 27B tensor-parallel AllReduce findings are a different workload.
+
+## Bit-identity with the reference, 2026-09-08
+
+The question this path kept raising was whether it costs quality. It no longer has
+an answer that needs measuring.
+
+The kernel used to sum ranks sequentially. The meta backend's AllReduce folds any
+ranks past the largest power of two into the first block, then combines at halving
+XOR offsets -- for four ranks `(a0+a2) + (a1+a3)` -- with every step a ggml ADD in
+the tensor's own type. Two different trees over the same FP32 values round
+differently, so the two paths agreed closely and never exactly. The sequential sum
+was also the marginally less accurate of the two: `n-1` roundings against the
+tree's `log2(n)`.
+
+The kernel now reproduces that tree, including the per-step rounding back to the
+tensor's type -- a no-op for F32, and what the reference does for F16 and BF16.
+XOR pairing is symmetric, so every rank still reduces the same tree and all of
+them finish with the same bits.
+
+Measured on the 27B tensor-parallel deployment across four GPUs, greedy,
+`GGML_CUDA_ALLREDUCE=none` against `=mixed`:
+
+| | Prefill, t/s | Generation, t/s | Output |
+| --- | ---: | ---: | --- |
+| `none` (reference) | 176.9 | 42.75 | `dc4fb163e3e27c45` |
+| `mixed` | 232.6 | 66.11 | `dc4fb163e3e27c45` |
+
+2000 generated tokens, 8407 characters, identical. A 200-token run after a 6k
+prefill likewise matched (`756a2b7872419b29`). Mixed is 55% faster on generation
+and 31% on prefill while producing the same bits.
+
+That is the distinction this project learned to insist on: not "no difference was
+detected" but "a difference cannot arise". Compact attention was removed because
+it only ever reached the first of those. This reaches the second.
+
+### What the runs do not cover
+
+Four ranks and F32 only. Bit-identity for F16 and BF16 follows from the same code
+-- the per-step rounding is to the tensor's type -- but no run exercised it. The
+non-power-of-two fold follows the reference by construction and there is no
+three-card configuration here to run it on.
+
+### What remains removed
+
+The INT8 packing, the F32-to-BF16 wire, and the fused, streamed, flat-group and
+two-stage variants are gone from source, not disabled, along with the environment
+variables that selected them. `GGML_CUDA_ALLREDUCE` is the only remaining choice:
+`mixed` for the kernel above, `none` for the meta backend's own reduction. With
+CUDA and V100_CUDA in separate registries an unset variable behaves as `none`.
