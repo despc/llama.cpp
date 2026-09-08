@@ -94,14 +94,20 @@ using ggml_cuda_mixed_ar_group_init_t = void * (*)(const ggml_cuda_mixed_ar_grou
 // The duplex probe is entered per registry from its own thread.  It cannot run
 // from group_init: the runtimes are initialised one after another on one thread,
 // so a rendezvous inside that loop is a rendezvous with nobody.
-using ggml_cuda_probe_duplex_t = void (*)(ggml_backend_t *, size_t, void *, size_t, uint32_t);
+// (backends, count, rendezvous page, its size, how many runtimes, which one this
+// is, and the read-over-write ratio of each local device).  The ratio is per
+// device because it is per share: a rank publishes N and reads (1+2w)N, so
+// 35/35/17/13 asks four different questions of the link, not one.
+using ggml_cuda_probe_duplex_t = void (*)(ggml_backend_t *, size_t, void *, size_t,
+                                          uint32_t, uint32_t, const double *);
 using ggml_cuda_mixed_ar_group_free_t = void (*)(void *);
 using ggml_cuda_mixed_ar_group_prepare_t = bool (*)(void *, size_t);
 using ggml_cuda_mixed_ar_group_enqueue_t = bool (*)(void *, ggml_tensor **, size_t, uint32_t);
 
 void ggml_cuda_probe_p2p(ggml_backend_t * backends, size_t n);
 void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
-                            void * probe_host, size_t probe_bytes, uint32_t probe_peers);
+                            void * probe_host, size_t probe_bytes,
+                            uint32_t probe_peers, uint32_t my_index, const double * ratios);
 void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * config);
 void ggml_cuda_mixed_ar_group_free(void * context);
 bool ggml_cuda_mixed_ar_group_prepare(void * context, size_t slot);

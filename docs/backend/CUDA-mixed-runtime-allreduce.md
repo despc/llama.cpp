@@ -1556,56 +1556,73 @@ reuse are exactly where it would not be.
 
 Two questions, asked before building anything: can one grid whose blocks have
 different jobs reach the duplex that two kernels on two streams reach, and does
-any of it survive all four cards being on the link at once at the collective's
-real direction ratio?
+any of it survive all four cards being on the link at once at the volumes each
+card actually moves?
 
-Getting the second question asked at all took fixing the probe twice. The
-rendezvous could not work where it first sat: `group_init` is entered once per
-registry from a single thread, so a meeting point inside it waits for a
-participant that has not been called yet -- the Tesla side had not reached the
-probe while the Blackwell side was already waiting for it. It now runs from
-`comm_init_mixed` after every runtime is up, on a thread each. And the device
-buffer was sized for one direction while the read side, at ratio 1.7, copied
-more than that into it: the copy failed and the line reported 39404 GB/s, which
-is the shape a wrong answer takes when nothing checks it.
+Getting them asked honestly took three corrections to the probe, and each one
+moved the answer.
 
-Both answers are yes. Teslas, 21 MiB, 1.7 reads per write, all four cards
-driven together:
+The rendezvous could not work where it first sat. `group_init` is entered once
+per registry from a single thread, so a meeting point inside it waits for a
+participant that has not been called yet: the Tesla side had not reached the
+probe while the Blackwell side was already waiting for it, and each went on
+measuring a link the other was idle on. It runs from `comm_init_mixed` now, after
+every runtime is up, on a thread each.
+
+Starting together is not the same as working together. Equal work finishes at
+unequal times, so the faster pair went quiet while the slower one measured the
+tail of its run on a link that had emptied. The pairs take turns now: one is
+timed while the other keeps both directions busy until told to stop, then they
+swap. This was not a detail. Symmetric traffic, two kernels, 64 blocks, the
+Teslas: 1.65x with the pair alone, 1.44x when the pairs merely start together,
+**1.34x** when the other pair is guaranteed to be working throughout. Contention
+costs about a fifth of the headroom, not the eighth this document said.
+
+And the direction ratio is per card, not per machine. A rank publishes N and
+reads (1+2w)N, so 35/35/17/13 is 1.70, 1.70, 1.34, 1.26 -- four workloads. Each
+device is driven at its own now; the single 1.7 was the Blackwells' question
+asked of everybody.
+
+Teslas, 21 MiB, each card at its own ratio, both pairs loaded throughout:
 
 | blocks | two kernels | best role split | sequential | best/seq |
 |--------|-------------|-----------------|------------|----------|
-| 8      | 6.44        | 6.34 (2:6)      | 5.96       | 1.06x    |
-| 16     | 6.76        | 6.93 (4:12)     | 5.96       | 1.16x    |
-| 32     | 6.98        | 7.60 (8:24)     | 5.96       | 1.28x    |
-| 64     | 7.69        | **8.67 (16:48)**| 5.96       | **1.45x**|
+| 8      | 6.48        | 6.36 (2:6)      | 5.90       | 1.08x    |
+| 16     | 6.88        | 7.03 (4:12)     | 5.90       | 1.19x    |
+| 32     | 7.11        | 7.83 (8:24)     | 5.91       | 1.32x    |
+| 64     | 8.10        | **8.72 (16:48)**| 5.91       | **1.48x**|
 
-The contention this document has warned about since the beginning is real and
-now has a number. Symmetric traffic, two kernels, 64 blocks: 10.00 against 6.07
-with the Tesla pair alone, 8.78 against 6.08 with all four cards, so 1.65x falls
-to 1.44x. About a eighth of the headroom is the other pair's. The role split
-earns it back -- 64 blocks at 16:48 gives 10.65, above the isolated two-kernel
-figure.
+Blackwells peak earlier, at 32 blocks and 8:24, with 19.14 against 12.95
+sequential, also 1.48x. 64 is where the sweep stops, not a maximum anyone has
+established, and the two architectures do not want the same number.
 
-**The grid size decides this, not the split.** The collective launches
-`GGML_CUDA_MIXED_AR_BLOCKS` = 8, and at eight blocks the role split is worth
-1.06x on a Tesla, which is noise. Everything appears from 32 blocks up, and the
-optimum differs by architecture: Blackwell peaks at 32 (20.97 against 13.01,
-1.61x), Tesla at 64. So the first thing a role-split reduce-scatter needs is not
-a protocol, it is a bigger grid -- and that walks straight into the residency
-question, since more blocks make co-residency harder to guarantee, not easier.
+**A claim this document made and the sustained load withdraws.** It said the role
+split earned the contention back, citing 10.65 against the 10.00 the two-kernel
+form reached with the pair alone. Under a link the other pair never leaves, the
+same configuration gives 8.99. It does not earn it back. What survives is
+narrower and still useful: at equal grid size the role split beats two kernels --
+8.99 against 8.13 at 64 blocks, 8.34 against 7.46 at 32 -- and the gap is real at
+every size above eight.
 
-**Give the reads most of the grid.** Every read-heavy split beats the even one
-and every write-heavy one: 2:6, 4:12, 8:24, 16:48, in that order, at every size
-and both ratios. That is a mechanism rather than a fitted number -- stores are
-posted and cost little to issue, while loads need many outstanding requests
-before the latency is covered. It replaces the three-to-five this document
-previously proposed, which came from phase times measured before the publication
-and share changes.
+**Grid size and split both matter, and the grid size matters more.** Going from 8
+to 64 blocks is worth 19% to the two-kernel form (6.81 to 8.13) and 36% to the
+role split (6.63 to 8.99). So most of what the role split gains over the
+collective's present eight blocks is not overlap at all -- it is having enough
+requests in flight. That has to be separated on the collective itself before any
+of it is attributed to duplex: the phased reduce-scatter with a larger grid and
+no role pipeline is the control, and until it is run, the share of this that
+belongs to overlap is unknown.
 
-What the probe does not measure is the waiting. Its two roles never synchronise;
-the collective's would, on every chunk. So these figures are a ceiling for the
-construction, not a forecast for it, and the gap between them is exactly the
-readiness traffic and the residency risk. The copy engines put a further ceiling
-above both: under the same four-card contention they reach 11.10 against 5.61
-sequential, 1.98x, so kernel-issued access is leaving something on the table that
-no arrangement of blocks has recovered.
+Read-heavy splits win at every size and both ratios -- 2:6, 4:12, 8:24, 16:48 --
+which fits the mechanism, stores being posted and cheap to issue while loads need
+many outstanding requests to cover latency. It is a good starting choice, not an
+established rule: the collective's readers also reduce, with a register and
+shared-memory load this probe's readers do not carry.
+
+Two things this still does not measure. The roles never synchronise here, while
+the collective's would on every chunk, so these are a ceiling for the
+construction rather than a forecast. And the copy engines under the same
+sustained load reach 10.74 against 6.07, 1.77x -- a reference point for a
+different transport, worth keeping as the next option if a role-split collective
+turns out to lose its margin in the protocol, not a bound on what kernel-issued
+access can do.

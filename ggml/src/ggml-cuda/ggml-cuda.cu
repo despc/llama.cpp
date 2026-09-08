@@ -1340,19 +1340,22 @@ static __global__ void ggml_cuda_host_roles_kernel(
     }
 }
 
-// Where the two runtimes meet.  They live in separate dynamic-linker namespaces
-// and probe from their own group_init, so without this each of them measures a
-// link the other is idle on -- and idle is exactly the condition the collective
-// never runs in.  Sense-reversing, in the shared host page.
+// Where the runtimes meet.  They live in separate dynamic-linker namespaces and
+// are initialised one after another, so without this each of them measures a link
+// the other is idle on -- and idle is the one condition the collective never runs
+// in.  Sense-reversing, in the shared host page, plus the two flags that keep one
+// pair loading the link while the other pair is the one being timed.
 struct ggml_cuda_probe_rendezvous {
     uint32_t count;
     uint32_t gen;
+    uint32_t bg_ready;   // the pair that is not being timed has started loading
+    uint32_t stop;       // the timed pair is done; the other may stop
 };
-static bool ggml_cuda_probe_meet(void * probe_host, uint32_t peers, bool & broken) {
-    if (!probe_host || peers < 2 || broken) {
+
+static bool ggml_cuda_probe_meet(ggml_cuda_probe_rendezvous * r, uint32_t peers, bool & broken) {
+    if (!r || peers < 2 || broken) {
         return false;
     }
-    auto * r = (ggml_cuda_probe_rendezvous *) probe_host;
     const uint32_t gen = __atomic_load_n(&r->gen, __ATOMIC_ACQUIRE);
     if (__atomic_add_fetch(&r->count, 1, __ATOMIC_ACQ_REL) == peers) {
         __atomic_store_n(&r->count, 0, __ATOMIC_RELEASE);
@@ -1374,43 +1377,46 @@ static bool ggml_cuda_probe_meet(void * probe_host, uint32_t peers, bool & broke
     return true;
 }
 
-// Can the link carry both directions at once, and can a role-split grid have it?
+// Can the link carry both directions at once, and can a grid whose blocks have
+// different jobs have it?
 //
-// Two questions, not one.  The first was answered for a pair of cards in
-// isolation and for two concurrent kernels: yes, 1.65x on the Teslas.  Neither
-// condition is the collective's.  All four cards share a root complex and host
-// DRAM, so the pairs have to be driven together; and a fused collective has one
-// grid, so the overlap has to survive being expressed as blocks with different
-// jobs rather than as two kernels on two streams.
+// Two questions, and the conditions of the answer matter as much as the answer.
+// A fused collective has one grid, so the overlap has to survive being expressed
+// as blocks with different jobs rather than two kernels on two streams.  And all
+// four cards share a root complex and host DRAM, so a figure taken while the
+// other pair is idle is not a figure about our link.
 //
-// The directions are also not equal in the collective.  A rank publishes its
-// contribution outside its own shard and its finished sum, N in total; it reads
-// every peer's contribution to its shard and every peer's finished sum,
-// (n-1)wN + (1-w)N -- about 1.7N for a 35% rank, 1.26N for a 13% one.  Probing
-// 1:1 answers for a workload we do not run.
+// Starting together is not enough for that second part: equal work finishes at
+// unequal times, and the faster pair would leave the slower one measuring an
+// empty link for the tail of every run.  So the pairs take turns -- one is timed
+// while the other keeps loading the link until told to stop, then they swap.
+//
+// The directions are not equal either, and not equal in the same way on every
+// card.  A rank publishes its contribution outside its own shard and its finished
+// sum, N in total, and reads every peer's contribution to its shard and every
+// peer's finished sum, (1+2w)N.  At 35/35/17/13 that is 1.70, 1.70, 1.34, 1.26 --
+// four questions, so each device is driven at its own ratio.
 //
 // Opt-in via GGML_CUDA_DUPLEX_PROBE.
 void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
-                            void * probe_host, size_t probe_bytes, uint32_t probe_peers) {
+                            void * probe_host, size_t probe_bytes,
+                            uint32_t peers, uint32_t my_index, const double * ratios) {
     static bool done = false;
     if (done || !ggml_env_flag_enabled("GGML_CUDA_DUPLEX_PROBE") || n == 0) {
         return;
     }
     done = true;
-    if (probe_bytes < sizeof(ggml_cuda_probe_rendezvous)) {
-        probe_host = nullptr;
-    }
+    auto * rv = (probe_host && probe_bytes >= sizeof(ggml_cuda_probe_rendezvous))
+        ? (ggml_cuda_probe_rendezvous *) probe_host : nullptr;
     bool broken = false;
-    const bool met = probe_host && probe_peers >= 2;
-    if (!met) {
-        GGML_LOG_WARN("duplex_probe backend=%s: no rendezvous, this registry measures alone\n",
-                      GGML_CUDA_NAME);
+    if (!rv || peers < 2) {
+        GGML_LOG_WARN("duplex_probe backend=%s: no rendezvous, this registry measures alone "
+                      "and the figures are not about a link the other pair is on\n", GGML_CUDA_NAME);
     }
 
-    // Read side over write side, as the collective sees it.  1.0 keeps the old
-    // symmetric figures comparable; 1.7 is the 35% rank's real ratio.
-    const double ratios[] = { 1.0, 1.7 };
     const size_t bytes = 21ull << 20;
+    const int reps = 10;
+    const int bg_reps = 2;   // small, so the background pair notices `stop` promptly
 
     std::vector<void *> dbuf(n, nullptr), hsend(n, nullptr), hrecv(n, nullptr);
     std::vector<cudaStream_t> ssend(n, nullptr), srecv(n, nullptr);
@@ -1419,31 +1425,42 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
     for (size_t i = 0; i < n && ok; ++i) {
         dev[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device;
         ggml_cuda_set_device(dev[i]);
-        // Both directions land here, and the read side is the larger one.
-        ok = ok && cudaMalloc(&dbuf[i], 2*bytes) == cudaSuccess;
+        // Both directions land in dbuf, and the read side is the larger one.
+        ok = ok && cudaMalloc(&dbuf[i], 3*bytes) == cudaSuccess;
         ok = ok && cudaHostAlloc(&hsend[i], bytes, cudaHostAllocPortable) == cudaSuccess;
-        ok = ok && cudaHostAlloc(&hrecv[i], 2*bytes, cudaHostAllocPortable) == cudaSuccess;
+        ok = ok && cudaHostAlloc(&hrecv[i], 3*bytes, cudaHostAllocPortable) == cudaSuccess;
         ok = ok && cudaStreamCreate(&ssend[i]) == cudaSuccess;
         ok = ok && cudaStreamCreate(&srecv[i]) == cudaSuccess;
     }
-    const int reps = 10;
 
-    for (size_t ri = 0; ri < sizeof(ratios)/sizeof(ratios[0]); ++ri) {
-        const size_t st_bytes = bytes;
-        const size_t ld_bytes = (size_t) (bytes * ratios[ri]) & ~(size_t) (sizeof(int4) - 1);
-        const size_t st_vecs = st_bytes / sizeof(int4);
-        const size_t ld_vecs = ld_bytes / sizeof(int4);
-        const double moved_st = (double) st_bytes * reps * n / 1e9;
-        const double moved_ld = (double) ld_bytes * reps * n / 1e9;
+    // Two passes: 1.0 keeps the earlier symmetric figures comparable, then each
+    // device at the ratio its own share gives it.
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<size_t> ld_bytes(n);
+        double sum_ratio = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double r = pass == 0 ? 1.0 : (ratios && ratios[i] > 0 ? ratios[i] : 1.0);
+            ld_bytes[i] = (size_t) (bytes * r) & ~(size_t) (sizeof(int4) - 1);
+            sum_ratio += r;
+        }
+        const double moved_st = (double) bytes * reps * n / 1e9;
+        double moved_ld = 0;
+        for (size_t i = 0; i < n; ++i) {
+            moved_ld += (double) ld_bytes[i] * reps / 1e9;
+        }
+        char ratio_tag[32];
+        if (pass == 0) {
+            snprintf(ratio_tag, sizeof(ratio_tag), "1.00 flat");
+        } else {
+            snprintf(ratio_tag, sizeof(ratio_tag), "%.2f mean", sum_ratio / (double) n);
+        }
 
-        // Copy engines, for the record: a different mechanism, not the one a
-        // fused collective can use, but it bounds what the link itself will give.
-        auto run_ce = [&](bool st, bool ld) {
+        auto run_ce = [&](bool st, bool ld, int r) {
             for (size_t i = 0; i < n; ++i) {
                 ggml_cuda_set_device(dev[i]);
-                for (int k = 0; k < reps; ++k) {
-                    if (st) { cudaMemcpyAsync(hsend[i], dbuf[i], st_bytes, cudaMemcpyDeviceToHost, ssend[i]); }
-                    if (ld) { cudaMemcpyAsync(dbuf[i], hrecv[i], ld_bytes, cudaMemcpyHostToDevice, srecv[i]); }
+                for (int k = 0; k < r; ++k) {
+                    if (st) { cudaMemcpyAsync(hsend[i], dbuf[i], bytes, cudaMemcpyDeviceToHost, ssend[i]); }
+                    if (ld) { cudaMemcpyAsync(dbuf[i], hrecv[i], ld_bytes[i], cudaMemcpyHostToDevice, srecv[i]); }
                 }
             }
             for (size_t i = 0; i < n; ++i) {
@@ -1452,18 +1469,18 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
                 if (ld) { cudaStreamSynchronize(srecv[i]); }
             }
         };
-        // Two kernels on two streams: the overlap the earlier probe reported.
-        auto run_2k = [&](bool st, bool ld, int blocks) {
+        auto run_2k = [&](bool st, bool ld, int blocks, int r) {
             for (size_t i = 0; i < n; ++i) {
                 ggml_cuda_set_device(dev[i]);
-                for (int k = 0; k < reps; ++k) {
+                for (int k = 0; k < r; ++k) {
                     if (st) {
                         ggml_cuda_host_store_kernel<<<blocks, 256, 0, ssend[i]>>>(
-                            (int4 *) hsend[i], (const int4 *) dbuf[i], st_vecs);
+                            (int4 *) hsend[i], (const int4 *) dbuf[i], bytes / sizeof(int4));
                     }
                     if (ld) {
                         ggml_cuda_host_load_kernel<<<blocks, 256, 0, srecv[i]>>>(
-                            (int4 *) dbuf[i], (const int4 *) hrecv[i], ld_vecs, (int4 *) dbuf[i]);
+                            (int4 *) dbuf[i], (const int4 *) hrecv[i], ld_bytes[i] / sizeof(int4),
+                            (int4 *) dbuf[i]);
                     }
                 }
             }
@@ -1473,14 +1490,13 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
                 if (ld) { cudaStreamSynchronize(srecv[i]); }
             }
         };
-        // One kernel, blocks split by role -- the shape a fused collective has.
-        auto run_roles = [&](int blocks, int n_store) {
+        auto run_roles = [&](int blocks, int n_store, int r) {
             for (size_t i = 0; i < n; ++i) {
                 ggml_cuda_set_device(dev[i]);
-                for (int k = 0; k < reps; ++k) {
+                for (int k = 0; k < r; ++k) {
                     ggml_cuda_host_roles_kernel<<<blocks, 256, 0, ssend[i]>>>(
-                        (int4 *) hsend[i], (const int4 *) dbuf[i], st_vecs,
-                        (const int4 *) hrecv[i], ld_vecs, n_store, (int4 *) dbuf[i]);
+                        (int4 *) hsend[i], (const int4 *) dbuf[i], bytes / sizeof(int4),
+                        (const int4 *) hrecv[i], ld_bytes[i] / sizeof(int4), n_store, (int4 *) dbuf[i]);
                 }
             }
             for (size_t i = 0; i < n; ++i) {
@@ -1488,52 +1504,90 @@ void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
                 cudaStreamSynchronize(ssend[i]);
             }
         };
-        // Every timed region starts at a meeting point, so all four cards are on
-        // the link together.  The sequence is identical in both runtimes -- it is
-        // built from constants, not from anything either of them measures -- so
-        // neither can arrive at a meeting the other never reaches.
-        auto timed = [&](const std::function<void()> & body) {
-            ggml_cuda_probe_meet(probe_host, probe_peers, broken);
-            const int64_t t0 = ggml_time_us();
-            if (ok) { body(); }
-            return (ggml_time_us() - t0) / 1e6;
+
+        // One timed region.  Whoever is not `turn` keeps both directions busy for
+        // the whole of it, so the measured pair never gets a quiet link to finish
+        // in.  Returns 0 for the pair that was loading rather than measuring.
+        auto timed = [&](uint32_t turn, const std::function<void(int)> & body) -> double {
+            if (!rv || broken) {
+                if (turn != my_index) {
+                    return 0.0;
+                }
+                const int64_t t0 = ggml_time_us();
+                if (ok) { body(reps); }
+                return (ggml_time_us() - t0) / 1e6;
+            }
+            ggml_cuda_probe_meet(rv, peers, broken);
+            double t = 0.0;
+            if (turn == my_index) {
+                const int64_t tw = ggml_time_us();
+                while (__atomic_load_n(&rv->bg_ready, __ATOMIC_ACQUIRE) == 0) {
+                    if (ggml_time_us() - tw > 30ll*1000*1000) { break; }
+                    std::this_thread::yield();
+                }
+                if (ok) { body(bg_reps); }              // warm, already under load
+                const int64_t t0 = ggml_time_us();
+                if (ok) { body(reps); }
+                t = (ggml_time_us() - t0) / 1e6;
+                __atomic_store_n(&rv->stop, 1, __ATOMIC_RELEASE);
+            } else {
+                __atomic_store_n(&rv->bg_ready, 1, __ATOMIC_RELEASE);
+                while (__atomic_load_n(&rv->stop, __ATOMIC_ACQUIRE) == 0) {
+                    if (!ok) { std::this_thread::yield(); continue; }
+                    run_2k(true, true, 32, bg_reps);
+                }
+            }
+            ggml_cuda_probe_meet(rv, peers, broken);
+            if (turn == my_index) {
+                __atomic_store_n(&rv->bg_ready, 0, __ATOMIC_RELEASE);
+                __atomic_store_n(&rv->stop, 0, __ATOMIC_RELEASE);
+            }
+            ggml_cuda_probe_meet(rv, peers, broken);
+            return t;
+        };
+        // Every runtime walks the same list of turns, so neither can arrive at a
+        // meeting the other never reaches: the sequence is built from constants.
+        auto sweep = [&](const std::function<void(int)> & body) -> double {
+            double mine = 0.0;
+            for (uint32_t turn = 0; turn < std::max<uint32_t>(peers, 1); ++turn) {
+                const double t = timed(turn, body);
+                if (turn == my_index) { mine = t; }
+            }
+            return mine;
         };
 
-        if (ok) { run_ce(true, true); run_2k(true, true, 64); }   // warm
-
-        const double ce_st = timed([&]{ run_ce(true, false); });
-        const double ce_ld = timed([&]{ run_ce(false, true); });
-        const double ce_bo = timed([&]{ run_ce(true, true); });
-        if (ok) {
-            GGML_LOG_WARN("duplex_probe backend=%s %zu MiB read/write %.2f x %zu dev | copy engines  | "
+        const double ce_st = sweep([&](int r){ run_ce(true, false, r); });
+        const double ce_ld = sweep([&](int r){ run_ce(false, true, r); });
+        const double ce_bo = sweep([&](int r){ run_ce(true, true, r); });
+        if (ok && ce_st > 0 && ce_ld > 0 && ce_bo > 0) {
+            GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s x %zu dev | copy engines  | "
                           "store %5.2f  load %5.2f  both %5.2f GB/s  (sequential %5.2f)\n",
-                          GGML_CUDA_NAME, bytes >> 20, ratios[ri], n,
+                          GGML_CUDA_NAME, bytes >> 20, ratio_tag, n,
                           moved_st/ce_st, moved_ld/ce_ld, (moved_st+moved_ld)/ce_bo,
                           (moved_st+moved_ld)/(ce_st+ce_ld));
         }
 
         for (int blocks = 8; blocks <= 64; blocks *= 2) {
-            const double k_st = timed([&]{ run_2k(true, false, blocks); });
-            const double k_ld = timed([&]{ run_2k(false, true, blocks); });
-            const double k_bo = timed([&]{ run_2k(true, true, blocks); });
-            if (ok) {
-                GGML_LOG_WARN("duplex_probe backend=%s %zu MiB read/write %.2f | two kernels %2d blk | "
+            const double k_st = sweep([&](int r){ run_2k(true, false, blocks, r); });
+            const double k_ld = sweep([&](int r){ run_2k(false, true, blocks, r); });
+            const double k_bo = sweep([&](int r){ run_2k(true, true, blocks, r); });
+            if (ok && k_st > 0 && k_ld > 0 && k_bo > 0) {
+                GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s | two kernels %2d blk | "
                               "store %5.2f  load %5.2f  both %5.2f GB/s  (sequential %5.2f)\n",
-                              GGML_CUDA_NAME, bytes >> 20, ratios[ri], blocks,
+                              GGML_CUDA_NAME, bytes >> 20, ratio_tag, blocks,
                               moved_st/k_st, moved_ld/k_ld, (moved_st+moved_ld)/k_bo,
                               (moved_st+moved_ld)/(k_st+k_ld));
             }
-            // Fractions of the grid given to storing.  A ratio derived from the
-            // old phase times would be a guess: those were measured before the
-            // publication and share changes, and throughput is not linear in the
-            // block count anyway.  So sweep it.
+            // Both the split and the grid size move this, so sweep both rather
+            // than carry a ratio over from an older measurement.  64 is where the
+            // sweep stops, not a maximum anyone has established.
             for (int num = 1; num <= 3; ++num) {
                 const int n_store = std::max(1, blocks * num / 4);
-                const double r_bo = timed([&]{ run_roles(blocks, n_store); });
-                if (ok) {
-                    GGML_LOG_WARN("duplex_probe backend=%s %zu MiB read/write %.2f | roles %2d:%-2d of %2d | "
+                const double r_bo = sweep([&](int r){ run_roles(blocks, n_store, r); });
+                if (ok && r_bo > 0 && k_bo > 0) {
+                    GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s | roles %2d:%-2d of %2d | "
                                   "                            both %5.2f GB/s  (two kernels %5.2f)\n",
-                                  GGML_CUDA_NAME, bytes >> 20, ratios[ri], n_store, blocks - n_store, blocks,
+                                  GGML_CUDA_NAME, bytes >> 20, ratio_tag, n_store, blocks - n_store, blocks,
                                   (moved_st+moved_ld)/r_bo, (moved_st+moved_ld)/k_bo);
                 }
             }
@@ -1700,8 +1754,10 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     // Kept alive past the loop: the duplex probe runs after every runtime is up,
     // and needs each one's own backends.
     std::vector<std::vector<ggml_backend_t>> probe_backends;
+    std::vector<std::vector<double>> probe_ratios;
     std::vector<ggml_cuda_probe_duplex_t> probe_entry;
     probe_backends.reserve(ranks_by_registry.size());
+    probe_ratios.reserve(ranks_by_registry.size());
 
     for (const auto & item : ranks_by_registry) {
         const auto registry = item.first;
@@ -1719,9 +1775,19 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             return false;
         }
         probe_backends.emplace_back();
+        probe_ratios.emplace_back();
         std::vector<ggml_backend_t> & local_backends = probe_backends.back();
         for (int rank : ranks) {
             local_backends.push_back(ret->backends[rank]);
+            // What this rank actually asks of the link: it publishes N and reads
+            // (1+2w)N, so the four ranks of a 35/35/17/13 split are four
+            // different workloads, not one.
+            uint64_t total = 0;
+            for (size_t k = 0; k < n_ranks; ++k) {
+                total += mixed_ar_shares[k];
+            }
+            const double w = total ? (double) mixed_ar_shares[rank] / (double) total : 0.0;
+            probe_ratios.back().push_back(1.0 + 2.0*w);
         }
         probe_entry.push_back(reinterpret_cast<ggml_cuda_probe_duplex_t>(
             ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_probe_duplex")));
@@ -1766,7 +1832,8 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             probes.emplace_back([&, i] {
                 probe_entry[i](probe_backends[i].data(), probe_backends[i].size(),
                                (char *) ret->mixed_host + shared_bytes, probe_bytes,
-                               (uint32_t) probe_entry.size());
+                               (uint32_t) probe_entry.size(), (uint32_t) i,
+                               probe_ratios[i].data());
             });
         }
         for (auto & t : probes) {
