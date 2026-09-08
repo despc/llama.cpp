@@ -1762,15 +1762,23 @@ resource costs more to unlock than it yields. The next gain, if there is one, is
 not in the transport. It is in making the ranks less uneven, which is a placement
 and share question, or in not sending the bytes at all.
 
-Everything here is off by default. The deployed configuration is unchanged:
-the single-kernel reduce-scatter at eight blocks, 35/35/17/13.
-`GGML_CUDA_MIXED_AR_RS_SPLIT=1` is the phase-split variant, equal in speed and
-free of the grid-wide barrier and its residency requirement;
-`GGML_CUDA_MIXED_AR_DUPLEX_PARTS=n` overlaps publication;
-`GGML_CUDA_MIXED_AR_DUPLEX_NOAUX=1` is the control that separates partitioning
-from overlap; `GGML_CUDA_MIXED_AR_VERIFY=1` compares every collective against the
-flat kernel elementwise; `GGML_CUDA_MIXED_AR_RS_BLOCKS=n` sets the
-reduce-scatter's grid without touching the small path decode runs on.
+**And then removed.** The code that produced all of the above is gone from the
+tree: the pipelined reduce-scatter, the phase-split kernels and their gate, the
+two-stream overlap and its control, the wall-clock stamps, and the duplex probe
+with its cross-runtime rendezvous. None of it was ever on by default, and none of
+it will be turned on, so keeping four implementations of one collective would buy
+nothing but the chance of maintaining the wrong one. The numbers are the
+deliverable; the scaffolding is not. Recovering any of it is `git log` away --
+the last commit that holds it all is the one this section was written in.
+
+What stayed, because neither belongs to this question: elementwise verification
+against the flat kernel (`GGML_CUDA_MIXED_AR_VERIFY=1`), which is how any future
+change to the collective gets checked, and the occupancy gate in `group_init`,
+which is what makes the reduce-scatter's grid-wide barrier safe rather than
+assumed. `GGML_CUDA_MIXED_AR_RS_BLOCKS=n` stayed with it, since the gate needs
+something to check. The deployed configuration is unchanged and unchanged in
+speed: the single-kernel reduce-scatter at eight blocks, 35/35/17/13, 391
+tokens/s, verified elementwise after the removal.
 
 ## Where this stands, 2026-09-08
 
@@ -1813,3 +1821,10 @@ bottleneck model.
 Blackwells), swapping cards between slots (the cost model came out exactly
 neutral), republishing to a leader (catastrophic, twice), and overlapping the
 directions (this document's last three sections).
+
+Duplex in particular is **closed, not paused**. The link has the headroom, a
+role-split grid reaches it, and the collective cannot use it: reaching the
+overlap requires cutting the collective into parts, and on ranks 1.7x apart each
+part costs more in synchronisation than the overlap returns. That arithmetic does
+not improve with a cleverer kernel -- three were written -- it improves only if
+the ranks stop being uneven. Do not start here again without that having changed.

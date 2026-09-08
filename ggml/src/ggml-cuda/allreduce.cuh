@@ -17,7 +17,7 @@ struct ggml_cuda_ar_pipeline;
 // never signals.  Version 7 adds the probe rendezvous: the two runtimes measure
 // the link in separate libraries, so without a meeting point each of them times
 // a link the other is not using, which is not the link the collective runs on.
-static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 11;
+static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 12;
 static constexpr size_t GGML_CUDA_MIXED_AR_SLOTS = 2;
 static constexpr size_t GGML_CUDA_MIXED_AR_RANK_BYTES = 64 * 1024 * 1024;
 // Signal-slot stride and the largest grid a group may launch.  The grid itself
@@ -41,23 +41,11 @@ enum ggml_cuda_mixed_ar_signal_word {
     GGML_CUDA_MIXED_AR_SIG_STREAM_TOKEN = 2,   // validates the count above
     GGML_CUDA_MIXED_AR_SIG_RS_PUBLISHED = 3,
     GGML_CUDA_MIXED_AR_SIG_RS_REDUCED = 4,
-    GGML_CUDA_MIXED_AR_SIG_PIPE_TOKEN = 5,   // validates the two counts below
-    GGML_CUDA_MIXED_AR_SIG_PIPE_PUB   = 6,   // chunks published, per block
-    GGML_CUDA_MIXED_AR_SIG_PIPE_RED   = 7,   // chunks reduced, per block
-    // The phase-split reduce-scatter waits in a one-block kernel between phase
-    // launches instead of grid-wide inside one, so these live in block 0's slot
-    // only and cost one word per peer rather than one per peer per block.
-    GGML_CUDA_MIXED_AR_SIG_SPLIT_PUB  = 8,
-    GGML_CUDA_MIXED_AR_SIG_SPLIT_RED  = 9,
-    // Separating the collective under test from the reference it is compared
+    // Keeping the collective under test apart from the reference it is compared
     // against, so no rank starts the second while a peer is still reading the
     // first.  Verification only.
-    GGML_CUDA_MIXED_AR_SIG_VERIFY_A   = 10,
-    GGML_CUDA_MIXED_AR_SIG_VERIFY_B   = 11,
-    // Counters rather than tokens, so a collective split into parts needs three
-    // words instead of two per part: how many parts this rank has published, how
-    // many it has reduced, and the token that says both belong to this call.
-    GGML_CUDA_MIXED_AR_SIG_SPLIT_TOKEN = 12,
+    GGML_CUDA_MIXED_AR_SIG_VERIFY_A = 5,
+    GGML_CUDA_MIXED_AR_SIG_VERIFY_B = 6,
 };
 
 // Which kernel a group runs.  Chosen once, on the host, and handed to every rank
@@ -88,29 +76,16 @@ struct ggml_cuda_mixed_ar_group_config {
     uint64_t stream_min_bytes;  // 0 disables streaming
     uint64_t rs_min_bytes;      // 0 disables reduce-scatter
     uint32_t stream_chunk;
-    uint32_t pipe_chunks;        // 0 disables the pipelined reduce-scatter
     // The reduce-scatter's own grid, kept apart from the small path's.  Decode
     // runs the flat kernel and has no business changing size when a prefill
     // experiment does.
     size_t rs_blocks;
-    uint32_t rs_split;           // 1: run the phases as separate launches
-    // Parts the collective is cut into so one part's publication can run beside
-    // the previous part's reduction and gather, on a second stream.  Publication
-    // only stores and the gather only loads, and the link carries both at once
-    // better than either alone.  0 disables it.
-    uint32_t duplex_parts;
-    uint32_t duplex_noaux;       // same parts on one stream: the control for the above
     uint32_t verify;             // 1: compare every result against the flat kernel
     // Relative share of the reduction each rank owns, in rank order.  Integers,
     // so every rank derives identical boundaries from them; all ones is an even
     // split.  This is not the weight split: it decides who reduces an element,
     // never which values are summed, so it cannot change a result.
     uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS];
-    // Where the runtimes meet to start a timed region together, and how many of
-    // them to expect.  Probing only: the collective never touches this.
-    void * probe_host;
-    size_t probe_bytes;
-    uint32_t probe_peers;
 };
 
 // Cumulative shard weights, so the kernel can derive lo[r]..lo[r+1) itself with
@@ -122,23 +97,11 @@ struct ggml_cuda_ar_shards {
 };
 
 using ggml_cuda_mixed_ar_group_init_t = void * (*)(const ggml_cuda_mixed_ar_group_config *);
-// The duplex probe is entered per registry from its own thread.  It cannot run
-// from group_init: the runtimes are initialised one after another on one thread,
-// so a rendezvous inside that loop is a rendezvous with nobody.
-// (backends, count, rendezvous page, its size, how many runtimes, which one this
-// is, and the read-over-write ratio of each local device).  The ratio is per
-// device because it is per share: a rank publishes N and reads (1+2w)N, so
-// 35/35/17/13 asks four different questions of the link, not one.
-using ggml_cuda_probe_duplex_t = void (*)(ggml_backend_t *, size_t, void *, size_t,
-                                          uint32_t, uint32_t, const double *);
 using ggml_cuda_mixed_ar_group_free_t = void (*)(void *);
 using ggml_cuda_mixed_ar_group_prepare_t = bool (*)(void *, size_t);
 using ggml_cuda_mixed_ar_group_enqueue_t = bool (*)(void *, ggml_tensor **, size_t, uint32_t);
 
 void ggml_cuda_probe_p2p(ggml_backend_t * backends, size_t n);
-void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
-                            void * probe_host, size_t probe_bytes,
-                            uint32_t probe_peers, uint32_t my_index, const double * ratios);
 void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * config);
 void ggml_cuda_mixed_ar_group_free(void * context);
 bool ggml_cuda_mixed_ar_group_prepare(void * context, size_t slot);

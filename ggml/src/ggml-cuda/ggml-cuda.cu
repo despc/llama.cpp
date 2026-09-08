@@ -1293,346 +1293,6 @@ static uint64_t ggml_cuda_mixed_ar_env(const char * name, uint64_t fallback) {
     return end != v ? (uint64_t) parsed : fallback;
 }
 
-// Kernel-issued host access, which is what the collective actually does.  The
-// copy-engine figures below are a different mechanism: an SM reading and writing
-// mapped host memory has to be asked separately whether it overlaps directions.
-static __global__ void ggml_cuda_host_store_kernel(int4 * __restrict__ dst, const int4 * __restrict__ src, size_t n) {
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
-        dst[i] = src[i];
-    }
-}
-static __global__ void ggml_cuda_host_load_kernel(int4 * __restrict__ dst, const int4 * __restrict__ src, size_t n, int4 * sink) {
-    int4 acc = make_int4(0,0,0,0);
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
-        const int4 v = src[i];
-        acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
-    }
-    if (acc.x == 0x7fffffff) { *sink = acc; }   // never taken; keeps the loads alive
-    GGML_UNUSED(dst);
-}
-
-// The construction a role-split reduce-scatter would rest on, measured on its own
-// before any protocol is built around it: one kernel, blocks divided by role,
-// some storing to host memory and the rest loading from it at the same time.
-// The two-kernel form above already overlaps the directions, but it does so with
-// two grids on two streams, which is not what a fused collective can do.  If the
-// split-by-role grid does not reach the same overlap, no amount of protocol work
-// on top of it will.
-static __global__ void ggml_cuda_host_roles_kernel(
-        int4 * __restrict__ hdst, const int4 * __restrict__ dsrc, size_t n_st,
-        const int4 * __restrict__ hsrc, size_t n_ld, int n_store, int4 * sink) {
-    if ((int) blockIdx.x < n_store) {
-        const size_t gt = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-        const size_t gn = (size_t) n_store * blockDim.x;
-        for (size_t i = gt; i < n_st; i += gn) {
-            hdst[i] = dsrc[i];
-        }
-    } else {
-        const int nl = gridDim.x - n_store;
-        const size_t gt = (size_t) (blockIdx.x - n_store) * blockDim.x + threadIdx.x;
-        const size_t gn = (size_t) nl * blockDim.x;
-        int4 acc = make_int4(0,0,0,0);
-        for (size_t i = gt; i < n_ld; i += gn) {
-            const int4 v = hsrc[i];
-            acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
-        }
-        if (acc.x == 0x7fffffff) { *sink = acc; }
-    }
-}
-
-// Where the runtimes meet.  They live in separate dynamic-linker namespaces and
-// are initialised one after another, so without this each of them measures a link
-// the other is idle on -- and idle is the one condition the collective never runs
-// in.  Sense-reversing, in the shared host page, plus the two flags that keep one
-// pair loading the link while the other pair is the one being timed.
-struct ggml_cuda_probe_rendezvous {
-    uint32_t count;
-    uint32_t gen;
-    uint32_t bg_ready;   // the pair that is not being timed has started loading
-    uint32_t stop;       // the timed pair is done; the other may stop
-};
-
-static bool ggml_cuda_probe_meet(ggml_cuda_probe_rendezvous * r, uint32_t peers, bool & broken) {
-    if (!r || peers < 2 || broken) {
-        return false;
-    }
-    const uint32_t gen = __atomic_load_n(&r->gen, __ATOMIC_ACQUIRE);
-    if (__atomic_add_fetch(&r->count, 1, __ATOMIC_ACQ_REL) == peers) {
-        __atomic_store_n(&r->count, 0, __ATOMIC_RELEASE);
-        __atomic_add_fetch(&r->gen, 1, __ATOMIC_ACQ_REL);
-        return true;
-    }
-    const int64_t t0 = ggml_time_us();
-    while (__atomic_load_n(&r->gen, __ATOMIC_ACQUIRE) == gen) {
-        if (ggml_time_us() - t0 > 60ll*1000*1000) {
-            // One side never arrived.  Every later meeting would hang on a counter
-            // this one left dirty, so stop meeting rather than stop the server.
-            GGML_LOG_WARN("duplex_probe backend=%s: rendezvous timed out, "
-                          "figures past this point are one registry alone\n", GGML_CUDA_NAME);
-            broken = true;
-            return false;
-        }
-        std::this_thread::yield();
-    }
-    return true;
-}
-
-// Can the link carry both directions at once, and can a grid whose blocks have
-// different jobs have it?
-//
-// Two questions, and the conditions of the answer matter as much as the answer.
-// A fused collective has one grid, so the overlap has to survive being expressed
-// as blocks with different jobs rather than two kernels on two streams.  And all
-// four cards share a root complex and host DRAM, so a figure taken while the
-// other pair is idle is not a figure about our link.
-//
-// Starting together is not enough for that second part: equal work finishes at
-// unequal times, and the faster pair would leave the slower one measuring an
-// empty link for the tail of every run.  So the pairs take turns -- one is timed
-// while the other keeps loading the link until told to stop, then they swap.
-//
-// The directions are not equal either, and not equal in the same way on every
-// card.  A rank publishes its contribution outside its own shard and its finished
-// sum, N in total, and reads every peer's contribution to its shard and every
-// peer's finished sum, (1+2w)N.  At 35/35/17/13 that is 1.70, 1.70, 1.34, 1.26 --
-// four questions, so each device is driven at its own ratio.
-//
-// Opt-in via GGML_CUDA_DUPLEX_PROBE.
-void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n,
-                            void * probe_host, size_t probe_bytes,
-                            uint32_t peers, uint32_t my_index, const double * ratios) {
-    static bool done = false;
-    if (done || !ggml_env_flag_enabled("GGML_CUDA_DUPLEX_PROBE") || n == 0) {
-        return;
-    }
-    done = true;
-    auto * rv = (probe_host && probe_bytes >= sizeof(ggml_cuda_probe_rendezvous))
-        ? (ggml_cuda_probe_rendezvous *) probe_host : nullptr;
-    bool broken = false;
-    if (!rv || peers < 2) {
-        GGML_LOG_WARN("duplex_probe backend=%s: no rendezvous, this registry measures alone "
-                      "and the figures are not about a link the other pair is on\n", GGML_CUDA_NAME);
-    }
-
-    const size_t bytes = 21ull << 20;
-    const int reps = 10;
-    const int bg_reps = 2;   // small, so the background pair notices `stop` promptly
-
-    std::vector<void *> dbuf(n, nullptr), hsend(n, nullptr), hrecv(n, nullptr);
-    std::vector<cudaStream_t> ssend(n, nullptr), srecv(n, nullptr);
-    std::vector<int> dev(n, 0);
-    bool ok = true;
-    for (size_t i = 0; i < n && ok; ++i) {
-        dev[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device;
-        ggml_cuda_set_device(dev[i]);
-        // Both directions land in dbuf, and the read side is the larger one.
-        ok = ok && cudaMalloc(&dbuf[i], 3*bytes) == cudaSuccess;
-        ok = ok && cudaHostAlloc(&hsend[i], 3*bytes, cudaHostAllocPortable) == cudaSuccess;
-        ok = ok && cudaHostAlloc(&hrecv[i], 3*bytes, cudaHostAllocPortable) == cudaSuccess;
-        ok = ok && cudaStreamCreate(&ssend[i]) == cudaSuccess;
-        ok = ok && cudaStreamCreate(&srecv[i]) == cudaSuccess;
-    }
-
-    // Two passes: 1.0 keeps the earlier symmetric figures comparable, then each
-    // device at the ratio its own share gives it.
-    for (int pass = 0; pass < 2; ++pass) {
-        std::vector<size_t> ld_bytes(n);
-        double sum_ratio = 0;
-        for (size_t i = 0; i < n; ++i) {
-            const double r = pass == 0 ? 1.0 : (ratios && ratios[i] > 0 ? ratios[i] : 1.0);
-            ld_bytes[i] = (size_t) (bytes * r) & ~(size_t) (sizeof(int4) - 1);
-            sum_ratio += r;
-        }
-        const double moved_st = (double) bytes * reps * n / 1e9;
-        double moved_ld = 0;
-        for (size_t i = 0; i < n; ++i) {
-            moved_ld += (double) ld_bytes[i] * reps / 1e9;
-        }
-        char ratio_tag[32];
-        if (pass == 0) {
-            snprintf(ratio_tag, sizeof(ratio_tag), "1.00 flat");
-        } else {
-            snprintf(ratio_tag, sizeof(ratio_tag), "%.2f mean", sum_ratio / (double) n);
-        }
-
-        auto run_ce = [&](bool st, bool ld, int r) {
-            for (size_t i = 0; i < n; ++i) {
-                ggml_cuda_set_device(dev[i]);
-                for (int k = 0; k < r; ++k) {
-                    if (st) { cudaMemcpyAsync(hsend[i], dbuf[i], bytes, cudaMemcpyDeviceToHost, ssend[i]); }
-                    if (ld) { cudaMemcpyAsync(dbuf[i], hrecv[i], ld_bytes[i], cudaMemcpyHostToDevice, srecv[i]); }
-                }
-            }
-            for (size_t i = 0; i < n; ++i) {
-                ggml_cuda_set_device(dev[i]);
-                if (st) { cudaStreamSynchronize(ssend[i]); }
-                if (ld) { cudaStreamSynchronize(srecv[i]); }
-            }
-        };
-        // The collective's real pattern: what one card reads is what another card
-        // is writing, in the same pinned allocation.  The probe so far gave every
-        // device its own buffer for each direction, which is the one thing the
-        // collective never has -- and it is the obvious suspect for why
-        // overlapping the directions there loses 6% instead of gaining 34%.
-        auto run_shared = [&](int blocks, int r) {
-            for (size_t i = 0; i < n; ++i) {
-                const size_t other = (i + 1) % n;
-                ggml_cuda_set_device(dev[i]);
-                for (int k = 0; k < r; ++k) {
-                    ggml_cuda_host_store_kernel<<<blocks, 256, 0, ssend[i]>>>(
-                        (int4 *) hsend[i], (const int4 *) dbuf[i], bytes / sizeof(int4));
-                    ggml_cuda_host_load_kernel<<<blocks, 256, 0, srecv[i]>>>(
-                        (int4 *) dbuf[i], (const int4 *) hsend[other], ld_bytes[i] / sizeof(int4),
-                        (int4 *) dbuf[i]);
-                }
-            }
-            for (size_t i = 0; i < n; ++i) {
-                ggml_cuda_set_device(dev[i]);
-                cudaStreamSynchronize(ssend[i]);
-                cudaStreamSynchronize(srecv[i]);
-            }
-        };
-        auto run_2k = [&](bool st, bool ld, int blocks, int r) {
-            for (size_t i = 0; i < n; ++i) {
-                ggml_cuda_set_device(dev[i]);
-                for (int k = 0; k < r; ++k) {
-                    if (st) {
-                        ggml_cuda_host_store_kernel<<<blocks, 256, 0, ssend[i]>>>(
-                            (int4 *) hsend[i], (const int4 *) dbuf[i], bytes / sizeof(int4));
-                    }
-                    if (ld) {
-                        ggml_cuda_host_load_kernel<<<blocks, 256, 0, srecv[i]>>>(
-                            (int4 *) dbuf[i], (const int4 *) hrecv[i], ld_bytes[i] / sizeof(int4),
-                            (int4 *) dbuf[i]);
-                    }
-                }
-            }
-            for (size_t i = 0; i < n; ++i) {
-                ggml_cuda_set_device(dev[i]);
-                if (st) { cudaStreamSynchronize(ssend[i]); }
-                if (ld) { cudaStreamSynchronize(srecv[i]); }
-            }
-        };
-        auto run_roles = [&](int blocks, int n_store, int r) {
-            for (size_t i = 0; i < n; ++i) {
-                ggml_cuda_set_device(dev[i]);
-                for (int k = 0; k < r; ++k) {
-                    ggml_cuda_host_roles_kernel<<<blocks, 256, 0, ssend[i]>>>(
-                        (int4 *) hsend[i], (const int4 *) dbuf[i], bytes / sizeof(int4),
-                        (const int4 *) hrecv[i], ld_bytes[i] / sizeof(int4), n_store, (int4 *) dbuf[i]);
-                }
-            }
-            for (size_t i = 0; i < n; ++i) {
-                ggml_cuda_set_device(dev[i]);
-                cudaStreamSynchronize(ssend[i]);
-            }
-        };
-
-        // One timed region.  Whoever is not `turn` keeps both directions busy for
-        // the whole of it, so the measured pair never gets a quiet link to finish
-        // in.  Returns 0 for the pair that was loading rather than measuring.
-        auto timed = [&](uint32_t turn, const std::function<void(int)> & body) -> double {
-            if (!rv || broken) {
-                if (turn != my_index) {
-                    return 0.0;
-                }
-                const int64_t t0 = ggml_time_us();
-                if (ok) { body(reps); }
-                return (ggml_time_us() - t0) / 1e6;
-            }
-            ggml_cuda_probe_meet(rv, peers, broken);
-            double t = 0.0;
-            if (turn == my_index) {
-                const int64_t tw = ggml_time_us();
-                while (__atomic_load_n(&rv->bg_ready, __ATOMIC_ACQUIRE) == 0) {
-                    if (ggml_time_us() - tw > 30ll*1000*1000) { break; }
-                    std::this_thread::yield();
-                }
-                if (ok) { body(bg_reps); }              // warm, already under load
-                const int64_t t0 = ggml_time_us();
-                if (ok) { body(reps); }
-                t = (ggml_time_us() - t0) / 1e6;
-                __atomic_store_n(&rv->stop, 1, __ATOMIC_RELEASE);
-            } else {
-                __atomic_store_n(&rv->bg_ready, 1, __ATOMIC_RELEASE);
-                while (__atomic_load_n(&rv->stop, __ATOMIC_ACQUIRE) == 0) {
-                    if (!ok) { std::this_thread::yield(); continue; }
-                    run_2k(true, true, 32, bg_reps);
-                }
-            }
-            ggml_cuda_probe_meet(rv, peers, broken);
-            if (turn == my_index) {
-                __atomic_store_n(&rv->bg_ready, 0, __ATOMIC_RELEASE);
-                __atomic_store_n(&rv->stop, 0, __ATOMIC_RELEASE);
-            }
-            ggml_cuda_probe_meet(rv, peers, broken);
-            return t;
-        };
-        // Every runtime walks the same list of turns, so neither can arrive at a
-        // meeting the other never reaches: the sequence is built from constants.
-        auto sweep = [&](const std::function<void(int)> & body) -> double {
-            double mine = 0.0;
-            for (uint32_t turn = 0; turn < std::max<uint32_t>(peers, 1); ++turn) {
-                const double t = timed(turn, body);
-                if (turn == my_index) { mine = t; }
-            }
-            return mine;
-        };
-
-        const double ce_st = sweep([&](int r){ run_ce(true, false, r); });
-        const double ce_ld = sweep([&](int r){ run_ce(false, true, r); });
-        const double ce_bo = sweep([&](int r){ run_ce(true, true, r); });
-        if (ok && ce_st > 0 && ce_ld > 0 && ce_bo > 0) {
-            GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s x %zu dev | copy engines  | "
-                          "store %5.2f  load %5.2f  both %5.2f GB/s  (sequential %5.2f)\n",
-                          GGML_CUDA_NAME, bytes >> 20, ratio_tag, n,
-                          moved_st/ce_st, moved_ld/ce_ld, (moved_st+moved_ld)/ce_bo,
-                          (moved_st+moved_ld)/(ce_st+ce_ld));
-        }
-
-        for (int blocks = 8; blocks <= 64; blocks *= 2) {
-            const double k_st = sweep([&](int r){ run_2k(true, false, blocks, r); });
-            const double k_ld = sweep([&](int r){ run_2k(false, true, blocks, r); });
-            const double k_bo = sweep([&](int r){ run_2k(true, true, blocks, r); });
-            if (ok && k_st > 0 && k_ld > 0 && k_bo > 0) {
-                GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s | two kernels %2d blk | "
-                              "store %5.2f  load %5.2f  both %5.2f GB/s  (sequential %5.2f)\n",
-                              GGML_CUDA_NAME, bytes >> 20, ratio_tag, blocks,
-                              moved_st/k_st, moved_ld/k_ld, (moved_st+moved_ld)/k_bo,
-                              (moved_st+moved_ld)/(k_st+k_ld));
-            }
-            // Both the split and the grid size move this, so sweep both rather
-            // than carry a ratio over from an older measurement.  64 is where the
-            // sweep stops, not a maximum anyone has established.
-            const double sh_bo = sweep([&](int r){ run_shared(blocks, r); });
-            if (ok && sh_bo > 0 && k_bo > 0) {
-                GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s | shared buf %2d blk | "
-                              "                            both %5.2f GB/s  (own buffers %5.2f)\n",
-                              GGML_CUDA_NAME, bytes >> 20, ratio_tag, blocks,
-                              (moved_st+moved_ld)/sh_bo, (moved_st+moved_ld)/k_bo);
-            }
-            for (int num = 1; num <= 3; ++num) {
-                const int n_store = std::max(1, blocks * num / 4);
-                const double r_bo = sweep([&](int r){ run_roles(blocks, n_store, r); });
-                if (ok && r_bo > 0 && k_bo > 0) {
-                    GGML_LOG_WARN("duplex_probe backend=%s %zu MiB r/w %-9s | roles %2d:%-2d of %2d | "
-                                  "                            both %5.2f GB/s  (two kernels %5.2f)\n",
-                                  GGML_CUDA_NAME, bytes >> 20, ratio_tag, n_store, blocks - n_store, blocks,
-                                  (moved_st+moved_ld)/r_bo, (moved_st+moved_ld)/k_bo);
-                }
-            }
-        }
-    }
-
-    for (size_t i = 0; i < n; ++i) {
-        if (ssend[i]) { cudaStreamDestroy(ssend[i]); }
-        if (srecv[i]) { cudaStreamDestroy(srecv[i]); }
-        if (hsend[i]) { cudaFreeHost(hsend[i]); }
-        if (hrecv[i]) { cudaFreeHost(hrecv[i]); }
-        if (dbuf[i])  { ggml_cuda_set_device(dev[i]); cudaFree(dbuf[i]); }
-    }
-}
-
 // Is a direct device-to-device route available inside this registry, and is it
 // worth anything?  The collective moves every byte through mapped host memory
 // because these cards have no P2P across the two driver stacks -- but within one
@@ -1726,16 +1386,12 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     // ranks' share is a strict win for them.  Integers in rank order, e.g.
     // GGML_CUDA_MIXED_AR_SHARES=35,35,15,15.  Default even, which reproduces the
     // previous behaviour exactly.
-    // Pipelined reduce-scatter: publish chunk c while reducing c-1 and gathering
-    // c-2, so the link carries both directions at once.  0 disables it.
-    const uint32_t mixed_ar_pipe = (uint32_t) ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_PIPE_CHUNKS", 0);
-    // The grid every rank runs.  The transport probe says most of what a role
-    // split gains over eight blocks is having more requests in flight rather
-    // than overlapping the directions -- 8 to 64 blocks is worth 19% to two
-    // plain kernels -- so the phased collective has to be tried at a larger grid
-    // before any of that gain is credited to duplex.  Default 8, which is what
-    // every figure recorded so far was measured at.  Each runtime refuses a grid
-    // its devices cannot hold resident.
+    // The grid every rank runs.  Measured: a larger grid is worth nothing to this
+    // collective and costs 31% with the grid-wide barrier the reduce-scatter
+    // uses, because every phase already saturates the link in one direction.
+    // Default 8; the knob stays because each runtime now refuses a grid its
+    // devices cannot hold resident, and that check is what makes the barrier
+    // safe rather than assumed.
     const size_t mixed_ar_blocks = (size_t) std::min<uint64_t>(GGML_CUDA_MIXED_AR_BLOCKS,
         std::max<uint64_t>(1, ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_BLOCKS", 8)));
     // The reduce-scatter's grid, separate from the small path's: decode runs the
@@ -1745,11 +1401,6 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     // the grid-wide barrier can be told apart from the cost of a large grid.
     const size_t mixed_ar_rs_blocks = (size_t) std::min<uint64_t>(GGML_CUDA_MIXED_AR_BLOCKS,
         std::max<uint64_t>(1, ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_RS_BLOCKS", mixed_ar_blocks)));
-    const uint32_t mixed_ar_rs_split = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_RS_SPLIT") ? 1 : 0;
-    // Parts to overlap: publication of part q+1 beside the reduction and gather
-    // of part q, on a second stream.  0 disables it.
-    const uint32_t mixed_ar_duplex = (uint32_t) ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_DUPLEX_PARTS", 0);
-    const uint32_t mixed_ar_noaux = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_DUPLEX_NOAUX") ? 1 : 0;
     // Compares every collective against the flat kernel elementwise.  Doubles
     // the traffic, so it is for checking, not for measuring.
     const uint32_t mixed_ar_verify = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_VERIFY") ? 1 : 0;
@@ -1795,23 +1446,11 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     const size_t data_bytes = GGML_CUDA_MIXED_AR_SLOTS * n_ranks * GGML_CUDA_MIXED_AR_RANK_BYTES;
     const size_t shared_bytes = data_bytes + GGML_CUDA_MIXED_AR_SLOTS * n_ranks *
         GGML_CUDA_MIXED_AR_BLOCKS * GGML_CUDA_MIXED_AR_SIGNAL_STRIDE;
-    // A page past the wire, for the probes to meet on.  The collective never
-    // reads it; keeping it inside the one shared allocation is what lets both
-    // dynamic-linker namespaces name the same bytes.
-    const size_t probe_bytes = 256;
-    ret->mixed_host = ggml_aligned_malloc(shared_bytes + probe_bytes);
+    ret->mixed_host = ggml_aligned_malloc(shared_bytes);
     if (!ret->mixed_host) {
         return false;
     }
-    memset(ret->mixed_host, 0, shared_bytes + probe_bytes);
-
-    // Kept alive past the loop: the duplex probe runs after every runtime is up,
-    // and needs each one's own backends.
-    std::vector<std::vector<ggml_backend_t>> probe_backends;
-    std::vector<std::vector<double>> probe_ratios;
-    std::vector<ggml_cuda_probe_duplex_t> probe_entry;
-    probe_backends.reserve(ranks_by_registry.size());
-    probe_ratios.reserve(ranks_by_registry.size());
+    memset(ret->mixed_host, 0, shared_bytes);
 
     for (const auto & item : ranks_by_registry) {
         const auto registry = item.first;
@@ -1828,23 +1467,10 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             ret->clear_mixed();
             return false;
         }
-        probe_backends.emplace_back();
-        probe_ratios.emplace_back();
-        std::vector<ggml_backend_t> & local_backends = probe_backends.back();
+        std::vector<ggml_backend_t> local_backends;
         for (int rank : ranks) {
             local_backends.push_back(ret->backends[rank]);
-            // What this rank actually asks of the link: it publishes N and reads
-            // (1+2w)N, so the four ranks of a 35/35/17/13 split are four
-            // different workloads, not one.
-            uint64_t total = 0;
-            for (size_t k = 0; k < n_ranks; ++k) {
-                total += mixed_ar_shares[k];
-            }
-            const double w = total ? (double) mixed_ar_shares[rank] / (double) total : 0.0;
-            probe_ratios.back().push_back(1.0 + 2.0*w);
         }
-        probe_entry.push_back(reinterpret_cast<ggml_cuda_probe_duplex_t>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_probe_duplex")));
         // Negotiated here, once, and handed to every runtime.  Reading the
         // environment separately inside each DSO's enqueue is how two of them end
         // up in different algorithms with matching buffer sizes.
@@ -1854,11 +1480,9 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             ret->mixed_host, shared_bytes, data_bytes,
             GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
             mixed_ar_blocks, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
-            mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk, mixed_ar_pipe,
-            mixed_ar_rs_blocks, mixed_ar_rs_split, mixed_ar_duplex, mixed_ar_noaux, mixed_ar_verify,
+            mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk,
+            mixed_ar_rs_blocks, mixed_ar_verify,
             {},
-            (char *) ret->mixed_host + shared_bytes, probe_bytes,
-            (uint32_t) ranks_by_registry.size(),
         };
         for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
             config.shard_weight[i] = mixed_ar_shares[i];
@@ -1871,29 +1495,6 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             return false;
         }
         ret->mixed_groups.push_back({context, free, prepare, enqueue});
-    }
-
-    // Now, and on a thread per runtime.  Inside group_init this could not work:
-    // the loop above enters the runtimes one at a time, so a rendezvous there
-    // waits for a participant that has not been called yet -- and a probe that
-    // drives one pair of cards while the other pair is idle measures a link the
-    // collective never sees.
-    {
-        std::vector<std::thread> probes;
-        for (size_t i = 0; i < probe_entry.size(); ++i) {
-            if (!probe_entry[i]) {
-                continue;
-            }
-            probes.emplace_back([&, i] {
-                probe_entry[i](probe_backends[i].data(), probe_backends[i].size(),
-                               (char *) ret->mixed_host + shared_bytes, probe_bytes,
-                               (uint32_t) probe_entry.size(), (uint32_t) i,
-                               probe_ratios[i].data());
-            });
-        }
-        for (auto & t : probes) {
-            t.join();
-        }
     }
 
     ret->try_allreduce = ggml_backend_cuda_comm_allreduce_mixed;
@@ -6613,9 +6214,6 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    if (strcmp(name, "ggml_backend_cuda_probe_duplex") == 0) {
-        return (void *) ggml_cuda_probe_duplex;
-    }
     if (strcmp(name, "ggml_backend_cuda_mixed_ar_group_init") == 0) {
         return (void *) ggml_cuda_mixed_ar_group_init;
     }
