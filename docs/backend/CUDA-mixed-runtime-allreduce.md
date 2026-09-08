@@ -1354,3 +1354,54 @@ this deployment excludes on accuracy grounds and which is where the historical
 1000+ tokens/s came from; P2P, measured above and slower; or fewer collectives,
 which is a property of the model graph. Within the current constraints this is
 close to the floor.
+
+### Where a prefill's time goes, as it stands
+
+A 10k prefill of the 27B at 391.6 tokens/s, 25534 ms of wall, shares
+35/35/15/15. The table is written from the V100 SXM2, which is the critical
+rank: it waits for almost nothing and everyone else waits for it.
+
+| stage on the critical rank | ms | % of wall |
+| --- | ---: | ---: |
+| publish -- writing its own contribution to host | 8056 | 31.5% |
+| gather -- reading the shards it does not own | 7952 | 31.1% |
+| reduce -- summing the shard it owns | 4090 | 16.0% |
+| waiting for peers | 685 | 2.7% |
+| **collective, total** | **20762** | **81.3%** |
+| model compute, launches, host gaps | 4772 | 18.7% |
+| **wall** | **25534** | **100%** |
+
+Model compute is about 3013 ms of that last row, from the operation profile;
+that reading was taken on an earlier configuration, so it is indicative rather
+than exact. Within it: MUL_MAT 67.3%, GATED_DELTA_NET 12.5%, FLASH_ATTN_EXT
+6.8%, RMS_NORM 4.3%.
+
+Three things follow directly, and they are why the remaining ideas are the ones
+they are.
+
+**Four fifths of a prefill is the exchange**, all of it against the Teslas' PCIe
+Gen3 x4 at 3.3 GB/s against the Blackwells' 7.15.
+
+**Waiting is 2.7%.** The critical rank has no idle time to hide work in, which is
+what retired the streamed publish-to-reduce overlap after it had been started:
+overlap converts waiting into work, and there is no waiting here.
+
+**Publish and gather together are 63%, and both are pure transfer.** Publication
+cannot be reduced at all -- every element is reduced by one owner who needs every
+rank's contribution, so all of N must cross. Gather shrinks only by owning a
+larger share, which grows the reduce; that trade is what 35/35/15/15 was measured
+to balance.
+
+Kernel work is 12% of the wall, so there is nothing left to win there. What
+remains is bytes on the link, and the three routes to fewer of them are
+compression (excluded on accuracy grounds), P2P (measured above at less than half
+the host path) and more lanes or a newer link generation. On the last: the
+Blackwells' devices report `LnkCap 32GT/s x16` while their ports report
+`8GT/s x8`, and both x4 ports report `8GT/s`, so the board or its firmware is
+what limits this, not the cards. Swapping the cards between slots is predicted to
+change nothing -- the cost model that reproduces all three measured share
+configurations gives 14.89 ms either way, because the floor is `N / slowest link`
+and two cards sit on x4 whichever pair they are -- but Teslas on the x8 ports
+together with Gen4 on the x4 ports would remove that floor and is worth 1.84x on
+the collective by the same model. Whether those ports can run Gen4 is a firmware
+question, not a software one.
