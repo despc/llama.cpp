@@ -14,6 +14,9 @@ static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 5;
 static constexpr size_t GGML_CUDA_MIXED_AR_SLOTS = 2;
 static constexpr size_t GGML_CUDA_MIXED_AR_RANK_BYTES = 64 * 1024 * 1024;
 static constexpr size_t GGML_CUDA_MIXED_AR_BLOCKS = 8;
+// Ranks a single mixed AllReduce group can hold; sizes the per-element scratch
+// the butterfly tree is reduced in.
+static constexpr int GGML_CUDA_MIXED_AR_MAX_RANKS = GGML_CUDA_MAX_DEVICES;
 static constexpr size_t GGML_CUDA_MIXED_AR_SIGNAL_STRIDE = 64;
 
 struct ggml_cuda_mixed_ar_group_config {

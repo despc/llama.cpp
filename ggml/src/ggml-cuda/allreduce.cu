@@ -954,6 +954,48 @@ bool ggml_cuda_ar_allreduce(
 
 // Mixed runtime: one native tensor type on both sides of the wire.
 // Every rank sums in global rank order; events protect slot reuse.
+// The reduction order, and why it is this one.
+//
+// The meta backend's AllReduce (ggml-backend-meta.cpp, "Butterfly reduction")
+// folds any ranks past the largest power of two into the first block, then
+// combines at halving XOR offsets: for four ranks that is (a0+a2) + (a1+a3).
+// Every step is a ggml ADD on the tensor's own type, so an F16 tensor is rounded
+// back to F16 after each one.
+//
+// This reproduces that tree exactly, including the per-step rounding.  The point
+// is not speed -- summing four already-loaded values costs nothing either way --
+// but that the result is then bit-identical to the reference rather than merely
+// close to it.  A sequential sum over ranks is a different tree: for n ranks it
+// rounds n-1 times against the tree's log2(n), so it was also marginally the less
+// accurate of the two.  Bit-identity means the question of whether this path
+// changes the model cannot be answered by measurement, because there is nothing
+// to measure.
+//
+// XOR pairing is symmetric, so every rank reduces the same tree and all of them
+// finish with the same bits; that also matches the reference.
+template <typename T>
+static __device__ __forceinline__ T ggml_cuda_mixed_ar_reduce(T (&v)[GGML_CUDA_MIXED_AR_MAX_RANKS], int n_ranks) {
+    // largest power of two <= n_ranks/2, as offset_j_max is derived there
+    int off_max = n_ranks / 2;
+    while (off_max > 1 && (off_max & (off_max - 1)) != 0) {
+        off_max--;
+    }
+    const int folded = off_max > 0 ? 2*off_max : 1;
+
+    // ranks past the power-of-two block are folded in first
+    for (int src = folded; src < n_ranks; ++src) {
+        v[src - folded] = ggml_cuda_cast<T>(ggml_cuda_cast<float>(v[src - folded]) +
+                                            ggml_cuda_cast<float>(v[src]));
+    }
+    for (int off = off_max; off >= 1; off /= 2) {
+        for (int j = 0; j < off; ++j) {
+            v[j] = ggml_cuda_cast<T>(ggml_cuda_cast<float>(v[j]) +
+                                     ggml_cuda_cast<float>(v[j + off]));
+        }
+    }
+    return v[0];
+}
+
 template <typename T>
 static __global__ void ggml_cuda_mixed_ar_kernel(
         const T *                   sendbuf,
@@ -1023,38 +1065,36 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
 
     for (int i = gtid; i < count_vec; i += gnt) {
         const int off = i * ELEMS_PER_VEC;
-        float sum[ELEMS_PER_VEC] = {};
+        T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
         for (int peer = 0; peer < n_ranks; ++peer) {
-            T wire[ELEMS_PER_VEC];
             if (peer == rank) {
 #pragma unroll
                 for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                    wire[k] = contribute ? sendbuf[off + k]
-                                         : ggml_cuda_cast<T>(0.0f);
+                    wire[peer][k] = contribute ? sendbuf[off + k]
+                                               : ggml_cuda_cast<T>(0.0f);
                 }
             } else {
                 const T * host_peer = slot_data + (size_t) peer * rank_stride;
-                ggml_cuda_memcpy_1<sizeof(wire)>(wire, &host_peer[off]);
-            }
-#pragma unroll
-            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                sum[k] += ggml_cuda_cast<float>(wire[k]);
+                ggml_cuda_memcpy_1<sizeof(wire[peer])>(wire[peer], &host_peer[off]);
             }
         }
 #pragma unroll
         for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-            recvbuf[off + k] = ggml_cuda_cast<T>(sum[k]);
+            T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+            for (int peer = 0; peer < n_ranks; ++peer) {
+                v[peer] = wire[peer][k];
+            }
+            recvbuf[off + k] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
         }
     }
     if (bid == 0 && tid < count - tail) {
-        float sum = 0.0f;
+        T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
         for (int peer = 0; peer < n_ranks; ++peer) {
-            const T value = peer == rank
+            v[peer] = peer == rank
                 ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
                 : (slot_data + (size_t) peer * rank_stride)[tail + tid];
-            sum += ggml_cuda_cast<float>(value);
         }
-        recvbuf[tail + tid] = ggml_cuda_cast<T>(sum);
+        recvbuf[tail + tid] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
     }
 }
 
