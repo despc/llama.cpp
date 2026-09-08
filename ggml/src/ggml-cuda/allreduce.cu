@@ -1319,6 +1319,32 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
     }
 }
 
+// Where a collective's time goes, opt-in via GGML_CUDA_MIXED_AR_PROFILE.
+//
+// The operation profile can only say that model compute is a small part of a
+// prefill; it cannot say whether what remains is publication, waiting for peers,
+// the reduction itself, or the gather.  Those want different fixes -- more
+// overlap, a different share of the work, a lighter kernel -- so they have to be
+// separated before the next prototype rather than after it.
+//
+// One accumulator per (rank, block), summed over calls.  Thread 0 samples the
+// global timer at each phase boundary, so the cost is a handful of reads per
+// block per collective.
+struct ggml_cuda_ar_phase_acc {
+    unsigned long long publish;    // writing this rank's contribution
+    unsigned long long wait_pub;   // blocked until every peer has published
+    unsigned long long reduce;     // reducing the shard this rank owns
+    unsigned long long wait_red;   // blocked until every peer has reduced
+    unsigned long long gather;     // reading the shards this rank does not own
+    unsigned long long calls;
+};
+
+static __device__ __forceinline__ unsigned long long ggml_cuda_ar_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
 // Reduce-scatter followed by all-gather.  Same arithmetic, less traffic.
 //
 // The kernels above have every rank reduce the whole tensor, so each one pulls
@@ -1349,7 +1375,9 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         int                         count,
         uint32_t *                  arrival_slot,
         uint32_t                    token,
-        bool                        contribute) {
+        bool                        contribute,
+        ggml_cuda_ar_shards         shards,
+        ggml_cuda_ar_phase_acc *    acc) {
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
     constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(uint32_t));
 
@@ -1359,13 +1387,31 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
     const int gtid = bid * nt + tid;
     const int gnt  = gridDim.x * nt;
 
+    unsigned long long t_mark = acc ? ggml_cuda_ar_now() : 0;
+    auto phase = [&](unsigned long long ggml_cuda_ar_phase_acc::*field) {
+        if (!acc) {
+            return;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            const unsigned long long now = ggml_cuda_ar_now();
+            atomicAdd(&(acc[bid].*field), now - t_mark);
+            t_mark = now;
+        }
+        __syncthreads();
+    };
+
     const int count_vec = count / ELEMS_PER_VEC;
     const int tail      = count_vec * ELEMS_PER_VEC;
 
     T * host_mine = slot_data + (size_t) rank * rank_stride;
     uint32_t * my_sig = arrival_slot + ((size_t) rank * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
 
-    auto shard_lo = [&](int r) { return (int) ((int64_t) r * count_vec / n_ranks); };
+    // Integer, and identical on every rank because the inputs are.
+    auto shard_lo = [&](int r) {
+        const uint32_t total = shards.cum[n_ranks];
+        return total ? (int) ((int64_t) shards.cum[r] * count_vec / (int64_t) total) : 0;
+    };
 
     // the tail is shorter than a vector; it belongs to the last shard's owner
     const bool owns_tail = rank == n_ranks - 1;
@@ -1418,7 +1464,10 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         __threadfence_system();
     };
 
+    phase(&ggml_cuda_ar_phase_acc::publish);
+
     barrier(GGML_CUDA_MIXED_AR_SIG_RS_PUBLISHED);
+    phase(&ggml_cuda_ar_phase_acc::wait_pub);
 
     // 2. reduce this rank's shard, into recvbuf and back into its own slot.  Its
     //    own contribution there is read by nobody -- a peer only ever reads the
@@ -1461,7 +1510,10 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         host_mine[tail + tid] = total;
     }
 
+    phase(&ggml_cuda_ar_phase_acc::reduce);
+
     barrier(GGML_CUDA_MIXED_AR_SIG_RS_REDUCED);
+    phase(&ggml_cuda_ar_phase_acc::wait_red);
 
     // 3. collect the shards this rank did not reduce
     for (int peer = 0; peer < n_ranks; ++peer) {
@@ -1483,6 +1535,11 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
         recvbuf[tail + tid] =
             (slot_data + (size_t) (n_ranks - 1) * rank_stride)[tail + tid];
     }
+
+    phase(&ggml_cuda_ar_phase_acc::gather);
+    if (acc && tid == 0) {
+        atomicAdd(&acc[bid].calls, 1ull);
+    }
 }
 
 struct ggml_cuda_mixed_ar_group {
@@ -1490,6 +1547,8 @@ struct ggml_cuda_mixed_ar_group {
     uint64_t stream_min_bytes = 0;
     uint64_t rs_min_bytes = 0;
     uint32_t stream_chunk = 8;
+    uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS] = {};
+    std::vector<ggml_cuda_ar_phase_acc *> phase_acc;   // per backend, device memory
     size_t data_bytes = 0;
     void * shared_host = nullptr;
     bool host_registered = false;
@@ -1505,6 +1564,32 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
     auto * group = static_cast<ggml_cuda_mixed_ar_group *>(context);
     if (!group) {
         return;
+    }
+    for (size_t i = 0; i < group->phase_acc.size(); ++i) {
+        if (!group->phase_acc[i]) {
+            continue;
+        }
+        ggml_cuda_set_device(group->devices[i]);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ggml_cuda_ar_phase_acc host[GGML_CUDA_MIXED_AR_BLOCKS] = {};
+        CUDA_CHECK(cudaMemcpy(host, group->phase_acc[i], sizeof(host), cudaMemcpyDeviceToHost));
+        // Blocks run concurrently, so the per-block sums are averaged rather than
+        // added: the collective's cost is what one block spends, not all of them.
+        double p = 0, wp = 0, r = 0, wr = 0, g = 0; unsigned long long calls = 0;
+        for (size_t b = 0; b < GGML_CUDA_MIXED_AR_BLOCKS; ++b) {
+            p += host[b].publish; wp += host[b].wait_pub; r += host[b].reduce;
+            wr += host[b].wait_red; g += host[b].gather; calls += host[b].calls;
+        }
+        const double nb = (double) GGML_CUDA_MIXED_AR_BLOCKS;
+        const double tot = (p + wp + r + wr + g) / nb / 1e6;
+        if (tot > 0.0) {
+            GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d calls=%llu total=%8.1f ms | "
+                          "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
+                          GGML_CUDA_NAME, group->ranks[i], (unsigned long long) (calls / GGML_CUDA_MIXED_AR_BLOCKS),
+                          tot, 100*p/(p+wp+r+wr+g), 100*wp/(p+wp+r+wr+g), 100*r/(p+wp+r+wr+g),
+                          100*wr/(p+wp+r+wr+g), 100*g/(p+wp+r+wr+g));
+        }
+        CUDA_CHECK(cudaFree(group->phase_acc[i]));
     }
     for (size_t i = 0; i < group->devices.size(); ++i) {
         ggml_cuda_set_device(group->devices[i]);
@@ -1549,12 +1634,28 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->stream_min_bytes = config->stream_min_bytes;
     group->rs_min_bytes = config->rs_min_bytes;
     group->stream_chunk = config->stream_chunk ? config->stream_chunk : 1;
+    for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
+        group->shard_weight[i] = config->shard_weight[i] ? config->shard_weight[i] : 0;
+    }
     group->data_bytes = data_bytes;
     group->shared_host = config->shared_host;
     group->backends.assign(config->backends, config->backends + config->n_backends);
     group->ranks.assign(config->ranks, config->ranks + config->n_backends);
     group->device_bases.resize(config->n_backends, nullptr);
     group->done.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, nullptr);
+    if (ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_PROFILE")) {
+        group->phase_acc.assign(config->n_backends, nullptr);
+        for (size_t i = 0; i < config->n_backends; ++i) {
+            auto * ctx = static_cast<ggml_backend_cuda_context *>(config->backends[i]->context);
+            ggml_cuda_set_device(ctx->device);
+            const size_t bytes = GGML_CUDA_MIXED_AR_BLOCKS * sizeof(ggml_cuda_ar_phase_acc);
+            if (cudaMalloc(&group->phase_acc[i], bytes) != cudaSuccess) {
+                group->phase_acc.clear();
+                break;
+            }
+            CUDA_CHECK(cudaMemset(group->phase_acc[i], 0, bytes));
+        }
+    }
     group->done_valid.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, false);
 
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(config->backends[0]));
@@ -1672,7 +1773,7 @@ bool ggml_cuda_mixed_ar_group_enqueue(
                 reinterpret_cast<const T *>(tensor->data), \
                 reinterpret_cast<T *>(tensor->data), \
                 reinterpret_cast<T *>(slot_data), rank, (int) group->n_ranks, rank_stride, \
-                (int) ne, arrival_slot, token, contribute); \
+                (int) ne, arrival_slot, token, contribute, shards, acc); \
         } else if (use_stream) { \
             ggml_cuda_mixed_ar_stream_kernel<T><<<dim3(GGML_CUDA_MIXED_AR_BLOCKS), dim3(256), 0, stream>>>( \
                 reinterpret_cast<const T *>(tensor->data), \
@@ -1687,6 +1788,17 @@ bool ggml_cuda_mixed_ar_group_enqueue(
                 (int) ne, arrival_slot, token, contribute); \
         }
 
+        // Cumulative weights; the kernel divides the vector count by them.
+        ggml_cuda_ar_shards shards = {};
+        {
+            uint32_t cum = 0;
+            for (size_t r = 0; r < group->n_ranks; ++r) {
+                shards.cum[r] = cum;
+                cum += group->shard_weight[r] ? group->shard_weight[r] : 1;
+            }
+            shards.cum[group->n_ranks] = cum;
+        }
+        ggml_cuda_ar_phase_acc * acc = i < group->phase_acc.size() ? group->phase_acc[i] : nullptr;
         switch (tensor->type) {
             case GGML_TYPE_F32:  LAUNCH_MIXED_AR(float);       break;
             case GGML_TYPE_F16:  LAUNCH_MIXED_AR(half);        break;

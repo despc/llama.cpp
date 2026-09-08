@@ -64,6 +64,19 @@ struct ggml_cuda_mixed_ar_group_config {
     uint64_t stream_min_bytes;  // 0 disables streaming
     uint64_t rs_min_bytes;      // 0 disables reduce-scatter
     uint32_t stream_chunk;
+    // Relative share of the reduction each rank owns, in rank order.  Integers,
+    // so every rank derives identical boundaries from them; all ones is an even
+    // split.  This is not the weight split: it decides who reduces an element,
+    // never which values are summed, so it cannot change a result.
+    uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS];
+};
+
+// Cumulative shard weights, so the kernel can derive lo[r]..lo[r+1) itself with
+// integer arithmetic.  Every rank is handed the same numbers and divides the same
+// vector count, so all of them land on the same boundaries: a gap would leave an
+// element unreduced and an overlap would reduce it twice.
+struct ggml_cuda_ar_shards {
+    uint32_t cum[GGML_CUDA_MIXED_AR_MAX_RANKS + 1];   // cum[0] = 0, cum[n] = total
 };
 
 using ggml_cuda_mixed_ar_group_init_t = void * (*)(const ggml_cuda_mixed_ar_group_config *);

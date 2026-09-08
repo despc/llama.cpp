@@ -1306,6 +1306,44 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
         ? ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_RS_MIN_BYTES", 256*1024) : 0;
     const uint32_t mixed_ar_chunk = (uint32_t) std::max<uint64_t>(1,
         ggml_cuda_mixed_ar_env("GGML_CUDA_MIXED_AR_STREAM_CHUNK", 8));
+
+    // Who reduces how much.  The phase profile shows the Teslas fully occupied
+    // while the Blackwells wait 56% of every collective, so the even split has
+    // the slow cards on the critical path.  A rank owning share w moves
+    // 2N + 3wN, the 3 coming from reading every peer's contribution for its own
+    // shard against one payload per shard when gathering, so shrinking the slow
+    // ranks' share is a strict win for them.  Integers in rank order, e.g.
+    // GGML_CUDA_MIXED_AR_SHARES=35,35,15,15.  Default even, which reproduces the
+    // previous behaviour exactly.
+    uint32_t mixed_ar_shares[GGML_CUDA_MIXED_AR_MAX_RANKS];
+    for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
+        mixed_ar_shares[i] = 1;
+    }
+    if (const char * spec = getenv("GGML_CUDA_MIXED_AR_SHARES")) {
+        uint32_t parsed[GGML_CUDA_MIXED_AR_MAX_RANKS] = {};
+        size_t n = 0;
+        uint64_t sum = 0;
+        const char * p = spec;
+        while (*p && n < (size_t) GGML_CUDA_MIXED_AR_MAX_RANKS) {
+            char * end = nullptr;
+            const unsigned long long v = strtoull(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            parsed[n++] = (uint32_t) v;
+            sum += v;
+            p = *end == ',' ? end + 1 : end;
+        }
+        if (n == ret->backends.size() && sum > 0) {
+            for (size_t i = 0; i < n; ++i) {
+                mixed_ar_shares[i] = parsed[i];
+            }
+            GGML_LOG_INFO("%s: reduction shares %s\n", __func__, spec);
+        } else {
+            GGML_LOG_WARN("%s: GGML_CUDA_MIXED_AR_SHARES needs %zu positive integers; using an even split\n",
+                          __func__, ret->backends.size());
+        }
+    }
     const size_t n_ranks = ret->backends.size();
     if (n_ranks < 2 || n_ranks > GGML_CUDA_MAX_DEVICES) {
         return false;
@@ -1346,14 +1384,18 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
         // Negotiated here, once, and handed to every runtime.  Reading the
         // environment separately inside each DSO's enqueue is how two of them end
         // up in different algorithms with matching buffer sizes.
-        const ggml_cuda_mixed_ar_group_config config = {
+        ggml_cuda_mixed_ar_group_config config = {
             GGML_CUDA_MIXED_AR_ABI_VERSION,
             local_backends.data(), ranks.data(), local_backends.size(), n_ranks,
             ret->mixed_host, shared_bytes, data_bytes,
             GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
             GGML_CUDA_MIXED_AR_BLOCKS, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
             mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk,
+            {},
         };
+        for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
+            config.shard_weight[i] = mixed_ar_shares[i];
+        }
         void * context = init(&config);
         if (!context) {
             GGML_LOG_WARN("%s: mixed AllReduce unavailable or ABI mismatch in %s\n",
