@@ -1443,14 +1443,37 @@ prefill, all of it bit-identical to the reference reduction.
 
 ### Still open
 
-Two things the review raised that are not done. Whether the link can carry both
-directions at once has not been measured: the phase profile shows only 2.7% of
-waiting, which says there is no idle time to overlap into, but it does not say
-whether sending the next chunk while receiving the previous one is faster than
-doing them in sequence. That needs a transport probe at the real sizes with all
-four cards active, not the sequential 128 MiB copies the P2P probe does. The
-historical duplex result is suggestive but was measured on the compressed path
-and its numbers do not transfer.
+### The link is full duplex, and the kernel uses one direction at a time
+
+Measured, because the argument for skipping it was wrong. "Waiting is 2.7%, so
+there is nothing to overlap" answers whether there is idle time to hide work in.
+It does not answer whether sending and receiving at the same time beats doing
+them in sequence, and that is what a pipelined reduce-scatter would rest on.
+
+`GGML_CUDA_DUPLEX_PROBE`, every card in a registry driven at once, at the
+collective's own sizes:
+
+| | send | receive | both at once | sequential would be |
+| --- | ---: | ---: | ---: | ---: |
+| V100 pair | 6.59 GB/s | 5.64 | **11.22** | 6.08 |
+| Blackwell pair | 14.30 | 8.41 | **25.79** | 10.59 |
+
+The Tesla link delivers **1.85x** when both directions run together, close to the
+sum of the two one-way figures, and the Blackwell link 2.44x. Sizes of 21 and 64
+MiB agree to within noise.
+
+The kernel runs its phases strictly in order, and each is one-directional:
+publish sends, reduce receives, gather receives. Half the link is idle
+throughout. On the critical rank publish is 8.1 s and reduce 4.1 s; overlapped,
+that pair costs about what the longer of them costs rather than their sum, which
+is roughly 4 s of a 20.8 s collective.
+
+What the probe does not cover: the two libraries probe separately, so contention
+between the Blackwell pair and the Tesla pair over the shared root complex and
+host DRAM is not in these numbers. A pipeline would have all four cards sending
+and receiving at once, so the real figure will be lower than 1.85x.
+
+### Still open
 
 And the shares will want re-measuring again after any further change to the
 transport, for the same reason they moved here.

@@ -1646,6 +1646,7 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->stream_chunk = config->stream_chunk ? config->stream_chunk : 1;
     // Runs in this library's namespace, so it sees this stack's devices.
     ggml_cuda_probe_p2p(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
+    ggml_cuda_probe_duplex(const_cast<ggml_backend_t *>(config->backends), config->n_backends);
     for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
         group->shard_weight[i] = config->shard_weight[i] ? config->shard_weight[i] : 0;
     }

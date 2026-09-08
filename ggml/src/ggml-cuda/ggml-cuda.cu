@@ -1291,6 +1291,83 @@ static uint64_t ggml_cuda_mixed_ar_env(const char * name, uint64_t fallback) {
     return end != v ? (uint64_t) parsed : fallback;
 }
 
+// Can the link carry both directions at once?
+//
+// The phase profile says the critical rank waits 2.7% of a collective, which
+// answers a different question: whether there is idle time to hide work in.  It
+// says nothing about whether sending the next chunk while receiving the previous
+// one beats doing them in sequence, and that is what a pipelined reduce-scatter
+// would depend on.  PCIe is nominally full duplex; whether this board delivers it
+// under real sizes with every card active is a measurement.
+//
+// Opt-in via GGML_CUDA_DUPLEX_PROBE.  Every device in this registry is driven at
+// once, since they share a root complex and host DRAM, and the sizes are the
+// collective's own.  Limit worth knowing: the two libraries probe separately, so
+// contention between the Blackwell pair and the Tesla pair is not captured here.
+void ggml_cuda_probe_duplex(ggml_backend_t * backends, size_t n) {
+    static bool done = false;
+    if (done || !ggml_env_flag_enabled("GGML_CUDA_DUPLEX_PROBE") || n == 0) {
+        return;
+    }
+    done = true;
+
+    const size_t sizes[] = { 21ull << 20, 64ull << 20 };
+    for (size_t si = 0; si < sizeof(sizes)/sizeof(sizes[0]); ++si) {
+        const size_t bytes = sizes[si];
+        std::vector<void *> dbuf(n, nullptr), hsend(n, nullptr), hrecv(n, nullptr);
+        std::vector<cudaStream_t> ssend(n, nullptr), srecv(n, nullptr);
+        std::vector<int> dev(n, 0);
+        bool ok = true;
+        for (size_t i = 0; i < n && ok; ++i) {
+            dev[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device;
+            ggml_cuda_set_device(dev[i]);
+            ok = ok && cudaMalloc(&dbuf[i], bytes) == cudaSuccess;
+            ok = ok && cudaHostAlloc(&hsend[i], bytes, cudaHostAllocPortable) == cudaSuccess;
+            ok = ok && cudaHostAlloc(&hrecv[i], bytes, cudaHostAllocPortable) == cudaSuccess;
+            ok = ok && cudaStreamCreate(&ssend[i]) == cudaSuccess;
+            ok = ok && cudaStreamCreate(&srecv[i]) == cudaSuccess;
+        }
+        const int reps = 10;
+        auto run = [&](bool send, bool recv) {
+            for (size_t i = 0; i < n; ++i) {
+                ggml_cuda_set_device(dev[i]);
+                for (int k = 0; k < reps; ++k) {
+                    if (send) { cudaMemcpyAsync(hsend[i], dbuf[i], bytes, cudaMemcpyDeviceToHost, ssend[i]); }
+                    if (recv) { cudaMemcpyAsync(dbuf[i], hrecv[i], bytes, cudaMemcpyHostToDevice, srecv[i]); }
+                }
+            }
+            for (size_t i = 0; i < n; ++i) {
+                ggml_cuda_set_device(dev[i]);
+                if (send) { cudaStreamSynchronize(ssend[i]); }
+                if (recv) { cudaStreamSynchronize(srecv[i]); }
+            }
+        };
+        if (ok) {
+            run(true, true);   // warm
+            double t[3];
+            for (int mode = 0; mode < 3; ++mode) {
+                const int64_t t0 = ggml_time_us();
+                run(mode != 1, mode != 0);
+                t[mode] = (ggml_time_us() - t0) / 1e6;
+            }
+            const double moved = (double) bytes * reps * n / 1e9;
+            GGML_LOG_WARN("duplex_probe backend=%s %zu MiB x %d x %zu dev | "
+                          "send %5.2f GB/s  recv %5.2f GB/s  both %5.2f GB/s aggregate "
+                          "(sequential would be %5.2f)\n",
+                          GGML_CUDA_NAME, bytes >> 20, reps, n,
+                          moved/t[0], moved/t[1], 2.0*moved/t[2],
+                          2.0*moved/(t[0]+t[1]));
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (ssend[i]) { cudaStreamDestroy(ssend[i]); }
+            if (srecv[i]) { cudaStreamDestroy(srecv[i]); }
+            if (hsend[i]) { cudaFreeHost(hsend[i]); }
+            if (hrecv[i]) { cudaFreeHost(hrecv[i]); }
+            if (dbuf[i])  { ggml_cuda_set_device(dev[i]); cudaFree(dbuf[i]); }
+        }
+    }
+}
+
 // Is a direct device-to-device route available inside this registry, and is it
 // worth anything?  The collective moves every byte through mapped host memory
 // because these cards have no P2P across the two driver stacks -- but within one
