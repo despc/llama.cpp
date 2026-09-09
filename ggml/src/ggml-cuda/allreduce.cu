@@ -1141,6 +1141,12 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
         uint32_t *                  arrival_slot,
         uint32_t                    token,
         bool                        contribute,
+        // The other two kernels learned these; this one had not, so it kept
+        // publishing zeros for ranks with no slice and reading peers that had
+        // published none -- and the traffic counter, which does skip them, was
+        // describing a kernel that did not exist.
+        uint32_t                    active_mask,
+        uint32_t                    needed_mask,
         int                         chunk) {
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
     constexpr int SIGNAL_INTS = (int) (GGML_CUDA_MIXED_AR_SIGNAL_STRIDE / sizeof(uint32_t));
@@ -1175,11 +1181,13 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
     __syncthreads();
 
     T * host_mine = slot_data + (size_t) rank * rank_stride;
+    const bool i_am_active = (active_mask >> rank) & 1u;
+    const bool i_need_it   = (needed_mask >> rank) & 1u;
 
     auto publish_step = [&](int step) {
         const int s0 = v0 + step * vps;
         const int s1 = min(s0 + vps, v1);
-        for (int i = s0 + tid; i < s1; i += nt) {
+        for (int i = i_am_active ? s0 + tid : s1; i < s1; i += nt) {
             const int off = i * ELEMS_PER_VEC;
             T wire[ELEMS_PER_VEC];
 #pragma unroll
@@ -1193,14 +1201,17 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
     auto consume_step = [&](int step) {
         const int s0 = v0 + step * vps;
         const int s1 = min(s0 + vps, v1);
-        for (int i = s0 + tid; i < s1; i += nt) {
+        for (int i = i_need_it ? s0 + tid : s1; i < s1; i += nt) {
             const int off = i * ELEMS_PER_VEC;
             T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
+            // positions and tree preserved, only the fetch skipped -- as in the
+            // other two kernels, and for the same reason
             for (int peer = 0; peer < n_ranks; ++peer) {
-                if (peer == rank) {
+                if (peer == rank || !((active_mask >> peer) & 1u)) {
 #pragma unroll
                     for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                        wire[peer][k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
+                        wire[peer][k] = (peer == rank && contribute)
+                            ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
                     }
                 } else {
                     const T * host_peer = slot_data + (size_t) peer * rank_stride;
@@ -1226,6 +1237,9 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
                 if (peer == rank) {
                     continue;
                 }
+                if (!((active_mask >> peer) & 1u)) {
+                    continue;   // publishes nothing: nothing to await
+                }
                 const uint32_t * ps = arrival_slot +
                     ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
                 const int done =
@@ -1241,7 +1255,7 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
 
     // the tail is shorter than one vector and belongs to block 0; publish it before
     // any progress is advertised, so "steps published" also covers it
-    if (bid == 0 && tid < count - tail) {
+    if (i_am_active && bid == 0 && tid < count - tail) {
         host_mine[tail + tid] = contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f);
     }
 
@@ -2050,7 +2064,7 @@ static void ggml_cuda_mixed_ar_launch(
         } else if (use_stream) {
             ggml_cuda_mixed_ar_stream_kernel<T><<<small, 256, 0, stream>>>(
                 data, data, slot_data, rank, n_ranks, rank_stride, ne,
-                arrival_slot, token, contribute, stream_chunk);
+                arrival_slot, token, contribute, active_mask, needed_mask, stream_chunk);
         } else {
             ggml_cuda_mixed_ar_kernel<T><<<small, 256, 0, stream>>>(
                 data, data, slot_data, rank, n_ranks, rank_stride, ne,
@@ -2255,15 +2269,24 @@ bool ggml_cuda_mixed_ar_group_enqueue(
                         continue;
                     }
                     const bool same = (local_mask >> p) & 1u;
-                    (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) mine * tsz;
+                    // the tail is read by whoever owns it, from every active peer
+                    const int64_t in = mine + (owns_tail ? tail_elems : 0);
+                    (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) in * tsz;
                 }
                 if ((needed_mask >> rank) & 1u) {
                     for (size_t p = 0; p < group->n_ranks; ++p) {
                         if (p == (size_t) rank) {
                             continue;
                         }
-                        const int64_t sz =
-                            (shard_lo_vec(p + 1) - shard_lo_vec(p)) * elems_per_vec;
+                        int64_t sz = (shard_lo_vec(p + 1) - shard_lo_vec(p)) * elems_per_vec;
+                        // and gathered by everyone else, from its owner
+                        int last = 0;
+                        for (size_t r = 0; r < group->n_ranks; ++r) {
+                            if ((active_mask >> r) & 1u) { last = (int) r; }
+                        }
+                        if (!owns_tail && (int) p == last) {
+                            sz += tail_elems;
+                        }
                         const bool same = (local_mask >> p) & 1u;
                         (same ? t.gather_same : t.gather_cross) += (unsigned long long) sz * tsz;
                     }
@@ -2277,12 +2300,17 @@ bool ggml_cuda_mixed_ar_group_enqueue(
                 if ((active_mask >> rank) & 1u) {
                     t.publish += (unsigned long long) ne * tsz;
                 }
-                for (size_t p = 0; p < group->n_ranks; ++p) {
-                    if (p == (size_t) rank || !((active_mask >> p) & 1u)) {
-                        continue;
+                // and the reads are gated by needed_mask in the kernel, which the
+                // counter did not check -- right at the default, overstated the
+                // moment the gather skip is switched on
+                if ((needed_mask >> rank) & 1u) {
+                    for (size_t p = 0; p < group->n_ranks; ++p) {
+                        if (p == (size_t) rank || !((active_mask >> p) & 1u)) {
+                            continue;
+                        }
+                        const bool same = (local_mask >> p) & 1u;
+                        (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) ne * tsz;
                     }
-                    const bool same = (local_mask >> p) & 1u;
-                    (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) ne * tsz;
                 }
             }
         }

@@ -2178,14 +2178,22 @@ collective moves:
 
 | path | prefill |
 |---|---:|
-| **reduce-scatter, as deployed** | **629.5** |
-| streaming publication | 452.9 |
-| flat | 551.0 |
+| **reduce-scatter, as deployed** | **631.0** |
+| streaming publication | 554.8 |
+| flat | 555.0 |
 
 It does not. Reduce-scatter wins by a wide margin at two ranks as well, and the
-chunk size changes nothing (626.4 at 16 against 629.5 at 8). Worth noting on the
-way past: the streaming kernel, which was built and tuned for four ranks, is now
-worse than the plain flat one. Nothing to change.
+chunk size changes nothing (626.4 at 16 against 629.5 at 8). Nothing to change.
+
+The first version of this table had streaming at 452.9, below flat's 551.0, and a
+remark that the kernel built for four ranks had become the worst of the three.
+That was an artefact of the comparison: streaming was the one kernel that had
+never been given the active and needed masks, so it was publishing zeros for
+ranks with no slice and reading peers that had published none, while the two it
+was measured against were not. Masked, it is level with flat -- which is what the
+arithmetic says, since at two ranks its overlap buys nothing and the two move the
+same bytes. Masking it is worth 100 tokens/s to that path whenever it is
+selected, which by default it is not.
 
 **Which layers the Teslas take.** How many is settled -- twelve, from the earlier
 sweep. Which twelve turns out to matter, and only to generation:
@@ -2254,3 +2262,33 @@ into the server, read from its address space rather than from the disk. Two
 measurements today were taken on builds that had not been installed, and the
 build script now refuses to deploy over a running server rather than letting
 `cp` fail into the noise.
+
+### Three more faults in the same instrument
+
+Found by review of the correction rather than by the correction working.
+
+**Streaming had no masks at all.** The kernel took `contribute` and nothing else,
+so it published zero contributions and read every peer regardless -- while the
+counter, written for the masked kernels, skipped inactive ranks. The counter was
+describing a kernel that did not exist, and the path comparison above was between
+a masked pair and an unmasked third. It has the masks now, verified elementwise,
+and the table is restated.
+
+**The tail was counted out but not in.** A rank writes the scalar remainder and
+the counter said so; every active peer also reads it during the reduction, and
+its owner's copy is gathered by everyone else, and neither was counted. No figure
+recorded here changes, because the tensors in these measurements divide evenly by
+the vector width -- which is luck, not correctness.
+
+**Flat counted reads a rank does not make.** Its reads are gated by
+`needed_mask` in the kernel and were not in the counter, so the figures are right
+at the default and overstated the moment the gather skip is switched on -- that
+is, in exactly the configuration the counter would be used to judge it.
+
+**And a caveat on reading the table above.** The byte columns cover every
+collective in the request, prefill and decode alike; the millisecond column comes
+from timers that live only in the reduce-scatter kernel, which decode does not
+reach. They must not be divided into each other for a bandwidth, and "three
+quarters of the Teslas' time" is three quarters of their measured
+reduce-scatter time, not of the whole collective including the flat kernel that
+carries decode.
