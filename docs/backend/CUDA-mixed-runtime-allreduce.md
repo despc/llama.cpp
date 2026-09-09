@@ -2158,3 +2158,42 @@ So the 1215 ms stands. What would reach it is a graph where a device that owns
 nothing in a layer also has no residual edge reaching into it -- a question about
 how the model's graph is built for a split, not about the collective or about
 when work is skipped. Nothing in this document's remaining ideas gets there.
+
+### The last two items, both closing on the configuration already deployed
+
+**A two-rank path for the exchange inside a pair.** Reduce-scatter costs an extra
+barrier and saves traffic, and it saves less at two ranks than at four -- 1.5N
+against 2N for the flat kernel, where at four ranks it is 2.25N against 4N. So
+the threshold that chooses between them, tuned when every collective had four
+participants, might sit in the wrong place now. Measured at the 10 MB a prefill
+collective moves:
+
+| path | prefill |
+|---|---:|
+| **reduce-scatter, as deployed** | **629.5** |
+| streaming publication | 452.9 |
+| flat | 551.0 |
+
+It does not. Reduce-scatter wins by a wide margin at two ranks as well, and the
+chunk size changes nothing (626.4 at 16 against 629.5 at 8). Worth noting on the
+way past: the streaming kernel, which was built and tuned for four ranks, is now
+worse than the plain flat one. Nothing to change.
+
+**Which layers the Teslas take.** How many is settled -- twelve, from the earlier
+sweep. Which twelve turns out to matter, and only to generation:
+
+| the Teslas' twelve KV layers | prefill | generation |
+|---|---:|---:|
+| **the last twelve, as deployed** | 628.4 | **78.1** |
+| the first twelve | 629.6 | 70.9 |
+| every fourth one left behind | 628.4 | 71.1 |
+| the middle twelve | 628.1 | 74.3 |
+
+Prefill is flat across all four and generation spans seven tokens a second. The
+deployed choice leaves the first nineteen layers entirely on the Blackwells
+before any handoff; the others start alternating between the pairs earlier, and
+each alternation is a transition paid once per token. Prefill amortises those
+over a batch and does not notice. Nothing to change here either.
+
+So the placement search closes where it started this morning, which is the useful
+kind of negative: the configuration was not lucky.
