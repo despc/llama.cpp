@@ -2603,3 +2603,20 @@ nothing was skipped. And a mask with no bits set reads as "everybody", so markin
 only the devices that sit out left the rest unmarked and the gather still
 happening. Each was found by reading the numbers rather than by the thing
 failing.
+
+**Removed.** The execution half is out of the tree -- the run computation, the
+extra subgraph cuts, the per-node skipping and the flag manipulation at handover
+boundaries. What stays is the analysis that produced the finding
+(`GGML_META_DEPS`, the layer-boundary flag, the consumer pass), because that is
+what a future attempt would start from and what makes the negative result
+checkable. Baseline restored and verified: 630.2 tokens/s of prefill, 78.0 of
+generation, output hash unchanged, 965,345,280 elements matching the reference.
+
+**Where this leaves the direction.** Not "the mirrored work is free" -- it is not,
+and the analysis says it can be dropped safely. The obstacle is that dropping it
+requires the layer output to arrive from somewhere, the only place to put that
+arrival is a subgraph boundary, and a subgraph boundary is a collective. On this
+machine a collective costs more in launches and waiting than three gigabytes of
+avoided transfer are worth. That is the same conclusion the duplex work reached
+by a different road: this collective is bound by how often the cards have to
+agree, not by how much they send.

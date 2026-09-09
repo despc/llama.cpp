@@ -1797,15 +1797,6 @@ struct ggml_backend_meta_context {
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
     size_t                      n_reduce_steps;
-    // Per-layer participation, computed when the graph is split rather than per
-    // token.  A "run" is a maximal stretch of consecutive layers a device takes
-    // no part in; it can skip the whole stretch and be handed the last layer's
-    // output once, instead of receiving both partial products of every layer in
-    // it and rebuilding them with mirrored work.
-    std::vector<bool>              bcast_subgraph;   // per subgraph: a broadcast, not a reduction
-    std::vector<int>               bcast_publisher;  // per subgraph: which rank publishes
-    std::vector<std::vector<bool>> skip_node;        // per device, per node
-    std::vector<std::vector<bool>> want_bcast;       // per device, per subgraph
     int                         max_nnodes    = 0;
     size_t                      max_tmp_size  = 0;
     size_t                      max_subgraphs = 0;
@@ -2189,68 +2180,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 return i_delayed;
             };
 
-            // Where a device's idle run ends, so the layer output can be cut off
-            // into its own subgraph and handed over there.  A subgraph boundary
-            // is where a collective happens, so this is both the cut and the
-            // place the value is passed; a cut anywhere else would add a
-            // reduction of a mirrored value, which would multiply it.
-            std::vector<bool> run_end_cut(cgraph->n_nodes, false);
-            std::vector<std::vector<bool>> idle_layer(n_backends);
-            std::vector<int> layer_bound;
-            const bool skip_runs = ggml_env_flag_enabled("GGML_META_SKIP_RUNS");
-            if (skip_runs) {
-                for (int i = 0; i < cgraph->n_nodes; i++) {
-                    if (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_LAYER_INPUT) {
-                        layer_bound.push_back(i);
-                    }
-                }
-                for (size_t j = 0; j < n_backends; j++) {
-                    idle_layer[j].assign(layer_bound.size(), false);
-                    for (size_t r = 0; r + 1 < layer_bound.size(); r++) {
-                        bool owns = false;
-                        for (int n = layer_bound[r]; n <= layer_bound[r + 1] && !owns; n++) {
-                            ggml_tensor * nd = cgraph->nodes[n];
-                            if (!nd->buffer || !ggml_backend_buffer_is_meta(nd->buffer)) {
-                                continue;
-                            }
-                            const ggml_backend_meta_split_state ss =
-                                ggml_backend_meta_get_split_state(nd, false);
-                            if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
-                                continue;
-                            }
-                            int64_t sum = 0;
-                            for (size_t sg = 0; sg < ss.n_segments; sg++) {
-                                sum += ss.ne[sg*n_backends + j] * ss.nr[sg];
-                            }
-                            owns = sum > 0;
-                        }
-                        idle_layer[j][r] = !owns;
-                    }
-                    // a run ends at layer r when the device is idle there and
-                    // takes part in the next one -- that is where it needs the
-                    // output, and nowhere in between
-                    // Only runs long enough to be worth a handover.  Each cut is
-                    // a collective, and a collective costs a cross-card
-                    // synchronisation whatever it carries -- so a one-layer run,
-                    // where the device would trade two receives for one plus a
-                    // barrier, is not worth cutting for.  GGML_META_SKIP_RUNS=n
-                    // sets the shortest run that is.
-                    const char * minv = getenv("GGML_META_SKIP_RUNS");
-                    const size_t min_run = std::max(1, minv ? atoi(minv) : 1);
-                    for (size_t r = 0; r + 1 < layer_bound.size(); r++) {
-                        if (!idle_layer[j][r] || (r + 2 < layer_bound.size() && idle_layer[j][r + 1])) {
-                            continue;
-                        }
-                        size_t len = 1;
-                        while (r >= len && idle_layer[j][r - len]) { ++len; }
-                        if (len >= min_run) {
-                            run_end_cut[layer_bound[r + 1]] = true;
-                        }
-                    }
-                }
-            }
-
-            std::vector<int> bcast_cut_of_subgraph;
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
@@ -2261,8 +2190,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes ||
-                    split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || run_end_cut[i];
+                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -2290,77 +2218,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
                 }
-                if (skip_runs) {
-                    bcast_cut_of_subgraph.push_back(run_end_cut[i] &&
-                        split_state.axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL ? i : -1);
-                }
                 n_subgraphs++;
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
-            const size_t n_subgraphs_final = n_subgraphs;
-            // Turn the run analysis into what the compute loop needs: which nodes a
-            // device sits out, which subgraph boundaries hand over a layer output
-            // instead of reducing a partial one, and who publishes there.
-            backend_ctx->bcast_subgraph.assign(n_subgraphs_final, false);
-            backend_ctx->bcast_publisher.assign(n_subgraphs_final, -1);
-            backend_ctx->skip_node.assign(n_backends, {});
-            backend_ctx->want_bcast.assign(n_backends, {});
-            if (skip_runs) {
-                std::map<int, size_t> subgraph_of_cut;
-                for (size_t k = 0; k < bcast_cut_of_subgraph.size() && k < n_subgraphs_final; k++) {
-                    if (bcast_cut_of_subgraph[k] >= 0) {
-                        subgraph_of_cut[bcast_cut_of_subgraph[k]] = k;
-                    }
-                }
-                for (size_t j = 0; j < n_backends; j++) {
-                    backend_ctx->skip_node[j].assign(cgraph->n_nodes, false);
-                    backend_ctx->want_bcast[j].assign(n_subgraphs_final, false);
-                    for (size_t r0 = 0; r0 + 1 < layer_bound.size(); ) {
-                        if (!idle_layer[j][r0]) { ++r0; continue; }
-                        size_t r1 = r0;
-                        while (r1 + 2 < layer_bound.size() && idle_layer[j][r1 + 1]) { ++r1; }
-                        // (lo, hi]: the node at lo is this run's input, which is
-                        // the previous layer's output -- a layer this device may
-                        // have computed itself.  Skipping it drops work it owns.
-                        const int lo = layer_bound[r0], hi = layer_bound[r1 + 1];
-                        auto it = subgraph_of_cut.find(hi);
-                        // and skipped only if there is a handover to end it.  A
-                        // run without one leaves the device with no output and no
-                        // way to get it, which is a wrong answer rather than a
-                        // slow one -- as the first version of the minimum-length
-                        // rule demonstrated.
-                        if (it != subgraph_of_cut.end()) {
-                            for (int n = lo + 1; n <= hi; n++) {
-                                backend_ctx->skip_node[j][n] = true;
-                            }
-                            backend_ctx->want_bcast[j][it->second] = true;
-                        }
-                        r0 = r1 + 1;
-                    }
-                }
-                for (const auto & kv : subgraph_of_cut) {
-                    backend_ctx->bcast_subgraph[kv.second] = true;
-                    // whoever took part in the layer that just ended can publish it;
-                    // the first such device is as good as any
-                    for (size_t j = 0; j < n_backends; j++) {
-                        if (!backend_ctx->skip_node[j][kv.first]) {
-                            backend_ctx->bcast_publisher[kv.second] = (int) j;
-                            break;
-                        }
-                    }
-                }
-                size_t n_cuts = subgraph_of_cut.size(), n_skipped = 0;
-                for (size_t j = 0; j < n_backends; j++) {
-                    for (int n = 0; n < cgraph->n_nodes; n++) {
-                        n_skipped += backend_ctx->skip_node[j][n];
-                    }
-                }
-                GGML_LOG_WARN("meta_skip_runs: %zu handover boundaries, %zu node-skips across %zu devices\n",
-                              n_cuts, n_skipped, n_backends);
-            }
-
-
         }
 
         backend_ctx->uid         = cgraph->uid;
@@ -2833,46 +2694,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    // Apply the run analysis to this evaluation's flags.  A device sits out the
-    // nodes of its runs; at a handover boundary exactly one device keeps the
-    // compute flag, which makes the collective there a broadcast of its value
-    // rather than a sum of four, and everyone else asks for the result.
-    if (!backend_ctx->skip_node.empty() && !backend_ctx->skip_node[0].empty()) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            for (int n = 0; n < cgraph->n_nodes; n++) {
-                if (backend_ctx->skip_node[j][n]) {
-                    bcj.nodes[n]->flags &= ~(GGML_TENSOR_FLAG_COMPUTE | GGML_TENSOR_FLAG_NEEDED);
-                } else {
-                    // said for everyone, not only for the ones sitting out: a
-                    // mask with no bits set reads as "everybody", so leaving the
-                    // active devices unmarked undoes the whole thing
-                    bcj.nodes[n]->flags |= GGML_TENSOR_FLAG_NEEDED;
-                }
-            }
-        }
-        for (size_t k = 0; k + 1 < backend_ctx->n_subgraphs; k++) {
-            if (!backend_ctx->bcast_subgraph[k]) {
-                continue;
-            }
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                ggml_cgraph * cg = bcj.cgraphs[k].cgraph_main;
-                if (cg->n_nodes == 0) {
-                    continue;
-                }
-                ggml_tensor * last = cg->nodes[cg->n_nodes - 1];
-                if ((int) j == backend_ctx->bcast_publisher[k]) {
-                    last->flags |=  GGML_TENSOR_FLAG_COMPUTE;
-                    last->flags &= ~GGML_TENSOR_FLAG_NEEDED;
-                } else {
-                    last->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
-                    last->flags |=  GGML_TENSOR_FLAG_NEEDED;
-                }
-            }
-        }
-    }
-
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2901,13 +2722,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // run out, and this would overwrite that at the very point it
                     // matters.  Which it did, silently, and the prototype's first
                     // measurement was of a version where nothing was skipped.
-                    if (backend_ctx->skip_node.empty() || backend_ctx->skip_node[j].empty()) {
-                        const bool needed = result_is_read[j].empty() || result_is_read[j][i];
-                        if (needed) {
-                            nodes.back()->flags |= GGML_TENSOR_FLAG_NEEDED;
-                        } else {
-                            nodes.back()->flags &= ~GGML_TENSOR_FLAG_NEEDED;
-                        }
+                    const bool needed = result_is_read[j].empty() || result_is_read[j][i];
+                    if (needed) {
+                        nodes.back()->flags |= GGML_TENSOR_FLAG_NEEDED;
+                    } else {
+                        nodes.back()->flags &= ~GGML_TENSOR_FLAG_NEEDED;
                     }
                 }
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
