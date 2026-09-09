@@ -1,3 +1,4 @@
+#include <array>
 #include "allreduce.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -1666,6 +1667,42 @@ static __global__ void ggml_cuda_mixed_ar_cmp_kernel(
     }
 }
 
+// A collective is one of a few shapes, and a single per-rank percentage cannot
+// tell them apart.  With the Blackwell pair sharing most layers and the Tesla
+// pair owning the rest, the traffic on a card is three different things: what it
+// exchanges inside its own pair, what it fetches from the other pair, and what
+// it publishes for the other pair to fetch.  These buckets separate the phase
+// timings by the shape of the collective; the byte counts beside them are exact
+// and computed on the host, so time and volume can be divided the same way.
+enum ggml_cuda_ar_bucket {
+    GGML_CUDA_AR_BUCKET_ALL   = 0,   // every rank takes part
+    GGML_CUDA_AR_BUCKET_LOCAL = 1,   // only this runtime's own pair
+    GGML_CUDA_AR_BUCKET_OTHER = 2,   // only the other pair
+    GGML_CUDA_AR_BUCKET_MIXED = 3,   // anything else
+    GGML_CUDA_AR_BUCKET_COUNT = 4,
+};
+
+static const char * ggml_cuda_ar_bucket_name(int b) {
+    switch (b) {
+        case GGML_CUDA_AR_BUCKET_ALL:   return "all four";
+        case GGML_CUDA_AR_BUCKET_LOCAL: return "own pair";
+        case GGML_CUDA_AR_BUCKET_OTHER: return "other pair";
+        default:                        return "mixed";
+    }
+}
+
+// Bytes this rank moves in one collective, by direction and by whether the peer
+// is in the same pair.  Derived from the shard boundaries the kernel uses, so it
+// is what crosses the link rather than an estimate of it.
+struct ggml_cuda_ar_traffic {
+    unsigned long long calls;
+    unsigned long long publish;        // out, read by whoever needs the shard
+    unsigned long long reduce_same;    // in, peers' contributions to this shard
+    unsigned long long reduce_cross;
+    unsigned long long gather_same;    // in, peers' finished shards
+    unsigned long long gather_cross;
+};
+
 struct ggml_cuda_mixed_ar_group {
     size_t n_ranks = 0;
     uint64_t stream_min_bytes = 0;
@@ -1679,7 +1716,8 @@ struct ggml_cuda_mixed_ar_group {
     std::vector<void *> verify_out;
     std::vector<unsigned long long *> verify_counters; // {mismatches, elements}
     uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS] = {};
-    std::vector<ggml_cuda_ar_phase_acc *> phase_acc;   // per backend, device memory
+    std::vector<ggml_cuda_ar_phase_acc *> phase_acc;   // per backend, per bucket, device memory
+    std::vector<std::array<ggml_cuda_ar_traffic, GGML_CUDA_AR_BUCKET_COUNT>> traffic;
     size_t data_bytes = 0;
     void * shared_host = nullptr;
     bool host_registered = false;
@@ -1721,23 +1759,42 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
         }
         ggml_cuda_set_device(group->devices[i]);
         CUDA_CHECK(cudaDeviceSynchronize());
-        ggml_cuda_ar_phase_acc host[GGML_CUDA_MIXED_AR_BLOCKS] = {};
+        ggml_cuda_ar_phase_acc host[GGML_CUDA_AR_BUCKET_COUNT * GGML_CUDA_MIXED_AR_BLOCKS] = {};
         CUDA_CHECK(cudaMemcpy(host, group->phase_acc[i], sizeof(host), cudaMemcpyDeviceToHost));
-        // Blocks run concurrently, so the per-block sums are averaged rather than
-        // added: the collective's cost is what one block spends, not all of them.
-        double p = 0, wp = 0, r = 0, wr = 0, g = 0; unsigned long long calls = 0;
-        for (size_t b = 0; b < group->blocks; ++b) {
-            p += host[b].publish; wp += host[b].wait_pub; r += host[b].reduce;
-            wr += host[b].wait_red; g += host[b].gather; calls += host[b].calls;
-        }
-        const double nb = (double) group->blocks;
-        const double tot = (p + wp + r + wr + g) / nb / 1e6;
-        if (tot > 0.0) {
-            GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d calls=%llu total=%8.1f ms | "
+        for (int bk = 0; bk < GGML_CUDA_AR_BUCKET_COUNT; ++bk) {
+            const ggml_cuda_ar_phase_acc * blk = host + (size_t) bk * GGML_CUDA_MIXED_AR_BLOCKS;
+            // Blocks run concurrently, so the per-block sums are averaged rather
+            // than added: the collective's cost is what one block spends, not all
+            // of them.
+            double p = 0, wp = 0, r = 0, wr = 0, g = 0; unsigned long long calls = 0;
+            for (size_t b2 = 0; b2 < group->blocks; ++b2) {
+                p += blk[b2].publish; wp += blk[b2].wait_pub; r += blk[b2].reduce;
+                wr += blk[b2].wait_red; g += blk[b2].gather; calls += blk[b2].calls;
+            }
+            const double nb  = (double) group->blocks;
+            const double sum = p + wp + r + wr + g;
+            const double tot = sum / nb / 1e6;
+            if (tot <= 0.0) {
+                continue;
+            }
+            const auto & t = i < group->traffic.size() ? group->traffic[i][bk] : ggml_cuda_ar_traffic{};
+            GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d %-10s calls=%llu total=%8.1f ms | "
                           "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
-                          ggml_backend_name(group->backends[i]), group->ranks[i], (unsigned long long) (calls / group->blocks),
-                          tot, 100*p/(p+wp+r+wr+g), 100*wp/(p+wp+r+wr+g), 100*r/(p+wp+r+wr+g),
-                          100*wr/(p+wp+r+wr+g), 100*g/(p+wp+r+wr+g));
+                          ggml_backend_name(group->backends[i]), group->ranks[i],
+                          ggml_cuda_ar_bucket_name(bk),
+                          (unsigned long long) (calls / group->blocks), tot,
+                          100*p/sum, 100*wp/sum, 100*r/sum, 100*wr/sum, 100*g/sum);
+            // "collectives" counts every call in this bucket; the phase line's
+            // "calls" counts only those that ran the reduce-scatter kernel, since
+            // that is where the timers live.  Decode is below its threshold.
+            GGML_LOG_WARN("mixed_ar_bytes backend=%s rank=%d %-10s collectives=%llu | "
+                          "out %7.2f GiB | reduce in: same-pair %6.2f  cross %6.2f | "
+                          "gather in: same-pair %6.2f  cross %6.2f GiB\n",
+                          ggml_backend_name(group->backends[i]), group->ranks[i],
+                          ggml_cuda_ar_bucket_name(bk), t.calls,
+                          t.publish/1073741824.0,
+                          t.reduce_same/1073741824.0, t.reduce_cross/1073741824.0,
+                          t.gather_same/1073741824.0, t.gather_cross/1073741824.0);
         }
         CUDA_CHECK(cudaFree(group->phase_acc[i]));
     }
@@ -1834,10 +1891,12 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->done.resize(config->n_backends * GGML_CUDA_MIXED_AR_SLOTS, nullptr);
     if (ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_PROFILE")) {
         group->phase_acc.assign(config->n_backends, nullptr);
+        group->traffic.assign(config->n_backends, {});
         for (size_t i = 0; i < config->n_backends; ++i) {
             auto * ctx = static_cast<ggml_backend_cuda_context *>(config->backends[i]->context);
             ggml_cuda_set_device(ctx->device);
-            const size_t bytes = GGML_CUDA_MIXED_AR_BLOCKS * sizeof(ggml_cuda_ar_phase_acc);
+            const size_t bytes = GGML_CUDA_AR_BUCKET_COUNT * GGML_CUDA_MIXED_AR_BLOCKS *
+                sizeof(ggml_cuda_ar_phase_acc);
             if (cudaMalloc(&group->phase_acc[i], bytes) != cudaSuccess) {
                 group->phase_acc.clear();
                 break;
@@ -2133,7 +2192,58 @@ bool ggml_cuda_mixed_ar_group_enqueue(
             }
             shards.cum[group->n_ranks] = cum;
         }
-        ggml_cuda_ar_phase_acc * acc = i < group->phase_acc.size() ? group->phase_acc[i] : nullptr;
+        // Which shape this collective has, from this runtime's point of view, and
+        // what it actually moves.  "Own pair" means the active ranks are exactly
+        // the ones this library drives; the two libraries therefore label the
+        // same collective differently, which is the point -- each is reporting
+        // its own link.
+        uint32_t local_mask = 0;
+        for (int r : group->ranks) {
+            local_mask |= 1u << r;
+        }
+        int bucket = GGML_CUDA_AR_BUCKET_MIXED;
+        if (active_mask == all_ranks)          { bucket = GGML_CUDA_AR_BUCKET_ALL;   }
+        else if (active_mask == local_mask)    { bucket = GGML_CUDA_AR_BUCKET_LOCAL; }
+        else if ((active_mask & local_mask) == 0) { bucket = GGML_CUDA_AR_BUCKET_OTHER; }
+
+        if (i < group->traffic.size()) {
+            const size_t   tsz   = ggml_type_size(tensor->type);
+            const uint32_t total = shards.cum[group->n_ranks];
+            auto shard_lo = [&](size_t r) -> int64_t {
+                return total ? (int64_t) shards.cum[r] * ne / (int64_t) total : 0;
+            };
+            const int64_t mine = shard_lo(rank + 1) - shard_lo(rank);
+            int n_active = 0;
+            for (size_t r = 0; r < group->n_ranks; ++r) {
+                n_active += (active_mask >> r) & 1u;
+            }
+            auto & t = group->traffic[i][bucket];
+            t.calls++;
+            if (contribute) {
+                t.publish += (unsigned long long) (ne - mine) * tsz;   // own shard has no reader
+            }
+            for (size_t p = 0; p < group->n_ranks; ++p) {
+                if (p == (size_t) rank || !((active_mask >> p) & 1u)) {
+                    continue;
+                }
+                const bool same = (local_mask >> p) & 1u;
+                (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) mine * tsz;
+            }
+            if ((needed_mask >> rank) & 1u) {
+                for (size_t p = 0; p < group->n_ranks; ++p) {
+                    if (p == (size_t) rank) {
+                        continue;
+                    }
+                    const int64_t sz = shard_lo(p + 1) - shard_lo(p);
+                    const bool same = (local_mask >> p) & 1u;
+                    (same ? t.gather_same : t.gather_cross) += (unsigned long long) sz * tsz;
+                }
+            }
+            GGML_UNUSED(n_active);
+        }
+
+        ggml_cuda_ar_phase_acc * acc = i < group->phase_acc.size()
+            ? group->phase_acc[i] + (size_t) bucket * GGML_CUDA_MIXED_AR_BLOCKS : nullptr;
         switch (tensor->type) {
             case GGML_TYPE_F32:
                 ggml_cuda_mixed_ar_launch<float>(group, i, rank, tensor, slot_data,

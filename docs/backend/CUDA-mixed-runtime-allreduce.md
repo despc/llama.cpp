@@ -2036,3 +2036,39 @@ quality. Splitting a matrix two ways instead of four changes which partial sums
 exist and how each rounds, and fewer participants is not by itself more accurate.
 Nothing here measures output quality, and the deployed split changes the model's
 text -- an argument for measuring it, not for assuming either direction.
+
+### What the Teslas are actually doing, 2026-09-09
+
+A single "gather is 65-74% of the collective" does not say which gather. The
+phase timers are bucketed by the shape of the collective now -- every rank active,
+this runtime's own pair only, the other pair only -- and the bytes beside them are
+computed on the host from the shard boundaries, so time and volume divide the
+same way. Prefill of 1430 tokens plus 200 generated:
+
+| rank | shape | collectives | time | gather share | bytes in from the other pair |
+|---|---|---:|---:|---:|---:|
+| V100 SXM2 | own pair | 72 | 390 ms | 27% | -- |
+| V100 SXM2 | **other pair** | **312** | **1215 ms** | **88.8%** | **3.32 GiB** |
+| V100 PCIe | own pair | 72 | 428 ms | 28% | -- |
+| V100 PCIe | other pair | 312 | 1168 ms | 78.9% | 3.32 GiB |
+| 5080 | own pair | 312 | 813 ms | 29% | -- |
+| 5080 | other pair | 72 | 643 ms | 17.5% | 0.77 GiB |
+
+The Teslas move 3.32 GiB in from the Blackwell pair against 0.33 GiB of traffic
+inside their own, ten to one, and three quarters of their collective time goes to
+the 312 collectives they take no part in at all -- no publication, no reduction,
+only fetching a result for a layer that is not theirs.
+
+That is what `GGML_TENSOR_FLAG_NEEDED` was supposed to remove, and it explains
+why the flag measured at nothing. Its test is "does this device compute anything
+in the next subgraph", and mirrored operations -- norms and the like -- are
+computed everywhere, so the answer is almost always yes. The question it needs to
+ask is whether anything on this device reads *this tensor*, following the
+consumers of the result and its aliases, which is what the review asked for and
+what the coarse test stands in for.
+
+The Blackwells show the other side of the same thing: 0.77 GiB in from the Tesla
+pair over 72 collectives, and 57.9% of that time waiting for the Teslas to
+publish rather than transferring. Their own pair's exchange is 1.66 GiB out and
+1.66 GiB back in over 312 collectives, evenly split between publishing, reducing
+and gathering -- that one looks balanced and is not where the next gain is.
