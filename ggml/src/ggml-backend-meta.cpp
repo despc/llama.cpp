@@ -1796,6 +1796,7 @@ struct ggml_backend_meta_context {
     ggml_context_ptr            ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
+    std::set<int64_t>           deps_seen;   // graphs the dependency probe has reported on
     size_t                      n_reduce_steps;
     int                         max_nnodes    = 0;
     size_t                      max_tmp_size  = 0;
@@ -2227,9 +2228,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
 
-        backend_ctx->uid         = cgraph->uid;
-        backend_ctx->n_subgraphs = n_subgraphs;
-
         if (max_tmp_size > backend_ctx->max_tmp_size) {
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
@@ -2501,8 +2499,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // the region, a value the graph declares an output, and a write into a tensor
     // the region did not produce, which is how saved state leaves.
     if (getenv("GGML_META_DEPS")) {
-        static std::set<int> shapes_seen;
-        if (n_backends > 1 && shapes_seen.insert(cgraph->n_nodes).second) {
+        // Keyed on the graph's own identity and held per context.  A node count
+        // is not an identity: two graphs of the same size can differ in every
+        // edge, and a static set shared by every backend instance would have
+        // silently skipped the second of them -- so "prefill, decode and MTP were
+        // all looked at" was not something the probe could support.
+        if (n_backends > 1 && backend_ctx->deps_seen.insert(cgraph->uid).second) {
             auto base_of = [](ggml_tensor * t) {
                 while (t && t->view_src) { t = t->view_src; }
                 return t;
@@ -2515,6 +2517,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             GGML_LOG_WARN("meta_deps graph of %d nodes, %zu layer boundaries\n",
                           cgraph->n_nodes, bounds.size());
+            // Does this device actually write anything through this node, or
+            // is its slice of the destination empty?  A node writing into storage
+            // the region did not produce matters only if the write is not zero
+            // bytes wide on this device.
+            auto writes_anything = [&](int n, size_t dev) {
+                ggml_tensor * meta_node = cgraph->nodes[n];
+                if (!meta_node->buffer || !ggml_backend_buffer_is_meta(meta_node->buffer)) {
+                    return true;   // cannot tell; assume it does
+                }
+                const ggml_backend_meta_split_state ss =
+                    ggml_backend_meta_get_split_state(meta_node, false);
+                if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+                    return true;   // mirrored: every device writes it
+                }
+                int64_t sum = 0;
+                for (size_t sg = 0; sg < ss.n_segments; sg++) {
+                    sum += ss.ne[sg*n_backends + dev] * ss.nr[sg];
+                }
+                return sum > 0;
+            };
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 size_t idle = 0, clean = 0;
@@ -2549,17 +2571,34 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (!idle_layer[r0]) { ++r0; continue; }
                     size_t r1 = r0;
                     while (r1 + 2 < bounds.size() && idle_layer[r1 + 1]) { ++r1; }
+                    // (lo, hi]: the node at lo is the run's input, which is the
+                    // previous layer's output and may be work this device owns.
+                    // The per-layer pass had the same off-by-one and the
+                    // prototype found it the hard way.
                     const int lo = bounds[r0], hi = bounds[r1 + 1];
                     runs++;
                     layers_in_runs += r1 - r0 + 1;
-                    std::unordered_set<const ggml_tensor *> inside;
-                    for (int n = lo; n <= hi; n++) {
+                    std::unordered_set<const ggml_tensor *> inside, produced;
+                    for (int n = lo + 1; n <= hi; n++) {
                         inside.insert(base_of(bcj.nodes[n]));
+                        produced.insert(bcj.nodes[n]);
                     }
                     const ggml_tensor * run_out = base_of(bcj.nodes[hi]);
                     bool ok = true;
+                    // the same three questions the per-layer pass asks, not just
+                    // the first: a reader outside, a declared output, a write into
+                    // storage the run did not produce
+                    for (int n = lo + 1; n <= hi && ok; n++) {
+                        if (cgraph->nodes[n]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                            ok = false;
+                        }
+                        ggml_tensor * dst = base_of(bcj.nodes[n]);
+                        if (dst != bcj.nodes[n] && !produced.count(dst) && writes_anything(n, j)) {
+                            ok = false;
+                        }
+                    }
                     for (int n = 0; n < cgraph->n_nodes && ok; n++) {
-                        if ((n >= lo && n <= hi) ||
+                        if ((n > lo && n <= hi) ||
                                 (bcj.nodes[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                             continue;
                         }
@@ -2581,11 +2620,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (size_t r = 0; r + 1 < bounds.size(); r++) {
                     // [lo, hi] inclusive: the node at the next boundary is this
                     // layer's own output, produced by it, not a reader of it
+                    // (lo, hi] for the same reason as the runs below
                     const int lo = bounds[r], hi = bounds[r + 1];
                     bool owns = false;
                     std::unordered_set<const ggml_tensor *> inside;
-                    for (int n = lo; n <= hi; n++) {
+                    // What the region *produces*, kept apart from what it merely
+                    // holds a view of.  The write test below asked whether a
+                    // written base was in `inside`, and every base had been put
+                    // there by this loop -- so it could never fire, and "no
+                    // external writes" meant nothing.  A view onto a cache does
+                    // not make the cache the region's.
+                    std::unordered_set<const ggml_tensor *> produced;
+                    for (int n = lo + 1; n <= hi; n++) {
                         inside.insert(base_of(bcj.nodes[n]));
+                        produced.insert(bcj.nodes[n]);
                         if (!owns && cgraph->nodes[n]->buffer &&
                                 ggml_backend_buffer_is_meta(cgraph->nodes[n]->buffer)) {
                             const ggml_backend_meta_split_state ss =
@@ -2607,20 +2655,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // the layer's own output is the next boundary, which is what a
                     // skip would have to be handed; everything else must stay in
                     const ggml_tensor * region_out = base_of(bcj.nodes[hi]);
-                    for (int n = lo; n <= hi; n++) {
+                    for (int n = lo + 1; n <= hi; n++) {
                         if (cgraph->nodes[n]->flags & GGML_TENSOR_FLAG_OUTPUT) {
                             outputs[cgraph->nodes[n]->name]++;
                             ok = false;
                         }
                         // a write into something the region did not produce
                         ggml_tensor * dst = base_of(bcj.nodes[n]);
-                        if (dst != bcj.nodes[n] && !inside.count(dst)) {
+                        if (dst != bcj.nodes[n] && !produced.count(dst) && writes_anything(n, j)) {
                             writes[cgraph->nodes[n]->name]++;
                             ok = false;
                         }
                     }
                     for (int n = 0; n < cgraph->n_nodes; n++) {
-                        if (n >= lo && n <= hi) {
+                        if (n > lo && n <= hi) {
                             continue;
                         }
                         if ((bcj.nodes[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {

@@ -2395,8 +2395,33 @@ tensor the region did not produce -- which is how saved state would leave.
 | 4038 nodes | Blackwells | 11 | **11** | 0 | 0 | 0 |
 | 49 nodes | all | 0 | -- | -- | -- | -- |
 
-Every idle layer is self-contained. The only value leaving is the layer's own
-output, which is the next layer's input.
+**This table is wrong and is kept only because later entries argue with it.** The
+write column came from a test that could not fail: it asked whether the base of a
+written tensor was in the set of things the region touched, and that set had been
+built by inserting exactly those bases. Every write looked internal. Corrected --
+the region's *products* kept apart from what it merely holds a view of, and the
+write counted only where this device's slice of the destination is not empty --
+the same graph gives:
+
+| device | idle layers | self-contained | readers | outputs | non-empty external writes |
+|---|---:|---:|---:|---:|---:|
+| Teslas | 51 | **4** | 0 | 0 | 188 |
+| Blackwells | 11 | 0 | 0 | 0 | 44 |
+
+Four of fifty-one, not fifty-one. And the blockers are named: `cache_r_lN (view)`
+and the copies into them -- the recurrent state. This document dismissed that
+hazard early, on the grounds that `qwen35` splits `cache_r` along axis 0 rather
+than mirroring it. That was the wrong reading: the cache is split, but some of
+the views and copies into it classify as mirrored, and a mirrored write is one
+every device makes.
+
+**And an open contradiction, left open.** The prototype built on the wrong table
+produced output bit-identical to the baseline, over the same request, at every
+setting. If it were skipping recurrent-state updates that mattered, that should
+not have happened. Either those particular writes do not carry state that
+survives the layer, or 702 characters of greedy decoding did not reach a
+divergence. This repository does not know which, and the earlier reading that the
+layers are safe to skip is withdrawn until it does.
 
 **And a gap, named rather than glossed.** The 49-node graph is the MTP draft
 head, and it has no layer boundaries at all -- its builder does not record
@@ -2586,6 +2611,14 @@ subgraph boundary is a collective -- 23 of them, four devices, per evaluation.
 The traffic they remove is bandwidth; what they add is a launch and a wait per
 device per handover, and this collective has been latency-bound rather than
 bandwidth-bound in every measurement in this document.
+
+**What the measurement does and does not separate.** It rejects this prototype.
+It does not price the extra collective on its own: the same build also walked
+every node of every device to set two flags before each evaluation, and cut the
+graph into 23 more subgraphs, and both of those cost something on every token.
+Unchanged CUDA graph reuse rules out capture being broken; it does not
+disentangle the three. So "a handover costs more than the traffic it saves" is
+the shape of the result, and the per-part costs are not measured.
 
 **One avenue remains and it is not enough.** Using AllReduce as a broadcast
 forces the *other* active device to receive the value it could have computed:

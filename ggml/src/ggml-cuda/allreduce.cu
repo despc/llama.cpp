@@ -1800,30 +1800,35 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
             const double nb  = (double) group->rs_blocks;
             const double sum = p + wp + r + wr + g;
             const double tot = sum / nb / 1e6;
-            if (tot <= 0.0) {
-                continue;
+            // Once per bucket.  The timers belong to the reduce-scatter kernel
+            // and to the bucket, not to a path, so printing them inside the loop
+            // over paths repeated the same milliseconds for every path present --
+            // which anything adding these up would have counted twice.
+            if (tot > 0.0) {
+                GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d %-10s calls=%llu total=%8.1f ms | "
+                              "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
+                              ggml_backend_name(group->backends[i]), group->ranks[i],
+                              ggml_cuda_ar_bucket_name(bk),
+                              (unsigned long long) (calls / group->rs_blocks), tot,
+                              100*p/sum, 100*wp/sum, 100*r/sum, 100*wr/sum, 100*g/sum);
             }
+            // And the bytes regardless: a bucket that ran only the flat kernel
+            // has no phase timers at all, and hiding its traffic behind them lost
+            // the whole of decode from the report.
             for (int path = 0; path < 2; ++path) {
-            const auto & t = i < group->traffic.size()
-                ? group->traffic[i][bk][path] : ggml_cuda_ar_traffic{};
-            if (t.calls == 0) { continue; }
-            GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d %-10s calls=%llu total=%8.1f ms | "
-                          "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
-                          ggml_backend_name(group->backends[i]), group->ranks[i],
-                          ggml_cuda_ar_bucket_name(bk),
-                          (unsigned long long) (calls / group->rs_blocks), tot,
-                          100*p/sum, 100*wp/sum, 100*r/sum, 100*wr/sum, 100*g/sum);
-            // "collectives" counts every call in this bucket; the phase line's
-            // "calls" counts only those that ran the reduce-scatter kernel, since
-            // that is where the timers live.  Decode is below its threshold.
-            GGML_LOG_WARN("mixed_ar_bytes backend=%s rank=%d %-10s %-3s collectives=%llu | "
-                          "out %7.2f GiB | reduce in: same-pair %6.2f  cross %6.2f | "
-                          "gather in: same-pair %6.2f  cross %6.2f GiB\n",
-                          ggml_backend_name(group->backends[i]), group->ranks[i],
-                          ggml_cuda_ar_bucket_name(bk), path ? "rs" : "flat", t.calls,
-                          t.publish/1073741824.0,
-                          t.reduce_same/1073741824.0, t.reduce_cross/1073741824.0,
-                          t.gather_same/1073741824.0, t.gather_cross/1073741824.0);
+                const auto & t = i < group->traffic.size()
+                    ? group->traffic[i][bk][path] : ggml_cuda_ar_traffic{};
+                if (t.calls == 0) {
+                    continue;
+                }
+                GGML_LOG_WARN("mixed_ar_bytes backend=%s rank=%d %-10s %-4s collectives=%llu | "
+                              "out %7.2f GiB | reduce in: same-pair %6.2f  cross %6.2f | "
+                              "gather in: same-pair %6.2f  cross %6.2f GiB\n",
+                              ggml_backend_name(group->backends[i]), group->ranks[i],
+                              ggml_cuda_ar_bucket_name(bk), path ? "rs" : "flat", t.calls,
+                              t.publish/1073741824.0,
+                              t.reduce_same/1073741824.0, t.reduce_cross/1073741824.0,
+                              t.gather_same/1073741824.0, t.gather_cross/1073741824.0);
             }
         }
         CUDA_CHECK(cudaFree(group->phase_acc[i]));
