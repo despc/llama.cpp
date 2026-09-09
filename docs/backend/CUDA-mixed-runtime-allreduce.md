@@ -2105,3 +2105,23 @@ The consumer analysis is kept even though it changes no number here. It answers
 the question the flag is supposed to answer, where the old test answered a
 different one that happened to agree; on a placement where a device really does
 stop reading, the two would part company.
+
+### The shares, re-measured under the new placement
+
+They were tuned when all four cards took a slice of every tensor, and 17/13
+between the Teslas was worth +0.6% then. Under per-layer participation the four
+numbers mean something else: 35:35 between the Blackwells on the layers they
+share, and the last two between the Teslas on theirs. Interleaved, twice each:
+
+| shares | prefill | generation |
+|---|---|---|
+| 35,35,17,13 | 624.1 / 624.7 | 76.6 / 75.6 |
+| **35,35,15,15** | **628.2 / 629.6** | 76.3 / 76.2 |
+| 35,35,20,10 | 610.1 | 76.7 |
+| 30,40,15,15 | 605.0 | 76.1 |
+
+The asymmetry has stopped paying and the even split is worth about +0.8% of
+prefill, reproducibly. That follows from what changed: the Teslas now share whole
+layers between themselves rather than taking a slice of everything, so an uneven
+reduction share between two cards doing equal work only unbalances it. Deployed
+at 35,35,15,15.
