@@ -1311,12 +1311,16 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
     }
 
     // the tail is smaller than one vector; block 0 takes it once every peer has
-    // finished its whole stripe
+    // finished its whole stripe.  The masks reach here too: the main loop learned
+    // them and this did not, so a rank that no longer publishes its tail was
+    // still having its stale slot read by everyone else -- wrong arithmetic on any
+    // size that is not a multiple of the vector width, which is why no
+    // measurement here caught it.
     if (bid == 0 && count > tail) {
         if (tid == 0) {
             for (int peer = 0; peer < n_ranks; ++peer) {
-                if (peer == rank) {
-                    continue;
+                if (peer == rank || !((active_mask >> peer) & 1u)) {
+                    continue;   // publishes no tail: nothing to await
                 }
                 const uint32_t * ps = arrival_slot +
                     ((size_t) peer * GGML_CUDA_MIXED_AR_BLOCKS + bid) * SIGNAL_INTS;
@@ -1332,11 +1336,13 @@ static __global__ void ggml_cuda_mixed_ar_stream_kernel(
         }
         __syncthreads();
         __threadfence_system();
-        if (tid < count - tail) {
+        if (i_need_it && tid < count - tail) {
             T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
+            // positions and tree preserved, zeros substituted for the ranks that
+            // published nothing -- as everywhere else
             for (int peer = 0; peer < n_ranks; ++peer) {
-                v[peer] = peer == rank
-                    ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
+                v[peer] = (peer == rank || !((active_mask >> peer) & 1u))
+                    ? ((peer == rank && contribute) ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
                     : (slot_data + (size_t) peer * rank_stride)[tail + tid];
             }
             recvbuf[tail + tid] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);

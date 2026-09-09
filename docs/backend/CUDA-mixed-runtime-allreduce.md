@@ -2292,3 +2292,24 @@ reach. They must not be divided into each other for a bandwidth, and "three
 quarters of the Teslas' time" is three quarters of their measured
 reduce-scatter time, not of the whole collective including the flat kernel that
 carries decode.
+
+### The tail, which nothing here exercises
+
+Masking the streaming kernel reached its main loop and its publication of the
+scalar tail, and not its consumption of one. Three rules were missing there: it
+waited on ranks that publish no tail, read their stale slots instead of
+substituting zeros, and wrote the result for ranks whose gather is switched off.
+With an inactive participant and a size that is not a multiple of the vector
+width that is a wrong answer, not a mis-count.
+
+No measurement in this document could have found it, and none did. The tensors
+this model reduces are `n_embd` by token count, `n_embd` is 2560, and four
+elements fit a vector at F32 -- so `ne` is always a multiple of the vector width
+and the tail path never runs. The same holds for every figure recorded here: the
+tail branches of all four kernels are unexercised code in this deployment. They
+were audited by reading rather than by measuring, and the other three already
+carried the rules (publication gated by activity, the result written only where
+it is needed, zeros substituted in place, and only publishing ranks awaited).
+
+Worth keeping in view when this collective meets a model with an odd hidden size,
+or a wire type where the vector holds eight.
