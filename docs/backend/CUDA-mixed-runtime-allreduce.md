@@ -2475,12 +2475,26 @@ of eight and a half, not the factor of two a per-layer transfer would give. For
 the Blackwells, whose idle layers are isolated, a run is one layer and the factor
 is two.
 
-**Both directions, since one of them is new traffic.** Per token a Tesla would
-take 12N in place of 102N, and the sender -- one card of the active pair -- would
-publish 12N it does not publish today, with a readiness signal each. Against the
-measured cross-pair figures, the Teslas' 3.81 GiB inbound would become roughly
-0.45 GiB, and about 0.45 GiB of outbound would appear on a Blackwell that does
-not carry it now.
+**Both directions, since one of them is new traffic** -- and separately by path,
+because 102 into 12 is a count of transfers and not a factor on bytes. The two
+paths carry different volumes per collective, so the counters are split by
+algorithm:
+
+| path | collectives | cross-pair in | per collective | after | factor |
+|---|---:|---:|---:|---:|---:|
+| reduce-scatter, prefill | 312 | 2.83 GiB | 9.3 MB | ~0.33 GiB | 8.5x |
+| flat, decode | 8632 | 0.98 GiB | 119 KB | ~0.06 GiB | ~17x |
+
+The factors differ because the paths differ. Under reduce-scatter an idle rank
+gathers one finished result, so replacing 102 of those with 12 is the transfer
+count applied directly. Under the flat kernel it reads *both* active peers, 2N a
+collective, and would receive N once a run instead -- so the byte factor is about
+twice the transfer factor. Together 3.81 GiB would become roughly 0.39, which is
+the sum of two different recalculations rather than one ratio applied to a total.
+
+The sender gains what the receiver loses, less the duplication: twelve
+publications a microbatch or a token, about 0.33 GiB across a prefill and 0.06
+across this decode, on a card that does not carry them today.
 
 That is a traffic estimate and not a speed one. Whether publishing becomes a new
 wait for the active pair is unmeasured, and the profile already shows the

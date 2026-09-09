@@ -1737,7 +1737,10 @@ struct ggml_cuda_mixed_ar_group {
     std::vector<unsigned long long *> verify_counters; // {mismatches, elements}
     uint32_t shard_weight[GGML_CUDA_MIXED_AR_MAX_RANKS] = {};
     std::vector<ggml_cuda_ar_phase_acc *> phase_acc;   // per backend, per bucket, device memory
-    std::vector<std::array<ggml_cuda_ar_traffic, GGML_CUDA_AR_BUCKET_COUNT>> traffic;
+    // [bucket][path], path 1 = reduce-scatter, 0 = flat or streaming.  They move
+    // different volumes per collective, so one total over both cannot be scaled
+    // by a count of transfers.
+    std::vector<std::array<std::array<ggml_cuda_ar_traffic, 2>, GGML_CUDA_AR_BUCKET_COUNT>> traffic;
     size_t data_bytes = 0;
     void * shared_host = nullptr;
     bool host_registered = false;
@@ -1800,7 +1803,10 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
             if (tot <= 0.0) {
                 continue;
             }
-            const auto & t = i < group->traffic.size() ? group->traffic[i][bk] : ggml_cuda_ar_traffic{};
+            for (int path = 0; path < 2; ++path) {
+            const auto & t = i < group->traffic.size()
+                ? group->traffic[i][bk][path] : ggml_cuda_ar_traffic{};
+            if (t.calls == 0) { continue; }
             GGML_LOG_WARN("mixed_ar_phase backend=%s rank=%d %-10s calls=%llu total=%8.1f ms | "
                           "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
                           ggml_backend_name(group->backends[i]), group->ranks[i],
@@ -1810,14 +1816,15 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
             // "collectives" counts every call in this bucket; the phase line's
             // "calls" counts only those that ran the reduce-scatter kernel, since
             // that is where the timers live.  Decode is below its threshold.
-            GGML_LOG_WARN("mixed_ar_bytes backend=%s rank=%d %-10s collectives=%llu | "
+            GGML_LOG_WARN("mixed_ar_bytes backend=%s rank=%d %-10s %-3s collectives=%llu | "
                           "out %7.2f GiB | reduce in: same-pair %6.2f  cross %6.2f | "
                           "gather in: same-pair %6.2f  cross %6.2f GiB\n",
                           ggml_backend_name(group->backends[i]), group->ranks[i],
-                          ggml_cuda_ar_bucket_name(bk), t.calls,
+                          ggml_cuda_ar_bucket_name(bk), path ? "rs" : "flat", t.calls,
                           t.publish/1073741824.0,
                           t.reduce_same/1073741824.0, t.reduce_cross/1073741824.0,
                           t.gather_same/1073741824.0, t.gather_cross/1073741824.0);
+            }
         }
         CUDA_CHECK(cudaFree(group->phase_acc[i]));
     }
@@ -2251,7 +2258,7 @@ bool ggml_cuda_mixed_ar_group_enqueue(
                      }
                      return last == rank; }();
 
-            auto & t = group->traffic[i][bucket];
+            auto & t = group->traffic[i][bucket][use_rs ? 1 : 0];
             t.calls++;
             // Each algorithm moves different bytes; one formula for all three was
             // comparing volumes that are not comparable.
