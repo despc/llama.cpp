@@ -2455,3 +2455,43 @@ Two conditions it inherits. The value published must be the one after both
 residuals, which the dump locates exactly at node 143. And the arithmetic of the
 active pair must not move: they compute `l_out` as they do now, and one of them
 publishes the result rather than the reduction being restructured around it.
+
+### Runs, not layers
+
+The review's last suggestion turns out to be the whole of it: a device that is
+idle in several consecutive layers does not need each layer's output, only the
+last one before its own next layer. Checked with the same analysis, taking
+maximal runs of consecutive idle layers as the region:
+
+| device | maximal idle runs | layers they cover | self-contained |
+|---|---:|---:|---:|
+| Teslas | 12 | 51 | **12** |
+| Blackwells | 11 | 11 | **11** |
+
+All of them. The Teslas are idle in 51 layers that form only twelve runs, because
+they own every fourth layer and the three between are one stretch. So a Tesla
+needs twelve values a token where it now receives 51 x 2 = 102 results -- a factor
+of eight and a half, not the factor of two a per-layer transfer would give. For
+the Blackwells, whose idle layers are isolated, a run is one layer and the factor
+is two.
+
+**Both directions, since one of them is new traffic.** Per token a Tesla would
+take 12N in place of 102N, and the sender -- one card of the active pair -- would
+publish 12N it does not publish today, with a readiness signal each. Against the
+measured cross-pair figures, the Teslas' 3.81 GiB inbound would become roughly
+0.45 GiB, and about 0.45 GiB of outbound would appear on a Blackwell that does
+not carry it now.
+
+That is a traffic estimate and not a speed one. Whether publishing becomes a new
+wait for the active pair is unmeasured, and the profile already shows the
+Blackwells spending 57.9% of their cross-pair collectives waiting -- so a new
+thing for them to do at that point is exactly where it could hurt. The prototype
+has to time the whole stretch, the extra publication and its waits included, not
+the gather it removes.
+
+So the first prototype is a run, not a layer: keep both collectives and all of
+the active pair's arithmetic, drop the idle pair's work across the whole run, and
+publish the run's final `l_out` once. The conditions carry over -- the value is
+the one after the second residual, and the active pair computes it exactly as it
+does now. MTP stays out: its draft graph has no layer boundaries marked, so none
+of this is established there.

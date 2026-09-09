@@ -2517,6 +2517,64 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 size_t idle = 0, clean = 0;
                 bool dumped = false;
                 std::map<std::string, size_t> escapes, outputs, writes;
+                // First pass: which layers this device is idle in.  Runs of
+                // consecutive idle layers are then checked as one region -- if a
+                // run is self-contained, the device needs one value at its end
+                // rather than one per layer inside it, which is a different
+                // prize entirely.
+                std::vector<bool> idle_layer(bounds.size(), false);
+                for (size_t r = 0; r + 1 < bounds.size(); r++) {
+                    bool owns_r = false;
+                    for (int n = bounds[r]; n <= bounds[r + 1] && !owns_r; n++) {
+                        if (cgraph->nodes[n]->buffer &&
+                                ggml_backend_buffer_is_meta(cgraph->nodes[n]->buffer)) {
+                            const ggml_backend_meta_split_state ss =
+                                ggml_backend_meta_get_split_state(cgraph->nodes[n], false);
+                            if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                                int64_t sum = 0;
+                                for (size_t sg = 0; sg < ss.n_segments; sg++) {
+                                    sum += ss.ne[sg*n_backends + j] * ss.nr[sg];
+                                }
+                                owns_r = sum > 0;
+                            }
+                        }
+                    }
+                    idle_layer[r] = !owns_r;
+                }
+                size_t runs = 0, runs_clean = 0, layers_in_runs = 0;
+                for (size_t r0 = 0; r0 + 1 < bounds.size(); ) {
+                    if (!idle_layer[r0]) { ++r0; continue; }
+                    size_t r1 = r0;
+                    while (r1 + 2 < bounds.size() && idle_layer[r1 + 1]) { ++r1; }
+                    const int lo = bounds[r0], hi = bounds[r1 + 1];
+                    runs++;
+                    layers_in_runs += r1 - r0 + 1;
+                    std::unordered_set<const ggml_tensor *> inside;
+                    for (int n = lo; n <= hi; n++) {
+                        inside.insert(base_of(bcj.nodes[n]));
+                    }
+                    const ggml_tensor * run_out = base_of(bcj.nodes[hi]);
+                    bool ok = true;
+                    for (int n = 0; n < cgraph->n_nodes && ok; n++) {
+                        if ((n >= lo && n <= hi) ||
+                                (bcj.nodes[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                            continue;
+                        }
+                        for (int x = 0; x < GGML_MAX_SRC; x++) {
+                            ggml_tensor * src = bcj.nodes[n]->src[x];
+                            if (src && inside.count(base_of(src)) && base_of(src) != run_out) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    runs_clean += ok;
+                    r0 = r1 + 1;
+                }
+                GGML_LOG_WARN("meta_deps backend=%s runs: %zu maximal idle runs covering %zu "
+                              "layers, %zu self-contained -- one value each instead of two a layer\n",
+                              ggml_backend_name(bcj.backend), runs, layers_in_runs, runs_clean);
+
                 for (size_t r = 0; r + 1 < bounds.size(); r++) {
                     // [lo, hi] inclusive: the node at the next boundary is this
                     // layer's own output, produced by it, not a reader of it
