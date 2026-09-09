@@ -2546,3 +2546,60 @@ does, and it is where this stops until it is made. Nothing above it is
 speculative any more: the unit is the run, the runs are self-contained, the value
 to move is located, the mechanism to move it exists, and the traffic it replaces
 is counted per path. What is missing is a cut in the graph.
+
+### The prototype, built and measured: it works and it does not pay
+
+Built as designed. Runs are computed when the graph is split, an idle device
+skips its runs node by node, a subgraph boundary is cut at each run's last layer
+output, and the collective there is given an active mask of one rank -- which
+makes it a broadcast of that rank's value rather than a sum of four. Behind
+`GGML_META_SKIP_RUNS=n`, where n is the shortest run worth a handover.
+
+**It is correct.** Output hash identical to the baseline at every setting, over
+the same request.
+
+**It removes the traffic it promised.** On a Tesla, cross-pair inbound:
+
+| path | before | after | factor |
+|---|---:|---:|---:|
+| reduce-scatter gather | 2.83 GiB | 0.38 GiB | 7.4x |
+| flat reduction | 0.98 GiB | 0.08 GiB | 12x |
+
+against a prediction of 8.5x and about 17x. 3.35 GiB of a 3.81 GiB flow, gone.
+
+**And it is slower at every setting.**
+
+| shortest run handed over | prefill | generation |
+|---|---:|---:|
+| off | **630.1** | **78.1** |
+| 1 -- 23 handovers | 573.2 | 75.2 |
+| 2 | 610.1 | 75.8 |
+| 3 | 610.2 | 76.4 |
+| 4 -- almost none | 626.0 | 76.1 |
+
+Monotone: the more is skipped, the worse it is, and the best setting is the one
+that does nothing. CUDA graph reuse is unchanged at 78 across all of them, so it
+is not capture being broken.
+
+What it costs is the handovers themselves. Each is a subgraph boundary, and a
+subgraph boundary is a collective -- 23 of them, four devices, per evaluation.
+The traffic they remove is bandwidth; what they add is a launch and a wait per
+device per handover, and this collective has been latency-bound rather than
+bandwidth-bound in every measurement in this document.
+
+**One avenue remains and it is not enough.** Using AllReduce as a broadcast
+forces the *other* active device to receive the value it could have computed:
+with two active ranks the reduction would sum two identical copies, so exactly
+one may keep the compute flag. A real broadcast primitive would spare it 12
+receives of N -- about 112 MB a microbatch against a 230 ms loss, or roughly a
+sixth of it. Worth naming, not worth building.
+
+**Three faults on the way, all of the same family.** The run was taken as
+`[lo, hi]` when `lo` is its *input* -- the previous layer's output, which the
+device may own -- so it dropped work it had to do. The consumer analysis rewrote
+`NEEDED` at the very boundary the run analysis had just set it on, silently
+undoing the whole thing, and the first traffic measurement was of a version where
+nothing was skipped. And a mask with no bits set reads as "everybody", so marking
+only the devices that sit out left the rest unmarked and the gather still
+happening. Each was found by reading the numbers rather than by the thing
+failing.
