@@ -2154,10 +2154,18 @@ because the two changes landed close together and the second one's loss was
 larger. It is computed only when `GGML_CUDA_MIXED_AR_SKIP_GATHER` is set now, and
 generation is back to 78.1.
 
-So the 1215 ms stands. What would reach it is a graph where a device that owns
-nothing in a layer also has no residual edge reaching into it -- a question about
-how the model's graph is built for a split, not about the collective or about
-when work is skipped. Nothing in this document's remaining ideas gets there.
+So the 1215 ms stands, but only the narrow method is refuted. What was tested is
+skipping a single subgraph, bounded by the collectives that already exist, and a
+residual crossing that boundary forbids it. The residuals in this model span
+attention and the feed-forward inside one layer (`src/models/qwen35.cpp`), so a
+region of several subgraphs may have those dependencies entirely inside it and
+stop being an obstacle when the region is considered whole.
+
+That is a direction, not a result. It would have to account for the layer's
+outputs, its saved state, the MTP head and anything else that reads across the
+region, and the dependency analysis would have to be computed when the graph is
+prepared rather than on every token -- which is what made this attempt cost 9% of
+generation for one skipped subgraph out of 129.
 
 ### The last two items, both closing on the configuration already deployed
 
@@ -2189,11 +2197,60 @@ sweep. Which twelve turns out to matter, and only to generation:
 | every fourth one left behind | 628.4 | 71.1 |
 | the middle twelve | 628.1 | 74.3 |
 
-Prefill is flat across all four and generation spans seven tokens a second. The
-deployed choice leaves the first nineteen layers entirely on the Blackwells
-before any handoff; the others start alternating between the pairs earlier, and
-each alternation is a transition paid once per token. Prefill amortises those
-over a batch and does not notice. Nothing to change here either.
+Prefill is flat across all four and generation spans seven tokens a second.
+
+An explanation was offered here and is withdrawn: that the deployed choice starts
+alternating between the pairs later, and each alternation costs a transition per
+token. Starting later is not the same as having fewer, and counting settles it --
+**all four arrangements have exactly 24 transitions**, twelve layers entering and
+leaving the Tesla pair. Whatever separates 78.1 from 70.9 tokens/s, it is not the
+number of handoffs, and this document does not know what it is. The measurement
+picks the configuration; it does not explain it.
 
 So the placement search closes where it started this morning, which is the useful
 kind of negative: the configuration was not lucky.
+
+### The instrument, corrected
+
+The byte counters this section leaned on were wrong in three ways, and the
+figures above them are restated here rather than left standing.
+
+They counted the contribution a rank publishes and not the finished shard it
+writes back to host memory for the others to gather -- which the kernel does, and
+which is outbound traffic. They applied one formula to the reduce-scatter, flat
+and streaming kernels, which move different bytes. And they divided in elements
+where the kernel divides in vectors and hands the remainder to block zero
+separately. A fourth appeared once the first three were fixed: an inactive rank
+was credited with publishing, which the kernels skip, putting half a gigabyte of
+outbound traffic on a card that sends none.
+
+Corrected, one request of 1430 tokens in and 200 out:
+
+| rank | shape | collectives | out | reduce in | gather in | time |
+|---|---|---:|---:|---:|---:|---:|
+| V100 SXM2 | own pair | 2064 | 0.77 | 0.44 same | 0.33 same | 380 ms |
+| V100 SXM2 | other pair | 8944 | 0.00 | 0.98 cross | 2.83 cross | 1206 ms |
+| 5080 | own pair | 8944 | 3.32 | 1.90 same | 1.41 same | 813 ms |
+| 5080 | other pair | 2064 | 0.00 | 0.23 cross | 0.65 cross | 623 ms |
+
+GiB. The earlier claim that the Teslas move ten times more from the other pair
+than inside their own does not survive: 3.81 GiB in from across against 1.54 GiB
+of their own pair's traffic is closer to five to two. The cross-pair inbound also
+turns out to have a reduction component the old counter could not show -- 0.98 GiB
+of it is the flat kernel during decode reading the Blackwells' contributions,
+not the gather.
+
+What does survive is the shape of the answer: three quarters of the Teslas' time
+in the collective goes to exchanges they take no part in, at 89% gather.
+
+And the phase timers were divided by the wrong grid. They live in the
+reduce-scatter kernel, which runs on `rs_blocks`; the report used `blocks`. Equal
+by default, so no figure here was affected -- and wrong for anything that sets the
+two apart, which is exactly what the grid experiments earlier in this document
+did.
+
+Every measurement now carries the identity of the CUDA libraries actually mapped
+into the server, read from its address space rather than from the disk. Two
+measurements today were taken on builds that had not been installed, and the
+build script now refuses to deploy over a running server rather than letting
+`cp` fail into the noise.

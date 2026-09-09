@@ -1767,11 +1767,14 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
             // than added: the collective's cost is what one block spends, not all
             // of them.
             double p = 0, wp = 0, r = 0, wr = 0, g = 0; unsigned long long calls = 0;
-            for (size_t b2 = 0; b2 < group->blocks; ++b2) {
+            // The timers are in the reduce-scatter kernel, which runs on
+            // rs_blocks -- not on the small path's grid.  Equal by default, and
+            // wrong the moment they are set apart.
+            for (size_t b2 = 0; b2 < group->rs_blocks; ++b2) {
                 p += blk[b2].publish; wp += blk[b2].wait_pub; r += blk[b2].reduce;
                 wr += blk[b2].wait_red; g += blk[b2].gather; calls += blk[b2].calls;
             }
-            const double nb  = (double) group->blocks;
+            const double nb  = (double) group->rs_blocks;
             const double sum = p + wp + r + wr + g;
             const double tot = sum / nb / 1e6;
             if (tot <= 0.0) {
@@ -1782,7 +1785,7 @@ void ggml_cuda_mixed_ar_group_free(void * context) {
                           "publish %5.1f%%  wait_pub %5.1f%%  reduce %5.1f%%  wait_red %5.1f%%  gather %5.1f%%\n",
                           ggml_backend_name(group->backends[i]), group->ranks[i],
                           ggml_cuda_ar_bucket_name(bk),
-                          (unsigned long long) (calls / group->blocks), tot,
+                          (unsigned long long) (calls / group->rs_blocks), tot,
                           100*p/sum, 100*wp/sum, 100*r/sum, 100*wr/sum, 100*g/sum);
             // "collectives" counts every call in this bucket; the phase line's
             // "calls" counts only those that ran the reduce-scatter kernel, since
@@ -2207,39 +2210,81 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         else if ((active_mask & local_mask) == 0) { bucket = GGML_CUDA_AR_BUCKET_OTHER; }
 
         if (i < group->traffic.size()) {
-            const size_t   tsz   = ggml_type_size(tensor->type);
+            const size_t tsz = ggml_type_size(tensor->type);
+            // The kernels divide vectors, not elements, and hand the remainder to
+            // block zero as a separate scalar tail.  Counting in elements put the
+            // boundaries in places the kernel never uses.  Sixteen bytes a vector
+            // is what every architecture here compiles to; it is an assumption
+            // about the build, not about the run.
+            const int64_t elems_per_vec = std::max<int64_t>(1, 16 / (int64_t) tsz);
+            const int64_t count_vec = ne / elems_per_vec;
+            const int64_t tail_elems = ne - count_vec * elems_per_vec;
             const uint32_t total = shards.cum[group->n_ranks];
-            auto shard_lo = [&](size_t r) -> int64_t {
-                return total ? (int64_t) shards.cum[r] * ne / (int64_t) total : 0;
+            auto shard_lo_vec = [&](size_t r) -> int64_t {
+                return total ? (int64_t) shards.cum[r] * count_vec / (int64_t) total : 0;
             };
-            const int64_t mine = shard_lo(rank + 1) - shard_lo(rank);
-            int n_active = 0;
-            for (size_t r = 0; r < group->n_ranks; ++r) {
-                n_active += (active_mask >> r) & 1u;
-            }
+            const int64_t mine = (shard_lo_vec(rank + 1) - shard_lo_vec(rank)) * elems_per_vec;
+            const bool owns_tail = ((active_mask >> rank) & 1u) &&
+                [&]{ int last = 0;
+                     for (size_t r = 0; r < group->n_ranks; ++r) {
+                         if ((active_mask >> r) & 1u) { last = (int) r; }
+                     }
+                     return last == rank; }();
+
             auto & t = group->traffic[i][bucket];
             t.calls++;
-            if (contribute) {
-                t.publish += (unsigned long long) (ne - mine) * tsz;   // own shard has no reader
-            }
-            for (size_t p = 0; p < group->n_ranks; ++p) {
-                if (p == (size_t) rank || !((active_mask >> p) & 1u)) {
-                    continue;
+            // Each algorithm moves different bytes; one formula for all three was
+            // comparing volumes that are not comparable.
+            if (use_rs) {
+                if (contribute) {
+                    // the contribution, minus this rank's own shard which nobody
+                    // reads, plus the tail unless this rank owns it
+                    t.publish += (unsigned long long) (count_vec*elems_per_vec - mine) * tsz;
+                    if (!owns_tail) {
+                        t.publish += (unsigned long long) tail_elems * tsz;
+                    }
                 }
-                const bool same = (local_mask >> p) & 1u;
-                (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) mine * tsz;
-            }
-            if ((needed_mask >> rank) & 1u) {
+                // the finished shard goes back to host memory for the others to
+                // gather -- outbound, and it was missing from this count entirely
+                t.publish += (unsigned long long) mine * tsz;
+                if (owns_tail) {
+                    t.publish += (unsigned long long) tail_elems * tsz;
+                }
                 for (size_t p = 0; p < group->n_ranks; ++p) {
-                    if (p == (size_t) rank) {
+                    if (p == (size_t) rank || !((active_mask >> p) & 1u)) {
                         continue;
                     }
-                    const int64_t sz = shard_lo(p + 1) - shard_lo(p);
                     const bool same = (local_mask >> p) & 1u;
-                    (same ? t.gather_same : t.gather_cross) += (unsigned long long) sz * tsz;
+                    (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) mine * tsz;
+                }
+                if ((needed_mask >> rank) & 1u) {
+                    for (size_t p = 0; p < group->n_ranks; ++p) {
+                        if (p == (size_t) rank) {
+                            continue;
+                        }
+                        const int64_t sz =
+                            (shard_lo_vec(p + 1) - shard_lo_vec(p)) * elems_per_vec;
+                        const bool same = (local_mask >> p) & 1u;
+                        (same ? t.gather_same : t.gather_cross) += (unsigned long long) sz * tsz;
+                    }
+                }
+            } else {
+                // flat and streaming both publish the whole contribution and read
+                // every peer's whole contribution; they differ in when, not in
+                // how much.  An inactive rank publishes nothing here either --
+                // the kernel skips it, and counting it anyway put half a gigabyte
+                // of outbound traffic on a card that sends none.
+                if ((active_mask >> rank) & 1u) {
+                    t.publish += (unsigned long long) ne * tsz;
+                }
+                for (size_t p = 0; p < group->n_ranks; ++p) {
+                    if (p == (size_t) rank || !((active_mask >> p) & 1u)) {
+                        continue;
+                    }
+                    const bool same = (local_mask >> p) & 1u;
+                    (same ? t.reduce_same : t.reduce_cross) += (unsigned long long) ne * tsz;
                 }
             }
-            GGML_UNUSED(n_active);
         }
 
         ggml_cuda_ar_phase_acc * acc = i < group->phase_acc.size()
