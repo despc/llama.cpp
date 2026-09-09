@@ -2509,3 +2509,40 @@ publish the run's final `l_out` once. The conditions carry over -- the value is
 the one after the second residual, and the active pair computes it exactly as it
 does now. MTP stays out: its draft graph has no layer boundaries marked, so none
 of this is established there.
+
+### What the prototype needs before it can be written
+
+Starting the implementation turned up the shape of it, which is worth having
+before any of it is built.
+
+**Work can be dropped per node.** The CUDA backend skips a node whose
+`GGML_TENSOR_FLAG_COMPUTE` is clear (`ggml-cuda.cu`), so an idle device can be
+made to skip exactly the run's nodes rather than whole subgraphs. The earlier
+attempt skipped launches, which was both coarser and, as it turned out, not the
+thing that cost.
+
+**The broadcast can be the existing collective.** An AllReduce whose active mask
+holds one rank is a broadcast: that rank publishes, everyone gathers. The mask,
+the readiness signals, the slot rotation and the buffer lifetime are all in place
+already, and the other active card overwrites its own copy with a bit-identical
+one, since both compute the mirrored output from the same reduced inputs.
+
+**But the value is produced in the wrong launch.** `l_out` is not at a subgraph
+boundary. The boundaries fall at the partial products -- the dump has node 142,
+`ffn_out`, marked as one -- so `l_out` at 143 is the *first* node of the next
+subgraph, and the rest of that subgraph is the following layer's opening. An idle
+device must skip node 143 and compute 144 onwards, which the per-node flag
+allows; but it needs 143's value before that launch, and the active devices only
+produce it inside it.
+
+So the prototype needs one more thing first: **a subgraph boundary at the layer
+output**. The meta backend already cuts subgraphs where a reduction is needed;
+cutting additionally at the end of a run gives the sequence the design requires --
+the run's last subgraph ends at `l_out`, the broadcast happens between launches
+like every other collective, and the next launch begins with the following layer.
+
+That is a change to how subgraphs are delimited rather than to what any kernel
+does, and it is where this stops until it is made. Nothing above it is
+speculative any more: the unit is the run, the runs are self-contained, the value
+to move is located, the mechanism to move it exists, and the traffic it replaces
+is counted per path. What is missing is a cut in the graph.
