@@ -2072,3 +2072,36 @@ pair over 72 collectives, and 57.9% of that time waiting for the Teslas to
 publish rather than transferring. Their own pair's exchange is 1.66 GiB out and
 1.66 GiB back in over 312 collectives, evenly split between publishing, reducing
 and gathering -- that one looks balanced and is not where the next gain is.
+
+### Why the cross-pair traffic cannot be dropped at the collective
+
+The obvious reading of the table above is that the Teslas fetch 3.32 GiB they do
+not need, and that a precise enough test would drop it. The coarse test --
+"computes anything in the next subgraph" -- was replaced with the real question:
+does any node this device will compute, anywhere later in the graph, read this
+tensor or a view of it, answered in one backward pass over the subgraphs rather
+than by scanning forward at every collective.
+
+The answer is that they do need it. Every result is read on every device, so the
+precise test marks exactly what the coarse one did and buys the same nothing:
+624.2 against 624.9 tokens/s of prefill, 76.6 against 76.1 of generation, same
+output hash, and the same 965,345,280 elements compared on every rank.
+
+The reason is upstream of the collective. `GGML_TENSOR_FLAG_COMPUTE` is cleared
+only when a source has a zero-length slice, and a mirrored tensor has no slice to
+be zero -- so the mirrored operations of a layer, its norms and the like, run on
+all four cards whether or not the card owns any of that layer's matrices. Those
+operations read the previous layer's output, and that read is what the fetch
+serves. The traffic is not unnecessary; the work that consumes it is.
+
+So the 1215 ms is not reachable from inside the collective, and the analysis that
+was supposed to reach it is now in place and says so. What would reach it is not
+running a layer's mirrored operations on a device that owns nothing in that
+layer -- which is a question about how the meta backend assigns mirrored work, not
+about how the reduction moves bytes. That is the next thing to look at, and it is
+a larger change than anything in this document so far.
+
+The consumer analysis is kept even though it changes no number here. It answers
+the question the flag is supposed to answer, where the old test answered a
+different one that happened to agree; on a placement where a device really does
+stop reading, the two would part company.

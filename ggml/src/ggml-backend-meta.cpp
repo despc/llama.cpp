@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
+#include <unordered_set>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -2431,6 +2432,53 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // Which collective results each device actually reads.
+    //
+    // A device that will not read the result of subgraph i does not need to
+    // gather it: whatever it holds is overwritten by the next collective before
+    // anything looks at it.  The first version of this asked whether the device
+    // computes anything in the next subgraph, which is not the same question --
+    // mirrored operations are computed on every device, so the answer was almost
+    // always yes and the test bought nothing.
+    //
+    // The question is whether any node this device will compute, in any later
+    // subgraph, has this tensor among its sources -- through a view as well as
+    // directly, since a residual can arrive that way.  Answered here in one
+    // backward pass rather than by scanning forward at each collective, which
+    // would be quadratic in the graph and is paid once per token.
+    std::vector<std::vector<bool>> result_is_read(n_backends);
+    if (n_backends > 1 && backend_ctx->comm_ctx && backend_ctx->n_subgraphs > 1) {
+        auto base_of = [](ggml_tensor * t) {
+            while (t && t->view_src) {
+                t = t->view_src;
+            }
+            return t;
+        };
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            result_is_read[j].assign(backend_ctx->n_subgraphs, false);
+            std::unordered_set<const ggml_tensor *> read_later;
+            for (size_t k = backend_ctx->n_subgraphs; k-- > 1; ) {
+                ggml_cgraph * cg = bcj.cgraphs[k].cgraph_main;
+                for (int n = 0; n < cg->n_nodes; n++) {
+                    if ((cg->nodes[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    for (int a = 0; a < GGML_MAX_SRC; a++) {
+                        if (cg->nodes[n]->src[a]) {
+                            read_later.insert(base_of(cg->nodes[n]->src[a]));
+                        }
+                    }
+                }
+                ggml_cgraph * cg_prev = bcj.cgraphs[k - 1].cgraph_main;
+                if (cg_prev->n_nodes > 0) {
+                    result_is_read[j][k - 1] =
+                        read_later.count(base_of(cg_prev->nodes[cg_prev->n_nodes - 1])) > 0;
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2450,17 +2498,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
 
-                    // Does this device need the result at all?  It does if it
-                    // computes anything in the next subgraph.  If it does not,
-                    // the next collective rewrites its copy before anything reads
-                    // it, so fetching this one moves bytes nobody looks at.  On a
-                    // split where one card owns a few layers that is most of its
-                    // inbound traffic.
-                    ggml_cgraph * cgraph_next = bcj.cgraphs[i + 1].cgraph_main;
-                    bool needed = false;
-                    for (int k = 0; k < cgraph_next->n_nodes && !needed; k++) {
-                        needed = (cgraph_next->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
-                    }
+                    // Marked from the backward pass above: does anything this
+                    // device computes, anywhere later in the graph, read this
+                    // result or a view of it.
+                    const bool needed = result_is_read[j].empty() || result_is_read[j][i];
                     if (needed) {
                         nodes.back()->flags |= GGML_TENSOR_FLAG_NEEDED;
                     } else {
