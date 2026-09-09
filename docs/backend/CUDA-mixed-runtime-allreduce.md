@@ -1816,6 +1816,14 @@ output comparison to substantiate the Volta dispatch equivalence, and the
 Flash-Next work, which is a layer-split workload with its own plan and its own
 bottleneck model.
 
+**Answered the next day**, and it was the larger of the two levers: not sending
+the bytes rather than sending them faster. Per-layer participation took prefill
+from 369.5 to 627.1 tokens/s and generation from 63.3 to 78.5 -- see *Per-layer
+participation* below, which supersedes the sentence above about where the levers
+are. The shares did want re-measuring and still do: 35/35/17/13 now applies only
+to the layers the Blackwell pair shares, where two of the four numbers are never
+used.
+
 **Not worth revisiting without new hardware.** Direct device-to-device transfer
 (1.38 GB/s against 3.29 through the host on the Tesla pair, unavailable on the
 Blackwells), swapping cards between slots (the cost model came out exactly
