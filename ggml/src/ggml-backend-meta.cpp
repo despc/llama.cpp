@@ -2446,8 +2446,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // directly, since a residual can arrive that way.  Answered here in one
     // backward pass rather than by scanning forward at each collective, which
     // would be quadratic in the graph and is paid once per token.
+    //
+    // Only when the answer will be used.  This is a pass over every node of every
+    // subgraph, and graph_compute runs once per token, so computing it for a
+    // feature that is switched off costs about 3% of generation -- measured, after
+    // shipping it that way.
     std::vector<std::vector<bool>> result_is_read(n_backends);
-    if (n_backends > 1 && backend_ctx->comm_ctx && backend_ctx->n_subgraphs > 1) {
+    if (ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_SKIP_GATHER") &&
+            n_backends > 1 && backend_ctx->comm_ctx && backend_ctx->n_subgraphs > 1) {
         auto base_of = [](ggml_tensor * t) {
             while (t && t->view_src) {
                 t = t->view_src;

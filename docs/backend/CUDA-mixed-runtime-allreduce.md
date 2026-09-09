@@ -2125,3 +2125,36 @@ prefill, reproducibly. That follows from what changed: the Teslas now share whol
 layers between themselves rather than taking a slice of everything, so an uneven
 reduction share between two cards doing equal work only unbalances it. Deployed
 at 35,35,15,15.
+
+### Not running the layer at all, and why that fails
+
+The traffic feeds work that is not needed, so the next thing to try is not doing
+the work: a device that owns no slice of a layer skips the layer, and takes the
+result from the collective's gather. Two conditions make that safe -- the device
+owns nothing with a real split axis in the subgraph, and nothing it computes
+later reads any of the subgraph's intermediate nodes.
+
+The second condition refuses almost everything. Counted on the 27B: of 129
+subgraphs a Tesla is idle in 104, and 103 of those have an intermediate read by
+something later. One subgraph is skippable. The residual reaches back past the
+subgraph boundary, which is exactly the hazard the condition exists to catch, and
+it is the normal case rather than the exception.
+
+Measured anyway, and it costs: 69.0 tokens/s of generation against 78.1, prefill
+unchanged, output hash identical. With one subgraph of 129 skipped the loss
+cannot be the skipping. It is the analysis -- a pass over every node of every
+subgraph, querying split states, run inside `graph_compute`, which happens once
+per token. Removed.
+
+**And a regression it exposed in the change before it.** The consumer analysis
+that replaced the `NEEDED` heuristic also runs per token, and also ran when the
+feature it feeds was switched off. That cost about 3% of generation -- 76.3
+against 78.4 -- and had been shipped and measured without anyone noticing,
+because the two changes landed close together and the second one's loss was
+larger. It is computed only when `GGML_CUDA_MIXED_AR_SKIP_GATHER` is set now, and
+generation is back to 78.1.
+
+So the 1215 ms stands. What would reach it is a graph where a device that owns
+nothing in a layer also has no residual edge reaching into it -- a question about
+how the model's graph is built for a split, not about the collective or about
+when work is skipped. Nothing in this document's remaining ideas gets there.
