@@ -673,6 +673,11 @@ extern "C" {
         // rewritten by the next collective anyway, so fetching this one is pure
         // traffic -- which on a four-card split is most of what crosses the link.
         GGML_TENSOR_FLAG_NEEDED  = 32,
+        // ...is the input of a decoder layer.  Marked by the graph builder, which
+        // already records these, so a backend can delimit a layer without
+        // matching tensor names.  A region between two consecutive marks is one
+        // layer, both of its residuals inside it.
+        GGML_TENSOR_FLAG_LAYER_INPUT = 64,
     };
 
     enum ggml_tri_type {

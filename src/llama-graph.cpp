@@ -1383,6 +1383,15 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
     }
+    // Where one layer ends and the next begins, said structurally.  A backend
+    // deciding whether a device can sit a layer out needs the boundary, and
+    // matching tensor names for it would be a guess about the builder rather
+    // than a fact from it.  The builder already records these.
+    for (auto * tensor : t_layer_inp) {
+        if (tensor != nullptr) {
+            tensor->flags |= GGML_TENSOR_FLAG_LAYER_INPUT;
+        }
+    }
     for (auto * tensor : t_sampled) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);

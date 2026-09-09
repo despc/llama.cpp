@@ -2323,22 +2323,39 @@ ones where a device owns no slice of anything, and lists every value produced
 inside that a node computed elsewhere reads -- excluding the region's own output,
 which the collective already delivers.
 
-The answer is one edge, and always the same one:
+One edge came back, and always the same one:
 
     attn_residual-N  <-  l_out-N
 
 The attention residual, produced in a layer's attention part and read by the
-layer's output in its feed-forward part. Nothing else escapes: no saved state,
-no view onto anything, no MTP consumer, no intermediate read from a later layer.
-That is a narrower obstacle than the earlier attempt suggested, and it is the
-named dependency the review asked for rather than a count.
+layer's output in its feed-forward part. That is the named dependency the review
+asked for rather than a count, and it is a narrower obstacle than the earlier
+attempt suggested.
+
+**What this does not establish.** It searched the sources of nodes computed in
+the graph it saw, which leaves three gaps, and the finding should be read as "no
+other edge among the consumers examined" rather than "nothing else escapes":
+
+- It runs once per process, on the first graph that qualifies. Prefill, decode
+  and MTP have different graph shapes and only one of them was looked at. A
+  planner would have to analyse each new structure, not the first.
+- Sources of computed nodes are not the only way out. A tensor that is itself an
+  observable output, a write into persistent state, or a read in the *next* call
+  is invisible to this search.
+- It excludes the region's own output on the assumption that the collective
+  delivers it. That assumption is now the central question rather than a given:
+  where the finished output materialises, who receives it, and which aliases were
+  excluded along with it, all need establishing before a prototype rests on them.
 
 It is also not removed by making the region bigger. Regions of two and three
 subgraphs, at every phase, give **no clean region at all** -- 0 of 52, 0 of 40,
-0 of 27, 0 of 27, 0 of 26. A fixed number of subgraphs always cuts some layer
-between its attention and its feed-forward, and that cut is exactly where the
-residual crosses. This model has 49 recurrent layers and 16 attention ones in 129
-subgraphs, so no constant stride aligns with the structure.
+0 of 27, 0 of 27, 0 of 26. Every escaping edge found is the attention residual
+crossing a cut between a layer's attention and its feed-forward, so a region
+delimited by a count of subgraphs does not line up with where the dependency
+ends. Why no constant works is not established here: that 49 recurrent and 16
+attention layers occupy 129 subgraphs makes a constant stride unlikely to align,
+but the measurement shows the misalignment, not its cause, and the next step does
+not need the cause.
 
 So a region that could be skipped has to be delimited by the layer, not by a
 count -- from the boundary before a layer's attention to the boundary after its
@@ -2357,3 +2374,42 @@ before it gave an answer: the first version compared meta tensors against
 per-device sources, which are different objects, so nothing ever matched and it
 reported every region clean. Identity has to come from the same side as the
 sources being searched.
+
+### Delimited by the layer instead, 2026-09-09
+
+The escaping edge was the second residual, and it escaped because a region
+counted in subgraphs cuts a layer between its attention and its feed-forward.
+The builder already records where a layer begins -- `t_layer_inp[il]`, kept for
+embeddings output -- so those tensors are marked with a flag
+(`GGML_TENSOR_FLAG_LAYER_INPUT`) and the analysis delimits by them. No name
+matching: the boundary comes from the builder that made it.
+
+A region is then one layer, from its input to the next layer's input inclusive,
+with both residuals inside. Three kinds of escape are searched: a value read by a
+computed node outside, a value the graph declares an output, and a write into a
+tensor the region did not produce -- which is how saved state would leave.
+
+| graph | device | idle layers | self-contained | readers | outputs | writes |
+|---|---|---:|---:|---:|---:|---:|
+| 4038 nodes | Teslas | 51 | **51** | 0 | 0 | 0 |
+| 4038 nodes | Blackwells | 11 | **11** | 0 | 0 | 0 |
+| 49 nodes | all | 0 | -- | -- | -- | -- |
+
+Every idle layer is self-contained. The only value leaving is the layer's own
+output, which is the next layer's input.
+
+**And a gap, named rather than glossed.** The 49-node graph is the MTP draft
+head, and it has no layer boundaries at all -- its builder does not record
+`t_layer_inp`. So MTP is not covered by this, and the table says nothing about
+it. The main graph covers prefill and decode, which share a node count here.
+
+**What still is not established** is the thing the previous entry was corrected
+for: that the collective delivers the layer output to a device that skipped the
+layer. The analysis says nothing else has to cross; it does not say this one
+does. Where the finished output materialises on an inactive device, and whether
+it arrives after both residuals rather than before the second, is the question a
+prototype would rest on, and it has not been answered.
+
+The diagnostic runs once per distinct graph shape now rather than once per
+process. That is the right granularity for a probe and not for a planner, which
+would have to key on the graph itself.

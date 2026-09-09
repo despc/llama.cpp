@@ -2485,111 +2485,114 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    // What actually crosses the boundary of a region a device could sit out.
+    // What actually crosses the boundary of a layer a device could sit out.
     //
-    // Analysis only, printed once, changing nothing.  Skipping a single subgraph
-    // was refused by 103 of 104 idle subgraphs because a residual reaches back
-    // past the boundary -- but this model's residuals span attention and the
-    // feed-forward inside one layer, so a region of several subgraphs may hold
-    // them.  Before building anything, the question is which tensors really
-    // leave such a region: the layer's output, which the collective already
-    // delivers, or something else.
+    // Analysis only, printed per distinct graph shape, changing nothing.  The
+    // regions are delimited by GGML_TENSOR_FLAG_LAYER_INPUT, which the graph
+    // builder sets on the tensors it already records as layer inputs -- so a
+    // region is one layer with both of its residuals inside it, rather than a
+    // count of subgraphs that cuts wherever it lands.
     //
-    // GGML_META_DEPS=<n> takes regions of n consecutive subgraphs.
-    if (const char * deps_env = getenv("GGML_META_DEPS")) {
-        static bool said = false;
-        // "span" or "span:offset" -- the phase matters, because a region that
-        // cuts a layer in half leaves its attention residual crossing the cut.
-        const int span = std::max(1, atoi(deps_env));
-        const char * colon = strchr(deps_env, ':');
-        const int phase = colon ? std::max(0, atoi(colon + 1)) : 0;
-        if (!said && n_backends > 1 && backend_ctx->n_subgraphs > (size_t) (span + phase)) {
-            said = true;
+    // Three kinds of escape are looked for, because "no other edge among the
+    // sources searched" was too weak a statement last time: a value read outside
+    // the region, a value the graph declares an output, and a write into a tensor
+    // the region did not produce, which is how saved state leaves.
+    if (getenv("GGML_META_DEPS")) {
+        static std::set<int> shapes_seen;
+        if (n_backends > 1 && shapes_seen.insert(cgraph->n_nodes).second) {
             auto base_of = [](ggml_tensor * t) {
                 while (t && t->view_src) { t = t->view_src; }
                 return t;
             };
+            std::vector<int> bounds;
+            for (int n = 0; n < cgraph->n_nodes; n++) {
+                if (cgraph->nodes[n]->flags & GGML_TENSOR_FLAG_LAYER_INPUT) {
+                    bounds.push_back(n);
+                }
+            }
+            GGML_LOG_WARN("meta_deps graph of %d nodes, %zu layer boundaries\n",
+                          cgraph->n_nodes, bounds.size());
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
-                size_t idle_regions = 0, clean_regions = 0;
-                std::map<std::string, size_t> blockers;   // producer name -> times seen
-                for (size_t a = phase; a + span <= backend_ctx->n_subgraphs; a += span) {
-                    const size_t b = a + span;   // region is [a, b)
-                    // idle: owns no slice of anything with a real split axis
+                size_t idle = 0, clean = 0;
+                std::map<std::string, size_t> escapes, outputs, writes;
+                for (size_t r = 0; r + 1 < bounds.size(); r++) {
+                    // [lo, hi] inclusive: the node at the next boundary is this
+                    // layer's own output, produced by it, not a reader of it
+                    const int lo = bounds[r], hi = bounds[r + 1];
                     bool owns = false;
                     std::unordered_set<const ggml_tensor *> inside;
-                    ggml_tensor * region_out = nullptr;
-                    for (size_t k = a; k < b; k++) {
-                        ggml_cgraph * cg = bcj.cgraphs[k].cgraph_main;
-                        const int off = bcj.cgraphs[k].offset;
-                        for (int n = 0; n < cg->n_nodes; n++) {
-                            ggml_tensor * meta_node = cgraph->nodes[off + n];
-                            // identity must be the per-device tensor, which is
-                            // what a consumer's src points at; the meta node is
-                            // only good for the name
-                            inside.insert(base_of(cg->nodes[n]));
-                            if (k + 1 == b && n + 1 == cg->n_nodes) {
-                                region_out = base_of(cg->nodes[n]);
-                            }
-                            if (!owns && meta_node->buffer && ggml_backend_buffer_is_meta(meta_node->buffer)) {
-                                const ggml_backend_meta_split_state ss =
-                                    ggml_backend_meta_get_split_state(meta_node, false);
-                                if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
-                                    int64_t sum = 0;
-                                    for (size_t sg = 0; sg < ss.n_segments; sg++) {
-                                        sum += ss.ne[sg*n_backends + j] * ss.nr[sg];
-                                    }
-                                    owns = sum > 0;
+                    for (int n = lo; n <= hi; n++) {
+                        inside.insert(base_of(bcj.nodes[n]));
+                        if (!owns && cgraph->nodes[n]->buffer &&
+                                ggml_backend_buffer_is_meta(cgraph->nodes[n]->buffer)) {
+                            const ggml_backend_meta_split_state ss =
+                                ggml_backend_meta_get_split_state(cgraph->nodes[n], false);
+                            if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                                int64_t sum = 0;
+                                for (size_t sg = 0; sg < ss.n_segments; sg++) {
+                                    sum += ss.ne[sg*n_backends + j] * ss.nr[sg];
                                 }
+                                owns = sum > 0;
                             }
                         }
                     }
                     if (owns) {
                         continue;
                     }
-                    idle_regions++;
-                    bool clean = true;
-                    for (size_t k = 0; k < backend_ctx->n_subgraphs; k++) {
-                        if (k >= a && k < b) {
+                    idle++;
+                    bool ok = true;
+                    // the layer's own output is the next boundary, which is what a
+                    // skip would have to be handed; everything else must stay in
+                    const ggml_tensor * region_out = base_of(bcj.nodes[hi]);
+                    for (int n = lo; n <= hi; n++) {
+                        if (cgraph->nodes[n]->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                            outputs[cgraph->nodes[n]->name]++;
+                            ok = false;
+                        }
+                        // a write into something the region did not produce
+                        ggml_tensor * dst = base_of(bcj.nodes[n]);
+                        if (dst != bcj.nodes[n] && !inside.count(dst)) {
+                            writes[cgraph->nodes[n]->name]++;
+                            ok = false;
+                        }
+                    }
+                    for (int n = 0; n < cgraph->n_nodes; n++) {
+                        if (n >= lo && n <= hi) {
                             continue;
                         }
-                        ggml_cgraph * cg = bcj.cgraphs[k].cgraph_main;
-                        const int off = bcj.cgraphs[k].offset;
-                        for (int n = 0; n < cg->n_nodes; n++) {
-                            if ((cg->nodes[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        if ((bcj.nodes[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                            continue;
+                        }
+                        for (int x = 0; x < GGML_MAX_SRC; x++) {
+                            ggml_tensor * src = bcj.nodes[n]->src[x];
+                            if (!src) {
                                 continue;
                             }
-                            for (int x = 0; x < GGML_MAX_SRC; x++) {
-                                ggml_tensor * src = cg->nodes[n]->src[x];
-                                if (!src) {
-                                    continue;
-                                }
-                                ggml_tensor * bs = base_of(src);
-                                if (!inside.count(bs) || bs == region_out) {
-                                    continue;   // outside, or the output the collective delivers
-                                }
-                                clean = false;
-                                blockers[std::string(bs->name) + " <- " +
-                                         std::string(cg->nodes[n]->name)]++;
+                            const ggml_tensor * bs = base_of(src);
+                            if (!inside.count(bs) || bs == region_out) {
+                                continue;
                             }
+                            escapes[std::string(cgraph->nodes[n]->name)]++;
+                            ok = false;
                         }
                     }
-                    clean += 0;
-                    if (clean) {
-                        clean_regions++;
-                    }
+                    clean += ok;
                 }
-                GGML_LOG_WARN("meta_deps backend=%s span=%d phase=%d: %zu idle regions, %zu with no "
-                              "escaping value other than the region output\n",
-                              ggml_backend_name(bcj.backend), span, phase, idle_regions, clean_regions);
-                size_t shown = 0;
-                for (const auto & kv : blockers) {
-                    if (shown++ >= 12) {
-                        GGML_LOG_WARN("meta_deps   ... %zu more distinct edges\n", blockers.size() - shown + 1);
-                        break;
+                GGML_LOG_WARN("meta_deps backend=%s: %zu idle layers, %zu self-contained "
+                              "(%zu escaping readers, %zu declared outputs, %zu external writes)\n",
+                              ggml_backend_name(bcj.backend), idle, clean,
+                              escapes.size(), outputs.size(), writes.size());
+                auto show = [&](const char * what, std::map<std::string, size_t> & m) {
+                    size_t k = 0;
+                    for (const auto & kv : m) {
+                        if (k++ >= 6) { GGML_LOG_WARN("meta_deps   %s ... %zu more\n", what, m.size() - 6); break; }
+                        GGML_LOG_WARN("meta_deps   %s x%-4zu %s\n", what, kv.second, kv.first.c_str());
                     }
-                    GGML_LOG_WARN("meta_deps   escapes x%-5zu %s\n", kv.second, kv.first.c_str());
-                }
+                };
+                show("reader ", escapes);
+                show("output ", outputs);
+                show("write  ", writes);
             }
         }
     }
