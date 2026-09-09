@@ -2413,3 +2413,45 @@ prototype would rest on, and it has not been answered.
 The diagnostic runs once per distinct graph shape now rather than once per
 process. That is the right granularity for a probe and not for a planner, which
 would have to key on the graph itself.
+
+### Where the layer output actually comes from
+
+The previous entry left one thing unestablished, and it was the thing a prototype
+would rest on: whether the collective delivers the layer output to a device that
+took no part in the layer. `GGML_META_DEPS_DUMP=1` prints one self-contained idle
+layer node by node, with each node's slice on that device and the collective
+points marked. Layer 1 seen from an idle Tesla, ending at:
+
+    134  linear_attn_out-1   MUL_MAT   mirrored   <= collective
+    135  ... (reshaped)      RESHAPE   mirrored
+    136  attn_residual-1     ADD       mirrored
+    137  norm-1              RMS_NORM  mirrored
+    138  attn_post_norm-1    MUL       mirrored
+    139  ffn_gate-1          MUL_MAT   slice=0
+    140  ffn_up-1            MUL_MAT   slice=0
+    141  ffn_swiglu-1        GLU       slice=0
+    142  ffn_out-1           MUL_MAT   mirrored   <= collective
+    143  l_out-1             ADD       mirrored
+
+It does not. The collective carries the two partial products -- the attention
+output projection and the feed-forward down projection -- and the layer output is
+a mirrored `ADD` computed locally on every device from the second of those and
+the residual it kept. So the assumption is refused: a device that skipped the
+layer would have no `l_out` from anywhere.
+
+That is the answer, and it also prices the change. An idle device today receives
+**two** results of N bytes per layer and must run the mirrored norms and both
+residual adds to turn them into one. If the active pair published the finished
+`l_out` instead, the idle pair would receive **one** N-byte value and run nothing:
+half the inbound traffic of those layers and all of the mirrored work.
+
+For the 51 layers a Tesla is idle in, that is the 2.83 GiB of cross-pair gather
+against roughly half of it, plus the compute those fetches feed. Whether it is
+worth what it costs -- a second thing to publish, on a path where only the active
+pair has the value -- is the next question, and it is a design question with a
+measured basis rather than a hope.
+
+Two conditions it inherits. The value published must be the one after both
+residuals, which the dump locates exactly at node 143. And the arithmetic of the
+active pair must not move: they compute `l_out` as they do now, and one of them
+publishes the result rather than the reduction being restructured around it.

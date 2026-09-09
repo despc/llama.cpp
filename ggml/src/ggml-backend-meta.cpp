@@ -2515,6 +2515,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 size_t idle = 0, clean = 0;
+                bool dumped = false;
                 std::map<std::string, size_t> escapes, outputs, writes;
                 for (size_t r = 0; r + 1 < bounds.size(); r++) {
                     // [lo, hi] inclusive: the node at the next boundary is this
@@ -2578,6 +2579,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
                     clean += ok;
+
+                    // One idle layer, node by node, with the collective points
+                    // marked -- because "the collective delivers the layer
+                    // output" was an assumption and this is where it is either
+                    // confirmed or not.
+                    if (ok && !dumped && getenv("GGML_META_DEPS_DUMP")) {
+                        dumped = true;
+                        std::set<int> ends;
+                        for (size_t k = 0; k < backend_ctx->n_subgraphs; k++) {
+                            ggml_cgraph * cg = bcj.cgraphs[k].cgraph_main;
+                            ends.insert(bcj.cgraphs[k].offset + cg->n_nodes - 1);
+                        }
+                        GGML_LOG_WARN("meta_deps dump backend=%s layer region [%d,%d]\n",
+                                      ggml_backend_name(bcj.backend), lo, hi);
+                        for (int n = lo; n <= hi; n++) {
+                            const bool is_end = ends.count(n) > 0;
+                            int64_t mine = -1;
+                            if (cgraph->nodes[n]->buffer &&
+                                    ggml_backend_buffer_is_meta(cgraph->nodes[n]->buffer)) {
+                                const ggml_backend_meta_split_state ss =
+                                    ggml_backend_meta_get_split_state(cgraph->nodes[n], false);
+                                if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                                    mine = 0;
+                                    for (size_t sg = 0; sg < ss.n_segments; sg++) {
+                                        mine += ss.ne[sg*n_backends + j] * ss.nr[sg];
+                                    }
+                                }
+                            }
+                            GGML_LOG_WARN("meta_deps   %-4d %-28s %-12s%s%s\n", n,
+                                          cgraph->nodes[n]->name,
+                                          ggml_op_name(cgraph->nodes[n]->op),
+                                          mine >= 0 ? (mine ? " slice>0" : " slice=0") : " mirrored",
+                                          is_end ? "  <= COLLECTIVE HERE" : "");
+                        }
+                    }
                 }
                 GGML_LOG_WARN("meta_deps backend=%s: %zu idle layers, %zu self-contained "
                               "(%zu escaping readers, %zu declared outputs, %zu external writes)\n",
