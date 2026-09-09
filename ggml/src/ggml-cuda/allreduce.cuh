@@ -17,7 +17,7 @@ struct ggml_cuda_ar_pipeline;
 // never signals.  Version 7 adds the probe rendezvous: the two runtimes measure
 // the link in separate libraries, so without a meeting point each of them times
 // a link the other is not using, which is not the link the collective runs on.
-static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 12;
+static constexpr uint32_t GGML_CUDA_MIXED_AR_ABI_VERSION = 13;
 static constexpr size_t GGML_CUDA_MIXED_AR_SLOTS = 2;
 static constexpr size_t GGML_CUDA_MIXED_AR_RANK_BYTES = 64 * 1024 * 1024;
 // Signal-slot stride and the largest grid a group may launch.  The grid itself
@@ -81,6 +81,11 @@ struct ggml_cuda_mixed_ar_group_config {
     // experiment does.
     size_t rs_blocks;
     uint32_t verify;             // 1: compare every result against the flat kernel
+    // 1: let a rank skip the gather when the meta backend says nothing on it
+    // reads the result.  Off by default: the marking is "computes nothing in the
+    // next subgraph", which is not a proof that no later edge -- a residual, a
+    // view -- reaches this tensor.
+    uint32_t skip_gather;
     // Relative share of the reduction each rank owns, in rank order.  Integers,
     // so every rank derives identical boundaries from them; all ones is an even
     // split.  This is not the weight split: it decides who reduces an element,

@@ -1076,44 +1076,37 @@ static __global__ void ggml_cuda_mixed_ar_kernel(
     for (int i = i_need_it ? gtid : count_vec; i < count_vec; i += gnt) {
         const int off = i * ELEMS_PER_VEC;
         T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
-        int n_act = 0;
+        // Positions and tree preserved; only the fetch is skipped.  See the
+        // reduce-scatter kernel for why compacting is not the same arithmetic.
         for (int peer = 0; peer < n_ranks; ++peer) {
-            if (!((active_mask >> peer) & 1u)) {
-                continue;
-            }
-            if (peer == rank) {
+            if (peer == rank || !((active_mask >> peer) & 1u)) {
 #pragma unroll
                 for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                    wire[n_act][k] = contribute ? sendbuf[off + k]
-                                                : ggml_cuda_cast<T>(0.0f);
+                    wire[peer][k] = (peer == rank && contribute)
+                        ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
                 }
             } else {
                 const T * host_peer = slot_data + (size_t) peer * rank_stride;
-                ggml_cuda_memcpy_1<sizeof(wire[n_act])>(wire[n_act], &host_peer[off]);
+                ggml_cuda_memcpy_1<sizeof(wire[peer])>(wire[peer], &host_peer[off]);
             }
-            ++n_act;
         }
 #pragma unroll
         for (int k = 0; k < ELEMS_PER_VEC; ++k) {
             T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
-            for (int peer = 0; peer < n_act; ++peer) {
+            for (int peer = 0; peer < n_ranks; ++peer) {
                 v[peer] = wire[peer][k];
             }
-            recvbuf[off + k] = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
+            recvbuf[off + k] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
         }
     }
     if (i_need_it && bid == 0 && tid < count - tail) {
         T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
-        int n_act = 0;
         for (int peer = 0; peer < n_ranks; ++peer) {
-            if (!((active_mask >> peer) & 1u)) {
-                continue;
-            }
-            v[n_act++] = peer == rank
-                ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
+            v[peer] = (peer == rank || !((active_mask >> peer) & 1u))
+                ? ((peer == rank && contribute) ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
                 : (slot_data + (size_t) peer * rank_stride)[tail + tid];
         }
-        recvbuf[tail + tid] = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
+        recvbuf[tail + tid] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
     }
 }
 
@@ -1528,49 +1521,45 @@ static __global__ void ggml_cuda_mixed_ar_rs_kernel(
     for (int i = shard_lo(rank) + gtid; i < shard_lo(rank + 1); i += gnt) {
         const int off = i * ELEMS_PER_VEC;
         T wire[GGML_CUDA_MIXED_AR_MAX_RANKS][ELEMS_PER_VEC];
-        // Compacted to the ranks that published.  The ones left out contributed
-        // exact zeros, and the butterfly folds an exact zero away without
-        // changing a bit, so the sum is the same one the full tree produces.
-        int n_act = 0;
+        // An inactive rank keeps its position and its zeros; only the fetch is
+        // skipped.  Compacting the array instead would reorder the butterfly --
+        // with 0,1,3 active, a0+(a1+a3) becomes (a0+a3)+a1, and those differ in
+        // floating point the moment a cancellation is involved.  Not summing a
+        // zero is not free either, once the sign of zero is counted.  So the
+        // tree is left exactly as it was and only the traffic goes away, which
+        // is what was worth having.
         for (int peer = 0; peer < n_ranks; ++peer) {
-            if (!((active_mask >> peer) & 1u)) {
-                continue;
-            }
-            if (peer == rank) {
+            if (peer == rank || !((active_mask >> peer) & 1u)) {
 #pragma unroll
                 for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                    wire[n_act][k] = contribute ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
+                    wire[peer][k] = (peer == rank && contribute)
+                        ? sendbuf[off + k] : ggml_cuda_cast<T>(0.0f);
                 }
             } else {
                 const T * host_peer = slot_data + (size_t) peer * rank_stride;
-                ggml_cuda_memcpy_1<sizeof(wire[n_act])>(wire[n_act], &host_peer[off]);
+                ggml_cuda_memcpy_1<sizeof(wire[peer])>(wire[peer], &host_peer[off]);
             }
-            ++n_act;
         }
         T out[ELEMS_PER_VEC];
 #pragma unroll
         for (int k = 0; k < ELEMS_PER_VEC; ++k) {
             T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
-            for (int peer = 0; peer < n_act; ++peer) {
+            for (int peer = 0; peer < n_ranks; ++peer) {
                 v[peer] = wire[peer][k];
             }
-            out[k] = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
+            out[k] = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
             recvbuf[off + k] = out[k];
         }
         ggml_cuda_memcpy_1<sizeof(out)>(&host_mine[off], out);
     }
     if (owns_tail && bid == 0 && tid < count - tail) {
         T v[GGML_CUDA_MIXED_AR_MAX_RANKS];
-        int n_act = 0;
         for (int peer = 0; peer < n_ranks; ++peer) {
-            if (!((active_mask >> peer) & 1u)) {
-                continue;
-            }
-            v[n_act++] = peer == rank
-                ? (contribute ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
+            v[peer] = (peer == rank || !((active_mask >> peer) & 1u))
+                ? ((peer == rank && contribute) ? sendbuf[tail + tid] : ggml_cuda_cast<T>(0.0f))
                 : (slot_data + (size_t) peer * rank_stride)[tail + tid];
         }
-        const T total = ggml_cuda_mixed_ar_reduce<T>(v, n_act);
+        const T total = ggml_cuda_mixed_ar_reduce<T>(v, n_ranks);
         recvbuf[tail + tid] = total;
         host_mine[tail + tid] = total;
     }
@@ -1685,6 +1674,7 @@ struct ggml_cuda_mixed_ar_group {
     size_t blocks = 8;                                 // grid for the small paths
     size_t rs_blocks = 8;                              // grid for the reduce-scatter
     uint32_t verify = 0;                               // compare against the flat kernel
+    uint32_t skip_gather = 0;                          // honour GGML_TENSOR_FLAG_NEEDED
     std::vector<void *> verify_in;                     // per backend, device memory
     std::vector<void *> verify_out;
     std::vector<unsigned long long *> verify_counters; // {mismatches, elements}
@@ -1826,6 +1816,7 @@ void * ggml_cuda_mixed_ar_group_init(const ggml_cuda_mixed_ar_group_config * con
     group->blocks = config->blocks;
     group->rs_blocks = config->rs_blocks ? config->rs_blocks : config->blocks;
     group->verify = config->verify;
+    group->skip_gather = config->skip_gather;
     if (group->rs_blocks > GGML_CUDA_MIXED_AR_BLOCKS) {
         ggml_cuda_mixed_ar_group_free(group);
         return nullptr;
@@ -2021,6 +2012,7 @@ static void ggml_cuda_mixed_ar_launch(
     meet(GGML_CUDA_MIXED_AR_SIG_VERIFY_A);
     CUDA_CHECK(cudaMemcpyAsync(group->verify_out[i], data, nbytes, cudaMemcpyDeviceToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(data, group->verify_in[i], nbytes, cudaMemcpyDeviceToDevice, stream));
+    const bool my_result_is_whole = (needed_mask >> rank) & 1u;
     // Every rank whole, whatever the mask says: the reference has to be
     // independent of the thing it is checking.
     //
@@ -2037,8 +2029,17 @@ static void ggml_cuda_mixed_ar_launch(
         n_ranks >= 32 ? ~0u : ((1u << n_ranks) - 1),
         n_ranks >= 32 ? ~0u : ((1u << n_ranks) - 1));
     meet(GGML_CUDA_MIXED_AR_SIG_VERIFY_B);
-    ggml_cuda_mixed_ar_cmp_kernel<T><<<64, 256, 0, stream>>>(
-        reinterpret_cast<const T *>(group->verify_out[i]), data, ne, group->verify_counters[i]);
+    // Only where the tested path was supposed to produce a whole result.  A rank
+    // that skipped the gather on purpose holds something the reference does not,
+    // and calling that a difference would be reporting the feature as a fault.
+    if (my_result_is_whole) {
+        ggml_cuda_mixed_ar_cmp_kernel<T><<<64, 256, 0, stream>>>(
+            reinterpret_cast<const T *>(group->verify_out[i]), data, ne, group->verify_counters[i]);
+    }
+    // And carry on with what the tested path produced, not with the reference.
+    // Leaving the reference in place fills every copy and would hide exactly the
+    // reads that a skipped gather might break.
+    CUDA_CHECK(cudaMemcpyAsync(data, group->verify_out[i], nbytes, cudaMemcpyDeviceToDevice, stream));
 }
 
 bool ggml_cuda_mixed_ar_group_enqueue(
@@ -2097,17 +2098,21 @@ bool ggml_cuda_mixed_ar_group_enqueue(
         if (active_mask == 0) {
             active_mask = (group->n_ranks >= 32) ? ~0u : ((1u << group->n_ranks) - 1);
         }
-        // Who will read the result.  Under verification everyone does: the
-        // reference writes the whole result everywhere, so a rank that skipped
-        // the gather would show up as a difference that is not one.
+        // Who will read the result.  Verification does not widen this any more:
+        // forcing every rank to gather would have checked everything except the
+        // one thing the flag decides.  Ranks whose result is deliberately
+        // incomplete are skipped by the comparison instead.
+        const uint32_t all_ranks = (group->n_ranks >= 32) ? ~0u : ((1u << group->n_ranks) - 1);
         uint32_t needed_mask = 0;
-        for (size_t r = 0; r < group->n_ranks; ++r) {
-            if (tensors[r] && (tensors[r]->flags & GGML_TENSOR_FLAG_NEEDED)) {
-                needed_mask |= 1u << r;
+        if (group->skip_gather) {
+            for (size_t r = 0; r < group->n_ranks; ++r) {
+                if (tensors[r] && (tensors[r]->flags & GGML_TENSOR_FLAG_NEEDED)) {
+                    needed_mask |= 1u << r;
+                }
             }
         }
-        if (needed_mask == 0 || group->verify) {
-            needed_mask = (group->n_ranks >= 32) ? ~0u : ((1u << group->n_ranks) - 1);
+        if (needed_mask == 0) {
+            needed_mask = all_ranks;
         }
         int tail_owner = 0;
         for (size_t r = 0; r < group->n_ranks; ++r) {

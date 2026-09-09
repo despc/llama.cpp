@@ -1862,7 +1862,91 @@ contribution, so nothing about what an operation means had to change.
 
 **On its own it was worth nothing, and the measurement says why.** With 40 layers
 on the Blackwell pair and 25 owned by the Teslas, the collective still ran 384
-time
+times -- exactly as many as before -- and cost the same 3.0 s on the critical
+rank. Every layer was still reduced over four ranks, including the 25 where one
+card held everything and there was nothing to reduce. Prefill 367.9 tokens/s
+against 369.6, generation 51.9 against 63.3: pipeline serialisation added, no
+traffic removed.
+
+**The collective's active mask was the load-bearing half.** A rank whose slice is
+empty must not publish, must own no shard, and must not be waited for; it still
+needs the result, so it still gathers. The shard boundaries fall to the ranks
+that remain and the scalar tail follows the highest active rank rather than the
+highest rank. Both runtimes derive the mask from the same per-rank flags, so both
+reach the same one. That is what made placement pay: the same 40/25 split went
+from 367.9 to 581.3 tokens/s.
+
+**Skipping the transfer, not the summand.** A first version compacted the active
+ranks into the front of the array and reduced over the shorter list, on the
+argument that an exact zero folds out of a sum. The argument is wrong as stated:
+compacting reorders the butterfly. With ranks 0, 1 and 3 active, `a0 + (a1 + a3)`
+becomes `(a0 + a3) + a1`, and at 16777216, -16777216, 1 those give 1 and 0. The
+sets this repository actually runs -- {0,1}, {2,3}, and single owners -- happen to
+produce the same tree either way, but the interface allows the ones that do not,
+and the sign of zero is a second question the argument never addressed. So the
+positions and the tree are left exactly as they were and only the fetch is
+skipped: the inactive rank's zeros are written locally instead of read across the
+link. Bit-identity then holds by construction rather than by an argument about
+zeros, and the traffic saving -- which was the point -- is unchanged.
+
+**Then placement was tuned, and the constraint turned out to be KV.** Moving the
+boundary gave 545.7, 562.2 and 580.3 tokens/s at 32, 36 and 40 Blackwell layers,
+and ran out of memory at 44. The Blackwells hold 16.3 GiB and the model costs
+about 0.45 GiB a layer -- but a layer with KV costs another 1 GiB at this context,
+and only every fourth layer has KV. Giving the Teslas the KV-bearing layers
+rather than a contiguous block let the Blackwells hold 49 layers instead of 40:
+595.5. Keeping four of the KV layers on the Blackwells, which have room for about
+that many, gave 628.8.
+
+**Decode wanted the mask in the flat kernel.** Below the reduce-scatter threshold
+the collective runs the flat kernel, which had no mask at all, so decode kept
+paying for four ranks on layers that had two. Adding it took generation from 60.5
+to 66.5 tokens/s -- past the 63.3 it had before any of this.
+
+**And one idea that measured to nothing.** A device that computes nothing in the
+next subgraph has its copy of this result rewritten by the next collective before
+anything reads it, so gathering it here looked like pure traffic. The meta
+backend marks the node (`GGML_TENSOR_FLAG_NEEDED`) and the collective can skip
+the gather for ranks not marked. In the deployed configuration it is worth
+nothing at all: 623.3 against 625.2 tokens/s of prefill and 78.2 against 78.1 of
+generation, same output hash. It shipped in the same build as the flat-kernel
+mask above, and the decode gain was first credited to it; measuring it on its own
+gives that credit back.
+
+It is also off by default for a second reason. "Computes nothing in the next
+subgraph" is not "nothing reads this": a residual or a view can reach the tensor
+from further along, and the next collective rewrites its own output rather than
+necessarily this one. No such read was found in the 27B graph, but not finding
+one is not the same as there being none, so the flag needs a consumer analysis
+before it is worth switching on. `GGML_CUDA_MIXED_AR_SKIP_GATHER=1` turns it on
+for whoever wants to measure it again.
+
+| | prefill | generation |
+|---|---:|---:|
+| four-way tensor split, as deployed | 369.5 | 63.3 |
+| placement only | 367.9 | 51.9 |
+| + active mask in the reduce-scatter | 581.3 | 52.0 |
+| + KV-aware placement | 628.8 | 60.5 |
+| + active mask in the flat kernel | 625.9 | 66.5 |
+| + gather only where needed | 625.2 | 78.1 (nil on its own) |
+
+**Two holes in the verification, both found by this work.**
+
+The reference collective reused the tested call's token. During decode the tested
+path *is* the flat kernel, so the reference found the arrival words already set,
+its barrier passed without waiting, and it read whatever the slot held. With
+every rank publishing the same bytes that was invisible; with a mask, a rank that
+publishes nothing leaves the previous call's data there, and 115k elements came
+out different. The reference has its own token now, and the decode path is
+verified for the first time.
+
+And verification widened `needed_mask` to every rank, which checked everything
+except the one thing that flag decides -- then left the reference's result in the
+tensor, filling every copy and hiding exactly the reads a skipped gather might
+break. It now runs the real mask, compares only where the tested path was
+supposed to produce a whole result, and puts the tested path's result back before
+carrying on.
+
 ### Sharing rather than owning, and where it landed
 
 Giving a Tesla a layer outright means one slow card computes it while three
@@ -1889,6 +1973,14 @@ Against the four-way split this replaces: **prefill 369.5 -> 627.1, generation
 and clearing both variables restores the previous behaviour exactly, output hash
 included.
 
+The reduction shares are still four numbers and all four are still used:
+35/35/17/13 now means 35:35 between the Blackwells on the layers they share and
+17:13 between the Teslas on the layers they share, rather than one split across
+all four. They were tuned against a distribution of work that no longer exists
+and want re-measuring against this one -- 17:13 against 1:1 first, since the
+Teslas now share whole layers between themselves rather than taking a slice of
+everything.
+
 **Where the collective's time goes now.** It costs 1602 ms on the critical rank
 against 2786 before, and the shape has changed completely:
 
@@ -1908,9 +2000,18 @@ activation each needs to start its own layer.
 
 **What this does not reach.** A real `-sm layer` run does 942 tokens/s of prefill
 against this 627, and 47.6 of generation against 78.5. Expressing pure layer
-splitting through this mask gives 550.7 -- worse than either -- because a
-collective with one participant still publishes to host memory and the next
-owner reads it back, where layer splitting copies device to device once. So the
-hybrid is the better trade for a server and the worse one for a batch prefill,
-and the gap to `-sm layer` on prefill is a transfer the collective makes and a
-copy does not.
+splitting through this mask gives 550.7 -- worse than either. The obvious
+explanation is that a collective with one participant still publishes to host
+memory and the next owner reads it back where layer splitting copies device to
+device once; that is a hypothesis for a decomposition, not an established cause.
+The two arrangements also give the matrix operations different shapes, place the
+compute differently and synchronise differently, and none of that has been
+separated. What is measured is the trade: the hybrid is the better one for a
+server and the worse one for a batch prefill.
+
+**And a claim not to make.** That the collective is bit-exact under this
+placement says the reduction is what it was; it says nothing about the model's
+quality. Splitting a matrix two ways instead of four changes which partial sums
+exist and how each rounds, and fewer participants is not by itself more accurate.
+Nothing here measures output quality, and the deployed split changes the model's
+text -- an argument for measuring it, not for assuming either direction.

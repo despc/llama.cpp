@@ -1404,6 +1404,11 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
     // Compares every collective against the flat kernel elementwise.  Doubles
     // the traffic, so it is for checking, not for measuring.
     const uint32_t mixed_ar_verify = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_VERIFY") ? 1 : 0;
+    // Letting a rank skip the gather rests on the meta backend's marking, which
+    // says "computes nothing in the next subgraph" -- not "nothing reads this".
+    // Off until that gap is closed by analysis rather than by not having seen it
+    // break.
+    const uint32_t mixed_ar_skip_gather = ggml_env_flag_enabled("GGML_CUDA_MIXED_AR_SKIP_GATHER") ? 1 : 0;
 
     uint32_t mixed_ar_shares[GGML_CUDA_MIXED_AR_MAX_RANKS];
     for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
@@ -1481,7 +1486,7 @@ static bool ggml_backend_cuda_comm_init_mixed(ggml_backend_cuda_comm_context * r
             GGML_CUDA_MIXED_AR_SLOTS, GGML_CUDA_MIXED_AR_RANK_BYTES,
             mixed_ar_blocks, GGML_CUDA_MIXED_AR_SIGNAL_STRIDE,
             mixed_ar_stream_min, mixed_ar_rs_min, mixed_ar_chunk,
-            mixed_ar_rs_blocks, mixed_ar_verify,
+            mixed_ar_rs_blocks, mixed_ar_verify, mixed_ar_skip_gather,
             {},
         };
         for (int i = 0; i < GGML_CUDA_MIXED_AR_MAX_RANKS; ++i) {
