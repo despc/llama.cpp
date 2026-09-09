@@ -1820,9 +1820,9 @@ bottleneck model.
 the bytes rather than sending them faster. Per-layer participation took prefill
 from 369.5 to 627.1 tokens/s and generation from 63.3 to 78.5 -- see *Per-layer
 participation* below, which supersedes the sentence above about where the levers
-are. The shares did want re-measuring and still do: 35/35/17/13 now applies only
-to the layers the Blackwell pair shares, where two of the four numbers are never
-used.
+are. The shares did want re-measuring and still do: all four numbers are still used,
+but they no longer describe one split across four cards -- 35:35 applies between
+the Blackwells on the layers they share and 17:13 between the Teslas on theirs.
 
 **Not worth revisiting without new hardware.** Direct device-to-device transfer
 (1.38 GB/s against 3.29 through the host on the Tesla pair, unavailable on the
@@ -1921,14 +1921,26 @@ one is not the same as there being none, so the flag needs a consumer analysis
 before it is worth switching on. `GGML_CUDA_MIXED_AR_SKIP_GATHER=1` turns it on
 for whoever wants to measure it again.
 
-| | prefill | generation |
-|---|---:|---:|
-| four-way tensor split, as deployed | 369.5 | 63.3 |
-| placement only | 367.9 | 51.9 |
-| + active mask in the reduce-scatter | 581.3 | 52.0 |
-| + KV-aware placement | 628.8 | 60.5 |
-| + active mask in the flat kernel | 625.9 | 66.5 |
-| + gather only where needed | 625.2 | 78.1 (nil on its own) |
+Two things changed along the way and they are easy to conflate, so they are
+listed apart. The mechanism steps are changes to the collective, each measured at
+a fixed placement; the placement steps are changes to which card holds what, each
+measured on the mechanism of the row above it.
+
+| step | kind | prefill | generation |
+|---|---|---:|---:|
+| four-way tensor split, as deployed | -- | 369.5 | 63.3 |
+| 40 layers to the Blackwells, 25 to the Teslas | placement | 367.9 | 51.9 |
+| active mask in the reduce-scatter | mechanism | 581.3 | 52.0 |
+| KV-bearing layers to the Teslas, one each | placement | 628.8 | 60.5 |
+| active mask in the flat kernel | mechanism | 625.9 | 66.5 |
+| the Tesla pair shares those layers | placement | 625.0 | **78.4** |
+
+The last row is a placement change, not a mechanism one: giving the pair a layer
+rather than giving one Tesla the whole of it is what took generation from 66.5 to
+78.4. An earlier version of this table put that step under "gather only where
+needed", which shipped in the same period and, measured on its own at the
+deployed split, is worth nothing: 625.2 against 623.3 tokens/s of prefill and
+78.1 against 78.2 of generation, same output hash.
 
 **Two holes in the verification, both found by this work.**
 
@@ -1991,12 +2003,21 @@ against 2786 before, and the shape has changed completely:
 | V100 SXM2 | 1602 | 5.6% | 7.4% | 9.4% | 3.6% | **74.0%** |
 | V100 PCIe | 1593 | 7.4% | 7.5% | 7.1% | 12.8% | **65.3%** |
 
-The Teslas now spend two thirds of their collective gathering. They publish and
-reduce almost nothing -- they own twelve layers out of sixty-five -- so what is
-left is fetching results, and the next thing worth attacking is which of those
-fetches are real. The `NEEDED` flag already drops the ones for layers they take
-no part in; what remains is the pair fetching each other's half, plus the
-activation each needs to start its own layer.
+Measured with `GGML_CUDA_MIXED_AR_SKIP_GATHER=1`, which was the behaviour at the
+time and is not the default now -- the flag was made opt-in afterwards, for the
+reasons above. So this is the profile of a configuration with the gather skip on;
+since the skip measures at nothing in throughput the shape is unlikely to differ
+much, but that is an expectation and not a measurement, and the profile under the
+default has not been taken.
+
+What it does show is that the Teslas spend two thirds of their collective
+gathering. They publish and reduce almost nothing -- they own twelve layers out of
+sixty-five -- so what is left is fetching results, and the next thing worth
+attacking is which of those fetches are real. A single percentage does not say:
+the exchange inside the Blackwell pair, the exchange inside the Tesla pair, and
+the activation crossing between pairs are three different things and want
+separating, with bytes and time recorded for each alongside the masks and the
+size.
 
 **What this does not reach.** A real `-sm layer` run does 942 tokens/s of prefill
 against this 627, and 47.6 of generation against 78.5. Expressing pure layer
