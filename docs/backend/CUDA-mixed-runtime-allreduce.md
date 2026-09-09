@@ -2313,3 +2313,47 @@ it is needed, zeros substituted in place, and only publishing ranks awaited).
 
 Worth keeping in view when this collective meets a model with an odd hidden size,
 or a wire type where the vector holds eight.
+
+### What actually crosses the boundary, 2026-09-09
+
+Before building anything, the question the failed single-subgraph skip left open:
+which values really leave a region a device could sit out. `GGML_META_DEPS=span`
+or `span:phase` walks every region of that many consecutive subgraphs, finds the
+ones where a device owns no slice of anything, and lists every value produced
+inside that a node computed elsewhere reads -- excluding the region's own output,
+which the collective already delivers.
+
+The answer is one edge, and always the same one:
+
+    attn_residual-N  <-  l_out-N
+
+The attention residual, produced in a layer's attention part and read by the
+layer's output in its feed-forward part. Nothing else escapes: no saved state,
+no view onto anything, no MTP consumer, no intermediate read from a later layer.
+That is a narrower obstacle than the earlier attempt suggested, and it is the
+named dependency the review asked for rather than a count.
+
+It is also not removed by making the region bigger. Regions of two and three
+subgraphs, at every phase, give **no clean region at all** -- 0 of 52, 0 of 40,
+0 of 27, 0 of 27, 0 of 26. A fixed number of subgraphs always cuts some layer
+between its attention and its feed-forward, and that cut is exactly where the
+residual crosses. This model has 49 recurrent layers and 16 attention ones in 129
+subgraphs, so no constant stride aligns with the structure.
+
+So a region that could be skipped has to be delimited by the layer, not by a
+count -- from the boundary before a layer's attention to the boundary after its
+feed-forward. That is a design step, not a measurement, and it is where this
+stops for now.
+
+**A correction to the attempt that preceded this.** The earlier skip reported 103
+of 104 idle subgraphs blocked by a later reader. That test collected readers
+without checking whether the reading device computes them, so it counted reads
+that never happen. The conclusion it supported -- that the residual blocks the
+narrow skip -- survives, and is now backed by the edge itself rather than by a
+count that was too large.
+
+And a caution about this diagnostic, which had the same class of fault twice
+before it gave an answer: the first version compared meta tensors against
+per-device sources, which are different objects, so nothing ever matched and it
+reported every region clean. Identity has to come from the same side as the
+sources being searched.

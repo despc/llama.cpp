@@ -2485,6 +2485,115 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    // What actually crosses the boundary of a region a device could sit out.
+    //
+    // Analysis only, printed once, changing nothing.  Skipping a single subgraph
+    // was refused by 103 of 104 idle subgraphs because a residual reaches back
+    // past the boundary -- but this model's residuals span attention and the
+    // feed-forward inside one layer, so a region of several subgraphs may hold
+    // them.  Before building anything, the question is which tensors really
+    // leave such a region: the layer's output, which the collective already
+    // delivers, or something else.
+    //
+    // GGML_META_DEPS=<n> takes regions of n consecutive subgraphs.
+    if (const char * deps_env = getenv("GGML_META_DEPS")) {
+        static bool said = false;
+        // "span" or "span:offset" -- the phase matters, because a region that
+        // cuts a layer in half leaves its attention residual crossing the cut.
+        const int span = std::max(1, atoi(deps_env));
+        const char * colon = strchr(deps_env, ':');
+        const int phase = colon ? std::max(0, atoi(colon + 1)) : 0;
+        if (!said && n_backends > 1 && backend_ctx->n_subgraphs > (size_t) (span + phase)) {
+            said = true;
+            auto base_of = [](ggml_tensor * t) {
+                while (t && t->view_src) { t = t->view_src; }
+                return t;
+            };
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                size_t idle_regions = 0, clean_regions = 0;
+                std::map<std::string, size_t> blockers;   // producer name -> times seen
+                for (size_t a = phase; a + span <= backend_ctx->n_subgraphs; a += span) {
+                    const size_t b = a + span;   // region is [a, b)
+                    // idle: owns no slice of anything with a real split axis
+                    bool owns = false;
+                    std::unordered_set<const ggml_tensor *> inside;
+                    ggml_tensor * region_out = nullptr;
+                    for (size_t k = a; k < b; k++) {
+                        ggml_cgraph * cg = bcj.cgraphs[k].cgraph_main;
+                        const int off = bcj.cgraphs[k].offset;
+                        for (int n = 0; n < cg->n_nodes; n++) {
+                            ggml_tensor * meta_node = cgraph->nodes[off + n];
+                            // identity must be the per-device tensor, which is
+                            // what a consumer's src points at; the meta node is
+                            // only good for the name
+                            inside.insert(base_of(cg->nodes[n]));
+                            if (k + 1 == b && n + 1 == cg->n_nodes) {
+                                region_out = base_of(cg->nodes[n]);
+                            }
+                            if (!owns && meta_node->buffer && ggml_backend_buffer_is_meta(meta_node->buffer)) {
+                                const ggml_backend_meta_split_state ss =
+                                    ggml_backend_meta_get_split_state(meta_node, false);
+                                if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+                                    int64_t sum = 0;
+                                    for (size_t sg = 0; sg < ss.n_segments; sg++) {
+                                        sum += ss.ne[sg*n_backends + j] * ss.nr[sg];
+                                    }
+                                    owns = sum > 0;
+                                }
+                            }
+                        }
+                    }
+                    if (owns) {
+                        continue;
+                    }
+                    idle_regions++;
+                    bool clean = true;
+                    for (size_t k = 0; k < backend_ctx->n_subgraphs; k++) {
+                        if (k >= a && k < b) {
+                            continue;
+                        }
+                        ggml_cgraph * cg = bcj.cgraphs[k].cgraph_main;
+                        const int off = bcj.cgraphs[k].offset;
+                        for (int n = 0; n < cg->n_nodes; n++) {
+                            if ((cg->nodes[n]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                                continue;
+                            }
+                            for (int x = 0; x < GGML_MAX_SRC; x++) {
+                                ggml_tensor * src = cg->nodes[n]->src[x];
+                                if (!src) {
+                                    continue;
+                                }
+                                ggml_tensor * bs = base_of(src);
+                                if (!inside.count(bs) || bs == region_out) {
+                                    continue;   // outside, or the output the collective delivers
+                                }
+                                clean = false;
+                                blockers[std::string(bs->name) + " <- " +
+                                         std::string(cg->nodes[n]->name)]++;
+                            }
+                        }
+                    }
+                    clean += 0;
+                    if (clean) {
+                        clean_regions++;
+                    }
+                }
+                GGML_LOG_WARN("meta_deps backend=%s span=%d phase=%d: %zu idle regions, %zu with no "
+                              "escaping value other than the region output\n",
+                              ggml_backend_name(bcj.backend), span, phase, idle_regions, clean_regions);
+                size_t shown = 0;
+                for (const auto & kv : blockers) {
+                    if (shown++ >= 12) {
+                        GGML_LOG_WARN("meta_deps   ... %zu more distinct edges\n", blockers.size() - shown + 1);
+                        break;
+                    }
+                    GGML_LOG_WARN("meta_deps   escapes x%-5zu %s\n", kv.second, kv.first.c_str());
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
