@@ -255,3 +255,64 @@ No generic quality benchmark proves absence of regressions on all inputs. A futu
 - Dense-27B tensor-parallel work is separate: [CUDA mixed-runtime AllReduce](CUDA-mixed-runtime-allreduce.md). Do not apply its bottleneck model to this layer-split workload. One result from it is worth knowing here, because it is the shape of answer this plan's policy asks for: the mixed AllReduce kernel now reduces on the same butterfly tree as the meta backend, publishes in overlapped chunks, and reduce-scatters a shard per rank instead of having every rank reduce everything. Prefill there went 187.5 -> 390 tokens/s against the meta backend, every step of it bit-identical to the reference reduction -- and, since 2026-09-08, checked elementwise rather than by matching output text. That work is now closed on the transport side: the link's spare direction was measured, built against three ways, and found to cost more to reach than it yields -- the code was removed and the question should not be reopened here either. The lesson that does transfer is the method: a control that changes one thing at a time, and an elementwise comparison rather than matching output text. An optimisation that cannot change the result is admissible without a quality argument, because there is nothing left to measure.
 
 Next concrete work: P0 baseline validation, then P1 selection-contract tests before implementing faster TOP_K. No GPU experiments or runtime changes were performed for this cleanup.
+
+## Decode profiled at a short context, 2026-09-09
+
+The decode shares recorded earlier in this plan were taken after 150k tokens,
+where attention was 25.6% and TOP_K 17.7%. At a short context the picture is not
+a smaller version of that one -- it is a different picture, and worth having
+because most requests do not start at 150k.
+
+`GGML_CUDA_OP_PROFILE=1`, a 20-token prompt and 600 generated. The profiler
+synchronises after every node and disables CUDA graphs, so the run itself fell
+from about 50 to 23.7 tokens/s: the shares below are for comparing operations
+against each other, never for a critical path.
+
+**The Teslas are 78% of summed GPU time**, 9710 ms against 2759 on the
+Blackwells.
+
+By component:
+
+| | GPU share | launches a token |
+|---|---:|---:|
+| expert matmuls (`ffn_moe_*`, `ffn_shexp`) | 23.8% | 341 |
+| linear attention (`z`, `linear_attn_out`, conv, gates) | 7.9% | 125 |
+| hyper-connections (`hc_*`) | 6.9% | 259 |
+| output head (`result_output`) | 5.1% | 2 |
+| full attention (`Qcur`, `attn_*`) | 3.6% | 42 |
+| TOP_K | 1.2% | 5 |
+| unnamed intermediates and the rest | 52.7% | -- |
+
+Attention and TOP_K, the two candidates the 150k profile pointed at, are almost
+invisible here. What replaces them is not another operation but the sheer number
+of them.
+
+**2278 kernel launches a token, averaging 9.1 microseconds of GPU work each.**
+
+| | GPU share | launches a token | mean kernel |
+|---|---:|---:|---:|
+| matmuls | 54.4% | 562 | 20.1 us |
+| elementwise (ADD, MUL, SCALE, UNARY, RMS_NORM, ...) | 33.9% | 1442 | 4.9 us |
+| everything else | 11.7% | 274 | 8.9 us |
+
+A third of the time goes to 1442 kernels a token that each do about five
+microseconds of work. And there is no hot spot to attack: the ten most expensive
+rows are 7.2% of GPU time between them, the top fifty are 13.2%, and it takes a
+thousand rows to reach 62.6%. Per token that is 248 `ADD`, 173 `SCALE`, 146
+`UNARY` and 103 `RMS_NORM` calls.
+
+So at this context decode is shaped by how many kernels there are rather than by
+how fast any of them is, which is also why CUDA graphs matter so much: the
+uninstrumented run is twice the profiled one, and that difference is launch
+overhead the graph removes. The lever here would be fewer and larger kernels --
+fusion -- and the honest starting question is which of these families can be
+fused at all, not which is largest.
+
+One family stands out for the ratio rather than the total: hyper-connections take
+6.9% of the time across 259 launches a token, more launches than the expert
+matmuls need for three times the work. The output head is the opposite -- 5.1% in
+two launches -- and nothing there is going to be improved by fusing.
+
+None of this is a measurement of production latency, and it is a short context.
+The 150k profile in this plan still describes long-context decode; neither
+replaces the other.
