@@ -44,17 +44,13 @@ list(APPEND GGML_SOURCES_V100_CUDA ${SRCS})
 file(GLOB SRCS "${GGML_V100_CUDA_DIR}/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_V100_CUDA ${SRCS})
 
-if (GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB SRCS "${GGML_V100_CUDA_DIR}/template-instances/fattn-vec*.cu")
-    list(APPEND GGML_SOURCES_V100_CUDA ${SRCS})
-    add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-else()
-    list(APPEND GGML_SOURCES_V100_CUDA
-        ${GGML_V100_CUDA_DIR}/template-instances/fattn-vec-instance-f16-f16.cu
-        ${GGML_V100_CUDA_DIR}/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ${GGML_V100_CUDA_DIR}/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ${GGML_V100_CUDA_DIR}/template-instances/fattn-vec-instance-bf16-bf16.cu)
-endif()
+# The same selection the CUDA backend makes, from the same GGML_CUDA_FA_QUANTS.  The
+# kernels are chosen by `if constexpr (GGML_CUDA_FA_<K>_<V>)` in fattn.cu now, so this
+# backend has to get those definitions as well as the matching instances -- a
+# hand-kept list here compiles the sources without the definitions and fails to
+# build, and an out-of-step one would give the two CUDA runtimes different kernels.
+ggml_cuda_fattn_vec_instances(${GGML_V100_CUDA_DIR} SRCS)
+list(APPEND GGML_SOURCES_V100_CUDA ${SRCS})
 
 # Headers (for IDE / install purposes).
 file(GLOB GGML_HEADERS_V100_CUDA "${GGML_V100_CUDA_DIR}/*.cuh")

@@ -316,3 +316,57 @@ two launches -- and nothing there is going to be improved by fusing.
 None of this is a measurement of production latency, and it is a short context.
 The 150k profile in this plan still describes long-context decode; neither
 replaces the other.
+
+## Upstream sync 2026-09-15: one change moves Flash-Next's output
+
+128 upstream commits merged. Compared build against build on the same
+deterministic request (9053-token prompt, 600 generated, greedy), hashing
+reasoning and content together:
+
+| | 27B, 1253 tokens | 27B, 9053 tokens | Flash-Next, 9053 tokens |
+|---|---|---|---|
+| output | identical | identical | **changed** |
+| prefill | 611.7 -> 611.8 | 715.9 -> 715.5 | 851.0 -> 865.6 |
+| generation | 68.5 -> 68.1 | 70.0 -> 70.2 | 49.7 -> 49.4 |
+
+The collective verifier on the merged 27B build: 1,097,072,640 elements a rank,
+zero differences.
+
+Flash-Next's output moved, and speculative decoding under greedy sampling cannot
+move it on its own -- the draft changes what is proposed, never what is accepted --
+so the trunk's arithmetic changed. Bisected:
+
+| build | fusion | BF16 path | output |
+|---|---|---|---|
+| old | off | old | `cd1a524eb709` |
+| new | off | **kept** | `cd1a524eb709` -- identical |
+| old | on | old | `51017a7e6a09` |
+| new | on | **kept** | `51017a7e6a09` -- identical |
+| new | on | upstream | `dd1770c73104` |
+
+So it is one upstream change and only one: `ad6c66839`, which moves cuBLAS
+matmuls with a BF16 compute type to F32 on devices without BF16 hardware -- NVIDIA
+before Ampere, which here means the Teslas -- once a batch exceeds eight rows.
+Flash-Next carries 24 BF16 tensors, all of them QSA indexer projections
+(`indexer.k_proj`, `indexer.q_proj`), and with `-ts 146,175,345,334` about nine of
+its twelve indexer layers sit on the Teslas. The indexer decides which cache
+positions attention reads, so a change in its scores reaches everything after
+it. The 27B is pure Q8_0 and has no BF16 to move.
+
+The other candidate, `41abbfd59`'s RMS_NORM + MUL fusion for qwen4exp, changes
+nothing numerically: with the BF16 path held fixed, the fused and unfused-era
+builds agree exactly.
+
+**The direction of the change matters for the policy.** F32 compute cannot be less
+precise than BF16 compute over the same BF16 weights -- it removes a rounding step
+from the accumulation rather than adding one. So this is not the compact-attention
+case, where output moved because the arithmetic was approximated. It is output
+moving because the arithmetic got more exact, and it is also 1.7% faster at
+prefill. `GGML_CUDA_KEEP_BF16=1` restores the previous compute type, so output
+identity with the pre-sync build is one variable away.
+
+Two merge hazards found on the way, both recorded in the sync policy: upstream's
+`qwen4exp.cpp` has no NextN/MTP loading at all, so the old rule of taking that
+file from upstream wholesale would have removed MTP from production; and the
+V100 backend's CMake keeps its own source list, which missed upstream's move of
+FlashAttention kernel selection to `if constexpr (GGML_CUDA_FA_<K>_<V>)`.
