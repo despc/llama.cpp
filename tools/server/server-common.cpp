@@ -13,6 +13,7 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <cctype>
 #include <cstring>
 #include <type_traits>
 #include <chrono>
@@ -1354,48 +1355,100 @@ json oaicompat_chat_params_parse(
         }
     }
 
-    // Which reasoning effort this request ends up with, and where it came from.  It
-    // can arrive three ways, in rising precedence -- the server's --reasoning-effort
-    // default, a "reasoning_effort" key inside the request's chat_template_kwargs,
-    // and the top-level OAI field (which /v1/responses maps reasoning.effort onto) --
-    // and when none is given the chat template applies its own default, which for
-    // Qwen3.8 is "xhigh".  Logged per request so a client's effort is visible without
-    // capturing its traffic.
+    // Reasoning effort, logged once per request: what came in and what reaches the
+    // model.
+    //
+    // It can come in three ways, in rising precedence -- the server's
+    // --reasoning-effort default, a "reasoning_effort" key inside the request's
+    // chat_template_kwargs, and the top-level OAI field, which /v1/responses maps
+    // reasoning.effort onto.
+    //
+    // What reaches the model is up to the chat template, not this code, so it is
+    // read back out of the rendered prompt rather than predicted.  Qwen3.8's template
+    // turns "high" into "xhigh", writes no instruction at all for "medium", and
+    // rejects anything outside xhigh/medium/low; other templates do other things.
+    std::string effort_in;
     {
         const bool top_level = body.contains("reasoning_effort") &&
                                !json_value(body, "reasoning_effort", std::string("")).empty();
         const bool in_kwargs = chat_template_kwargs_object.contains("reasoning_effort");
         const bool cli       = opt.chat_template_kwargs.count("reasoning_effort") > 0;
 
-        std::string effective = "(unset: template default)";
-        if (top_level && json_value(body, "reasoning_effort", std::string("")) == "none") {
-            effective = "none (reasoning disabled)";   // erased above, not left to the template
-        }
-        auto it = inputs.chat_template_kwargs.find("reasoning_effort");
-        if (it != inputs.chat_template_kwargs.end()) {
-            // stored JSON-encoded; show the bare value when it is a string
-            try {
-                const json v = json::parse(it->second);
-                effective = v.is_string() ? v.get<std::string>() : it->second;
-            } catch (const std::exception &) {
-                effective = it->second;
+        std::string value = "(none)";
+        if (top_level) {
+            value = json_value(body, "reasoning_effort", std::string(""));
+        } else {
+            auto it = inputs.chat_template_kwargs.find("reasoning_effort");
+            if (it != inputs.chat_template_kwargs.end()) {
+                // stored JSON-encoded; show the bare value when it is a string
+                try {
+                    const json v = json::parse(it->second);
+                    value = v.is_string() ? v.get<std::string>() : it->second;
+                } catch (const std::exception &) {
+                    value = it->second;
+                }
             }
         }
-
-        const char * source = top_level ? "request field reasoning_effort"
+        const char * source = top_level ? "request field"
                             : in_kwargs ? "request chat_template_kwargs"
-                            : cli       ? "server default --reasoning-effort"
+                            : cli       ? "server --reasoning-effort"
                             :             "not given";
-        std::string sent = top_level ? json_value(body, "reasoning_effort", std::string("")) : std::string("-");
-
-        SRV_INF("reasoning_effort = %s (source: %s, request field: %s), enable_thinking = %s\n",
-                effective.c_str(), source, sent.c_str(), inputs.enable_thinking ? "true" : "false");
+        effort_in = value + " (" + source + "), enable_thinking=" + (inputs.enable_thinking ? "true" : "false");
     }
 
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    common_chat_params chat_params;
+    try {
+        chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    } catch (const std::exception & e) {
+        // The template refused the request, so nothing reaches the model; say so with
+        // what came in before the error goes back to the client.  The engine wraps the
+        // template's own message in a multi-line trace that starts with a newline, so
+        // printed whole it leaves this line empty -- take the message itself.
+        std::string reason = e.what();
+        const std::string mark = "Jinja Exception: ";
+        size_t at = reason.find(mark);
+        if (at != std::string::npos) {
+            reason = reason.substr(at + mark.size());
+        } else {
+            // otherwise the last non-empty line carries the cause
+            size_t end = reason.find_last_not_of("\n \t");
+            reason = end == std::string::npos ? std::string() : reason.substr(0, end + 1);
+            size_t nl = reason.find_last_of('\n');
+            if (nl != std::string::npos) {
+                reason = reason.substr(nl + 1);
+            }
+        }
+        reason = reason.substr(0, reason.find('\n'));
+        SRV_WRN("reasoning_effort: in = %s -> model: rejected by the chat template: %s\n",
+                effort_in.c_str(), reason.c_str());
+        throw;
+    }
+
+    {
+        // The instruction the template wrote into the prompt, as the model will see it.
+        // Qwen3.8 writes "Reasoning effort is set to <level>."; harmony-format templates
+        // write "Reasoning: <level>".  The first occurrence is the template's own, since
+        // the system block comes before any message text.
+        const std::string & prompt = chat_params.prompt;
+        std::string to_model = "no reasoning-effort instruction in the prompt";
+        for (const char * marker : { "Reasoning effort is set to ", "\nReasoning: " }) {
+            size_t pos = prompt.find(marker);
+            if (pos == std::string::npos) {
+                continue;
+            }
+            pos += strlen(marker);
+            size_t end = pos;
+            while (end < prompt.size() && (isalnum((unsigned char) prompt[end]) || prompt[end] == '-' || prompt[end] == '_')) {
+                ++end;
+            }
+            to_model = prompt.substr(pos, end - pos);
+            break;
+        }
+        SRV_INF("reasoning_effort: in = %s -> model: %s\n", effort_in.c_str(), to_model.c_str());
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
