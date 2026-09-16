@@ -1354,6 +1354,44 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    // Which reasoning effort this request ends up with, and where it came from.  It
+    // can arrive three ways, in rising precedence -- the server's --reasoning-effort
+    // default, a "reasoning_effort" key inside the request's chat_template_kwargs,
+    // and the top-level OAI field (which /v1/responses maps reasoning.effort onto) --
+    // and when none is given the chat template applies its own default, which for
+    // Qwen3.8 is "xhigh".  Logged per request so a client's effort is visible without
+    // capturing its traffic.
+    {
+        const bool top_level = body.contains("reasoning_effort") &&
+                               !json_value(body, "reasoning_effort", std::string("")).empty();
+        const bool in_kwargs = chat_template_kwargs_object.contains("reasoning_effort");
+        const bool cli       = opt.chat_template_kwargs.count("reasoning_effort") > 0;
+
+        std::string effective = "(unset: template default)";
+        if (top_level && json_value(body, "reasoning_effort", std::string("")) == "none") {
+            effective = "none (reasoning disabled)";   // erased above, not left to the template
+        }
+        auto it = inputs.chat_template_kwargs.find("reasoning_effort");
+        if (it != inputs.chat_template_kwargs.end()) {
+            // stored JSON-encoded; show the bare value when it is a string
+            try {
+                const json v = json::parse(it->second);
+                effective = v.is_string() ? v.get<std::string>() : it->second;
+            } catch (const std::exception &) {
+                effective = it->second;
+            }
+        }
+
+        const char * source = top_level ? "request field reasoning_effort"
+                            : in_kwargs ? "request chat_template_kwargs"
+                            : cli       ? "server default --reasoning-effort"
+                            :             "not given";
+        std::string sent = top_level ? json_value(body, "reasoning_effort", std::string("")) : std::string("-");
+
+        SRV_INF("reasoning_effort = %s (source: %s, request field: %s), enable_thinking = %s\n",
+                effective.c_str(), source, sent.c_str(), inputs.enable_thinking ? "true" : "false");
+    }
+
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
