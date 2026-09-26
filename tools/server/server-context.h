@@ -173,7 +173,7 @@ private:
     // --check-model-name: a request naming a model this server did not load gets a 404 instead of
     // being served by whatever is loaded. Returns the error response, or nullptr to let it proceed.
     std::unique_ptr<server_res_generator> reject_unknown_model(const server_http_req & req);
-    std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type);
+    std::unique_ptr<server_res_generator> handle_count_tokens(const server_http_req & req, task_response_type res_type);
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;

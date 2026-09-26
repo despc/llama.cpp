@@ -113,7 +113,7 @@ bool ggml_cuda_mixed_ar_group_prepare(void * context, size_t slot);
 bool ggml_cuda_mixed_ar_group_enqueue(void * context, ggml_tensor ** tensors, size_t slot, uint32_t token);
 
 // Allocate a pipeline for n_devices GPUs.
-// devices[] holds the CUDA device IDs in rank order.
+// devices[] holds the GPU device IDs in rank order.
 // Returns nullptr on allocation failure.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(
     const int * devices, size_t n_devices);
