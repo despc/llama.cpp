@@ -1006,7 +1006,38 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
     return talloc->size_max >= node_size;
 }
 
+// GGML_GALLOC_REALLOC_DEBUG=1: print why a graph cannot reuse the previous plan (each re-plan syncs all backends)
+static int ggml_gallocr_realloc_debug(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_GALLOC_REALLOC_DEBUG"); v = e ? atoi(e) : 0; }
+    return v;
+}
+
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (ggml_gallocr_realloc_debug()) {
+        if (galloc->n_nodes != graph->n_nodes || galloc->n_leafs != graph->n_leafs) {
+            fprintf(stderr, "galloc_realloc: topology nodes %d -> %d, leafs %d -> %d\n", galloc->n_nodes, graph->n_nodes, galloc->n_leafs, graph->n_leafs);
+        } else {
+            for (int i = 0; i < graph->n_nodes; i++) {
+                struct ggml_tensor * node = graph->nodes[i];
+                struct node_alloc * na = &galloc->node_allocs[i];
+                if (!ggml_gallocr_node_needs_realloc(galloc, node, &na->dst)) {
+                    fprintf(stderr, "galloc_realloc[g%d]: node %d %s (%s) planned %zu needs %zu\n", graph->n_nodes, i, node->name, ggml_op_desc(node),
+                            na->dst.size_max, ggml_backend_buft_get_alloc_size(galloc->bufts[na->dst.buffer_id], node));
+                    break;
+                }
+                int bad = 0;
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    struct ggml_tensor * src = node->src[j];
+                    if (src && !ggml_gallocr_node_needs_realloc(galloc, src, &na->src[j])) {
+                        fprintf(stderr, "galloc_realloc[g%d]: src %d %s of node %s planned %zu\n", graph->n_nodes, j, src->name, node->name, na->src[j].size_max);
+                        bad = 1; break;
+                    }
+                }
+                if (bad) break;
+            }
+        }
+    }
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);

@@ -4745,6 +4745,30 @@ struct ggml_cuda_op_profile {
     }
 };
 
+// GGML_CUDA_HOST_BLOCK_PROFILE: host time spent in each op launch, printed at exit. Adds no sync;
+// a slow launch is an op that blocks the host (stream sync, device-to-host read, pool growth).
+struct ggml_cuda_host_block_table {
+    struct stat { int64_t calls = 0; double us = 0, max_us = 0; };
+    std::map<std::pair<int, std::string>, stat> rows;
+    std::mutex mtx;
+    ~ggml_cuda_host_block_table() {
+        if (rows.empty()) return;
+        std::vector<std::pair<std::pair<int, std::string>, stat>> v(rows.begin(), rows.end());
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
+        double tot = 0; for (auto & r : v) tot += r.second.us;
+        fprintf(stderr, "host_block backend=%s total_ms=%.1f\n", GGML_CUDA_NAME, tot/1e3);
+        for (size_t i = 0; i < v.size() && i < 40; ++i) {
+            fprintf(stderr, "host_block backend=%s device=%d op=%-28s calls=%-8lld host_ms=%9.2f max_ms=%7.2f\n", GGML_CUDA_NAME, v[i].first.first,
+                    v[i].first.second.c_str(), (long long) v[i].second.calls, v[i].second.us/1e3, v[i].second.max_us/1e3);
+        }
+    }
+};
+static ggml_cuda_host_block_table g_cuda_host_block;
+static bool ggml_cuda_host_block_enabled() {
+    static const bool enabled = ggml_env_flag_enabled("GGML_CUDA_HOST_BLOCK_PROFILE");
+    return enabled;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4915,7 +4939,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                const int64_t hb_t0 = ggml_cuda_host_block_enabled() ? ggml_time_us() : 0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (ggml_cuda_host_block_enabled()) {
+                    const double dt = (double) (ggml_time_us() - hb_t0);
+                    std::string key = std::string(ggml_op_desc(node)) + ":" + std::string(node->name).substr(0, std::string(node->name).find('-'));
+                    std::lock_guard<std::mutex> lk(g_cuda_host_block.mtx);
+                    auto & st = g_cuda_host_block.rows[{cuda_ctx->device, key}];
+                    st.calls++; st.us += dt; st.max_us = std::max(st.max_us, dt);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5001,7 +5033,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
-            if (!graph->warmup_complete) {
+            // GGML_CUDA_GRAPH_ALWAYS_CAPTURE: capture also when the shape changed. An eager prefill split holds the host
+            // in the launch queue until the device is nearly done, so no later split can be queued in the meantime.
+            static const bool always_capture = ggml_env_flag_enabled("GGML_CUDA_GRAPH_ALWAYS_CAPTURE");
+            if (always_capture) {
+                graph->warmup_complete = true;
+                use_cuda_graph = true;
+                cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+            } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;

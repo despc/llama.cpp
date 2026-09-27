@@ -1439,13 +1439,14 @@ struct ubatch_phase_profile {
     bool     enabled = ggml_env_flag_enabled("LLAMA_UBATCH_PROFILE");
     int64_t  calls   = 0;
     int64_t  reused  = 0;
-    double   build_ms = 0, alloc_ms = 0, inputs_ms = 0, compute_ms = 0, sync_ms = 0, apply_ms = 0, reuse_wait_ms = 0;
+    double   build_ms = 0, alloc_ms = 0, inputs_ms = 0, compute_ms = 0, sync_ms = 0, apply_ms = 0, reuse_wait_ms = 0, decode_ms = 0;
 
     ~ubatch_phase_profile() {
         if (!enabled || calls == 0) {
             return;
         }
         const double total = apply_ms + build_ms + alloc_ms + inputs_ms + compute_ms + sync_ms + reuse_wait_ms;
+        LLAMA_LOG_WARN("ubatch_profile decode_total=%.0f ms (whole llama_decode calls; the rest of it is outside process_ubatch)\n", decode_ms);
         LLAMA_LOG_WARN("ubatch_profile calls=%" PRId64 " reused=%" PRId64 " total=%.0f ms"
                        " | apply=%.0f build=%.0f alloc=%.0f reuse_wait=%.0f set_inputs=%.0f submit=%.0f sync=%.0f\n",
                        calls, reused, total, apply_ms, build_ms, alloc_ms, reuse_wait_ms, inputs_ms, compute_ms, sync_ms);
@@ -1488,7 +1489,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // LLAMA_REUSE_NOSYNC: skip it. The scheduler already waits per split for the previous use of the copy slot,
+        // and the global wait stops the first device from starting ubatch k+1 before the last one finishes ubatch k.
+        static const bool reuse_nosync = getenv("LLAMA_REUSE_NOSYNC") != nullptr;
+        if (cparams.pipeline_parallel && !reuse_nosync) {
             phase_timer t(&g_ubatch_profile.reuse_wait_ms);
             ggml_backend_sched_synchronize(sched.get());
         }
@@ -1821,6 +1825,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    phase_timer decode_timer(&g_ubatch_profile.decode_ms);
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2004,7 +2009,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // otherwise exist here, so the profiler creates one -- and only the profiler.
         // The sync figure it reports is therefore the wait made visible, not a wait
         // the uninstrumented path performs.
-        if (g_ubatch_profile.enabled) {
+        // LLAMA_UBATCH_PROFILE_NOSYNC: do not add this sync, to see where the host blocks on its own
+        static const bool profile_nosync = getenv("LLAMA_UBATCH_PROFILE_NOSYNC") != nullptr;
+        if (g_ubatch_profile.enabled && !profile_nosync) {
             phase_timer t(&g_ubatch_profile.sync_ms);
             synchronize();
         }
