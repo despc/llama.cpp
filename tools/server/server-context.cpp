@@ -3563,7 +3563,23 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // LLAMA_SERVER_CKPT_OFFSETS="4": tokens before the prompt end to checkpoint at (default "4+ub,4");
+                            // each offset splits the prompt tail into its own decode, which drains the device pipeline
+                            static const std::vector<int> checkpoint_offsets = [&] {
+                                std::vector<int> v;
+                                if (const char * e = getenv("LLAMA_SERVER_CKPT_OFFSETS")) {
+                                    for (const auto & s : string_split<std::string>(e, ',')) {
+                                        const int o = std::atoi(s.c_str());
+                                        if (o > 0) {
+                                            v.push_back(o);
+                                        }
+                                    }
+                                }
+                                if (v.empty()) {
+                                    v = {4 + n_ubatch, 4};
+                                }
+                                return v;
+                            }();
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

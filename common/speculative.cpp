@@ -1513,6 +1513,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // LLAMA_SPEC_PROFILE: host time of the MTP catch-up phases, printed at exit
+        struct spec_prof { double sync = 0, copy = 0, decode = 0; int64_t n = 0, toks = 0;
+            ~spec_prof() { if (n) fprintf(stderr, "spec_profile calls=%lld tokens=%lld tgt_sync=%.1f copy=%.1f dft_decode=%.1f ms\n", (long long) n, (long long) toks, sync/1e3, copy/1e3, decode/1e3); } };
+        static spec_prof sp;
+        static const bool sp_on = getenv("LLAMA_SPEC_PROFILE") != nullptr;
+        int64_t sp_t = sp_on ? ggml_time_us() : 0;
+        auto sp_lap = [&](double & acc) { if (sp_on) { const int64_t t = ggml_time_us(); acc += t - sp_t; sp_t = t; } };
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             common_batch_clear(batch);
@@ -1528,7 +1536,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                sp_lap(sp.sync);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                sp_lap(sp.copy);
+                if (sp_on) { sp.n++; sp.toks += n_tokens; }
             }
 
             // fill the pending embeddings from a previous run
@@ -1571,6 +1582,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            sp_lap(sp.decode);
             if (!ok) {
                 return false;
             }

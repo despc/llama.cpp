@@ -2850,7 +2850,20 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 // drain it. Without this the generic path in ggml_backend_tensor_copy_async synchronizes
 // both backends and copies through malloc'd pageable memory, which costs far more than
 // the transfer itself for the small tensors an AllReduce moves.
+// GGML_CUDA_FOREIGN_PROFILE: host time per phase of the foreign copy, printed at exit
+struct ggml_cuda_foreign_profile {
+    double slot_wait = 0, src_sync = 0, get = 0, h2d = 0; int64_t n = 0; size_t bytes = 0;
+    ~ggml_cuda_foreign_profile() {
+        if (n) fprintf(stderr, "foreign_copy backend=%s n=%lld MiB=%.0f slot_wait=%.1f src_sync=%.1f get=%.1f h2d=%.1f ms\n", GGML_CUDA_NAME,
+                       (long long) n, bytes / 1048576.0, slot_wait/1e3, src_sync/1e3, get/1e3, h2d/1e3);
+    }
+};
+static ggml_cuda_foreign_profile g_foreign_profile;
+
 static bool ggml_backend_cuda_cpy_tensor_foreign(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    static const bool fprof = ggml_env_flag_enabled("GGML_CUDA_FOREIGN_PROFILE");
+    int64_t ft = fprof ? ggml_time_us() : 0;
+    auto lap = [&](double & acc) { if (fprof) { const int64_t t = ggml_time_us(); acc += t - ft; ft = t; } };
     ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
 
     const size_t nbytes = ggml_nbytes(dst);
@@ -2866,6 +2879,7 @@ static bool ggml_backend_cuda_cpy_tensor_foreign(ggml_backend_t backend_src, ggm
         // the slot may still be feeding an earlier H2D
         CUDA_CHECK(cudaEventSynchronize(cuda_ctx_dst->stage_event[slot]));
     }
+    lap(g_foreign_profile.slot_wait);
 
     if (cuda_ctx_dst->stage_size[slot] < nbytes) {
         if (cuda_ctx_dst->stage_buf[slot] != nullptr) {
@@ -2877,11 +2891,15 @@ static bool ggml_backend_cuda_cpy_tensor_foreign(ggml_backend_t backend_src, ggm
 
     // the source must finish computing before we read it
     ggml_backend_synchronize(backend_src);
+    lap(g_foreign_profile.src_sync);
     ggml_backend_tensor_get(src, cuda_ctx_dst->stage_buf[slot], 0, nbytes);
+    lap(g_foreign_profile.get);
 
     CUDA_CHECK(cudaMemcpyAsync(dst->data, cuda_ctx_dst->stage_buf[slot], nbytes,
                                cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
     CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->stage_event[slot], cuda_ctx_dst->stream()));
+    lap(g_foreign_profile.h2d);
+    if (fprof) { g_foreign_profile.n++; g_foreign_profile.bytes += nbytes; }
 
     return true;
 }
@@ -5013,6 +5031,37 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
 }
 #endif // USE_CUDA_GRAPH
 
+// GGML_CUDA_TIMELINE=path: host-clock time when each device starts/finishes a graph, via host callbacks on the stream.
+// Both driver stacks write to one file, so devices can be compared on one clock. Diagnostic only.
+struct ggml_cuda_timeline_rec { int64_t t; int device; int n_nodes; int start; };
+struct ggml_cuda_timeline {
+    std::mutex mtx;
+    std::vector<ggml_cuda_timeline_rec> recs;
+    const char * path = getenv("GGML_CUDA_TIMELINE");
+    ~ggml_cuda_timeline() {
+        if (!path || recs.empty()) return;
+        FILE * f = fopen(path, "a");
+        if (!f) return;
+        for (auto & r : recs) fprintf(f, "%s %d %lld %d %d\n", GGML_CUDA_NAME, r.device, (long long) r.t, r.start, r.n_nodes);
+        fclose(f);
+    }
+};
+static ggml_cuda_timeline g_cuda_timeline;
+
+static void CUDART_CB ggml_cuda_timeline_cb(void * data) {
+    auto * r = (ggml_cuda_timeline_rec *) data;
+    r->t = ggml_time_us();
+    std::lock_guard<std::mutex> lk(g_cuda_timeline.mtx);
+    g_cuda_timeline.recs.push_back(*r);
+    delete r;
+}
+
+static void ggml_cuda_timeline_mark(ggml_backend_cuda_context * ctx, int n_nodes, int start) {
+    if (!g_cuda_timeline.path) return;
+    auto * r = new ggml_cuda_timeline_rec{0, ctx->device, n_nodes, start};
+    CUDA_CHECK(cudaLaunchHostFunc(ctx->stream(), ggml_cuda_timeline_cb, r));
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -5069,6 +5118,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         cuda_graph_update_required = false;
     }
 
+    ggml_cuda_timeline_mark(cuda_ctx, cgraph->n_nodes, 1); // before capture starts, so it is never captured
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5080,6 +5131,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_timeline_mark(cuda_ctx, cgraph->n_nodes, 0);
 
     return GGML_STATUS_SUCCESS;
 }

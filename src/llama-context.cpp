@@ -1483,7 +1483,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // LLAMA_PREFILL_NO_REUSE: rebuild prompt ubatch graphs (>= 64 tokens). A reused graph stays bound to one pipeline
+    // copy slot, so consecutive ubatches wait for each other; a rebuilt graph takes the next slot. Decode keeps reuse.
+    static const bool prefill_no_reuse = getenv("LLAMA_PREFILL_NO_REUSE") != nullptr;
+    const bool reuse_allowed = !graph_reuse_disable && !(prefill_no_reuse && ubatch.n_tokens >= 64);
+
+    if (reuse_allowed && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
