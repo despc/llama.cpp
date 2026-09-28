@@ -5,6 +5,10 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
+#include <cstring>
+#include <map>
+#include <mutex>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -533,6 +537,97 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 // 2048-token budget, so dense is a numerical superset; drafts are verified by the target
 // either way. The indexer tensors are still loaded so the GGUF stays complete.
 // TODO: wire up QSA here for long-context draft fidelity.
+// Draft-only LM head over a token subset (FR-Spec style). The target verifies every
+// drafted token, so the output stays exact while the head reads K rows, not n_vocab.
+// LLAMA_MTP_HEAD_IDS=<file of token ids> and/or LLAMA_MTP_HEAD_TOPN=<n> (ids 0..n-1).
+// Control/EOG tokens are always kept. Built once per head weight, lives until exit.
+struct mtp_head_subset {
+    ggml_tensor * w   = nullptr; // [n_embd, K] rows of the head
+    ggml_tensor * inv = nullptr; // [n_vocab] I32: row in w, or K for the -inf row
+};
+
+static const mtp_head_subset * mtp_head_subset_get(const llama_model & model, ggml_tensor * head_w) {
+    static std::mutex mtx;
+    static std::map<ggml_tensor *, mtp_head_subset> cache;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = cache.find(head_w);
+    if (it != cache.end()) {
+        return it->second.w ? &it->second : nullptr;
+    }
+    mtp_head_subset & sub = cache[head_w];
+
+    const char * ids_path = getenv("LLAMA_MTP_HEAD_IDS");
+    const char * topn_s   = getenv("LLAMA_MTP_HEAD_TOPN");
+    if ((!ids_path && !topn_s) || !head_w->buffer) {
+        return nullptr;
+    }
+    const int64_t n_vocab = head_w->ne[1];
+    std::vector<char> keep(n_vocab, 0);
+    if (topn_s) {
+        const int64_t n = std::min<int64_t>(atoll(topn_s), n_vocab);
+        for (int64_t i = 0; i < n; i++) {
+            keep[i] = 1;
+        }
+    }
+    if (ids_path) {
+        FILE * f = fopen(ids_path, "r");
+        if (!f) {
+            LLAMA_LOG_ERROR("%s: cannot open %s\n", __func__, ids_path);
+            return nullptr;
+        }
+        long long id;
+        while (fscanf(f, "%lld", &id) == 1) {
+            if (id >= 0 && id < n_vocab) {
+                keep[id] = 1;
+            }
+        }
+        fclose(f);
+    }
+    const int64_t n_tok = std::min<int64_t>(n_vocab, model.vocab.n_tokens());
+    for (int64_t i = 0; i < n_tok; i++) {
+        if (model.vocab.is_control(i) || model.vocab.is_eog(i)) {
+            keep[i] = 1;
+        }
+    }
+    std::vector<int32_t> ids;
+    for (int64_t i = 0; i < n_vocab; i++) {
+        if (keep[i]) {
+            ids.push_back((int32_t) i);
+        }
+    }
+    const int64_t K = ids.size();
+
+    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * w   = ggml_new_tensor_2d(ctx, head_w->type, head_w->ne[0], K);
+    ggml_tensor * inv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_vocab);
+    ggml_set_name(w,   "mtp_head_sub");
+    ggml_set_name(inv, "mtp_head_inv");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(head_w->buffer));
+    if (!buf) {
+        LLAMA_LOG_ERROR("%s: cannot allocate the draft head subset\n", __func__);
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const size_t row = head_w->nb[1];
+    std::vector<uint8_t> all(ggml_nbytes(head_w));
+    ggml_backend_tensor_get(head_w, all.data(), 0, all.size());
+    std::vector<uint8_t> packed(row * K);
+    std::vector<int32_t> map(n_vocab, (int32_t) K);
+    for (int64_t j = 0; j < K; j++) {
+        memcpy(packed.data() + j * row, all.data() + (size_t) ids[j] * row, row);
+        map[ids[j]] = (int32_t) j;
+    }
+    ggml_backend_tensor_set(w,   packed.data(), 0, packed.size());
+    ggml_backend_tensor_set(inv, map.data(),    0, map.size() * sizeof(int32_t));
+    sub.w   = w;
+    sub.inv = inv;
+    LLAMA_LOG_INFO("%s: draft LM head restricted to %" PRId64 " of %" PRId64 " tokens (%.1f MiB on %s)\n",
+        __func__, K, n_vocab, packed.size() / 1048576.0, ggml_backend_buffer_name(buf));
+    return &sub;
+}
+
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
@@ -706,7 +801,18 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    const mtp_head_subset * hsub = head_s ? nullptr : mtp_head_subset_get(model, head_w);
+    if (hsub) {
+        // logits over the subset, scattered back to n_vocab with -inf elsewhere
+        ggml_tensor * sl = ggml_mul_mat(ctx0, hsub->w, cur);                  // [K, T]
+        sl = ggml_cont(ctx0, ggml_transpose(ctx0, sl));                       // [T, K]
+        ggml_tensor * ninf = ggml_fill(ctx0, ggml_view_2d(ctx0, sl, sl->ne[0], 1, sl->nb[1], 0), -INFINITY);
+        sl = ggml_concat(ctx0, sl, ninf, 1);                                  // [T, K+1]
+        sl = ggml_get_rows(ctx0, sl, hsub->inv);                              // [T, n_vocab]
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, sl));                      // [n_vocab, T]
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
