@@ -1710,9 +1710,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        // GGML_SCHED_INPUTS_FIRST: copy the user inputs (host data) in a first pass, before any wait on another
+        // backend's output, so their synchronous upload overlaps the producer's compute instead of following it
+        static const bool inputs_first = getenv("GGML_SCHED_INPUTS_FIRST") != nullptr;
+        for (int pass = 0; pass < (inputs_first ? 2 : 1); pass++)
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
+            if (inputs_first && (pass == 0) != ((input->flags & GGML_TENSOR_FLAG_INPUT) != 0)) {
+                continue;
+            }
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched_slot(split_backend_id));
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
