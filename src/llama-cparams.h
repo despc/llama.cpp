@@ -43,6 +43,7 @@ struct llama_cparams {
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
+    bool moe_sel_output;     // keep ffn_moe_topk as graph output (expert heatmap/hot store)
     bool auto_flid;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;

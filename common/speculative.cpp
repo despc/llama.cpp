@@ -2505,6 +2505,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
+    // LLAMA_SPEC_DRAFT_UBATCH: draft ubatch size; a bigger one lets the prompt catch-up run as fewer,
+    // asynchronous graphs instead of blocking the host between ubatches
+    if (const char * e = getenv("LLAMA_SPEC_DRAFT_UBATCH")) {
+        result.n_ubatch = std::min(atoi(e), result.n_batch);
+    }
+
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;

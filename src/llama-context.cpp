@@ -235,6 +235,9 @@ llama_context::llama_context(
     cparams.auto_fgdn    = false;
 
     cparams.fused_lid = true;
+    // LLAMA_TOPK_MOE_FUSE=1 drops the output flag when nothing reads it (lets the router fuse, not exact)
+    cparams.moe_sel_output = params.expert_heat_log_period != 0 || params.expert_hot_s != 0 ||
+        getenv("LLAMA_TOPK_MOE_FUSE") == nullptr;
     cparams.auto_flid = false;
 
     cparams.fused_dsv4_hc_pre  = true;

@@ -2136,7 +2136,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (selected_experts == nullptr) {
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
-        ggml_set_output(selected_experts);
+        // only the expert heatmap/hot store reads it back; the output flag
+        // blocks the CUDA topk-moe fusion
+        if (cparams.moe_sel_output) {
+            ggml_set_output(selected_experts);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
