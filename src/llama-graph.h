@@ -154,6 +154,11 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
+    // h read from a device stage instead (cparams.nextn_input_stage): row = pos - pos0
+    ggml_tensor *       h_idx = nullptr; // I32 [n_batch]
+    const ggml_tensor * stage = nullptr;
+    int32_t             pos0  = 0;
+
     const int64_t n_embd = 0;
 };
 

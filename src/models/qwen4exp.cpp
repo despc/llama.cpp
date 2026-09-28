@@ -546,7 +546,7 @@ struct mtp_head_subset {
     ggml_tensor * inv = nullptr; // [n_vocab] I32: row in w, or K for the -inf row
 };
 
-static const mtp_head_subset * mtp_head_subset_get(const llama_model & model, ggml_tensor * head_w) {
+static const mtp_head_subset * mtp_head_subset_get(const llama_model & model, ggml_tensor * head_w, ggml_tensor * near) {
     static std::mutex mtx;
     static std::map<ggml_tensor *, mtp_head_subset> cache;
     std::lock_guard<std::mutex> lock(mtx);
@@ -603,7 +603,10 @@ static const mtp_head_subset * mtp_head_subset_get(const llama_model & model, gg
     ggml_tensor * inv = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_vocab);
     ggml_set_name(w,   "mtp_head_sub");
     ggml_set_name(inv, "mtp_head_inv");
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(head_w->buffer));
+    // place the subset with the draft layer, not with the borrowed target head, so the draft
+    // graph stays on one device when the draft runs elsewhere (--spec-draft-device)
+    ggml_tensor * home = near && near->buffer ? near : head_w;
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(home->buffer));
     if (!buf) {
         LLAMA_LOG_ERROR("%s: cannot allocate the draft head subset\n", __func__);
         return nullptr;
@@ -657,15 +660,26 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
     ggml_set_input(inp->embd);
 
-    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
-    ggml_set_input(inp->h);
-    ggml_set_name(inp->h, "mtp_h_input");
+    ggml_tensor * h_in = nullptr;
+    if (cparams.nextn_input_stage) {
+        // the target left its h rows on this device (llama_nextn_stage_*): gather them there
+        inp->h_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->h_idx);
+        inp->stage = cparams.nextn_input_stage;
+        inp->pos0  = cparams.nextn_input_pos0;
+        h_in = ggml_get_rows(ctx0, cparams.nextn_input_stage, inp->h_idx);
+    } else {
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc_dim, n_tokens);
+        ggml_set_input(inp->h);
+        ggml_set_name(inp->h, "mtp_h_input");
+        h_in = inp->h;
+    }
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
     ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
-    ggml_tensor * h_state = ggml_reshape_3d(ctx0, inp->h, n_embd, hc, n_tokens);
+    ggml_tensor * h_state = ggml_reshape_3d(ctx0, h_in, n_embd, hc, n_tokens);
     cb(h_state, "mtp_h_state", il);
 
     res->add_input(std::move(inp));
@@ -697,7 +711,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
     cb(concat, "mtp_concat", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    // one [2*n_embd, hc*n_tokens] GEMM: with the 3-D src1 it ran as n_tokens separate
+    // 4-column products (8 ms per 512-token catch-up ubatch on the V100)
+    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj,
+            ggml_reshape_2d(ctx0, concat, concat->ne[0], hc * n_tokens), layer.nextn.eh_proj_s);
+    res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, n_tokens);
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
@@ -747,6 +765,26 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
+    // A catch-up ubatch (prompt, or the tokens a verification accepted) has no outputs:
+    // only its K/V rows are ever read, by later draft steps. Store them and stop, which
+    // leaves out the dense attention over the whole context, wo, the MoE and the head.
+    // The same nodes compute K/V, so the cache contents are unchanged.
+    // LLAMA_MTP_FULL_CATCHUP=1 builds the full graph as before.
+    static const bool full_catchup = getenv("LLAMA_MTP_FULL_CATCHUP") != nullptr;
+    if (n_outputs == 0 && !full_catchup && !inp_attn->self_k_rot && !inp_attn->self_v_rot) {
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        const auto * mctx_cur = inp_attn->mctx;
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        // the mask stays unallocated and its set_input is skipped (as in DFlash's KV
+        // injection); out_ids asserts on its buffer, so keep it in the graph
+        if (inp_out_ids) {
+            ggml_build_forward_expand(gf, inp_out_ids);
+        }
+        return;
+    }
 
     cur = build_attn(inp_attn,
             nullptr, nullptr, nullptr,
@@ -801,7 +839,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
 
-    const mtp_head_subset * hsub = head_s ? nullptr : mtp_head_subset_get(model, head_w);
+    const mtp_head_subset * hsub = head_s ? nullptr : mtp_head_subset_get(model, head_w, layer.nextn.eh_proj);
     if (hsub) {
         // logits over the subset, scattered back to n_vocab with -inf elsewhere
         ggml_tensor * sl = ggml_mul_mat(ctx0, hsub->w, cur);                  // [K, T]

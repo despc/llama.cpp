@@ -108,7 +108,13 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    if (h_idx) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(h_idx->buffer) && ubatch->pos);
+        int32_t * data = (int32_t *) h_idx->data;
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            data[i] = ubatch->pos[i] - pos0;
+        }
+    } else if (ubatch->embd) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
@@ -120,7 +126,10 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens) ||
+                                     (h_idx  && h_idx->ne[0]  == params.ubatch.n_tokens);
+    res &= stage == params.cparams.nextn_input_stage;
+    pos0 = params.cparams.nextn_input_pos0;
 
     return res;
 }

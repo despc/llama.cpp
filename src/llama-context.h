@@ -119,6 +119,17 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_nextn_input_stage(ggml_tensor * stage, int32_t pos0);
+    void          nextn_stage_enable(int32_t min_tokens) { nextn_stage_min = min_tokens; }
+    ggml_tensor * nextn_stage_get(int64_t * n_rows) const {
+        if (!nextn_stage_active) {
+            return nullptr;
+        }
+        if (n_rows) {
+            *n_rows = nextn_stage_rows;
+        }
+        return nextn_stage;
+    }
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -308,6 +319,16 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // device copy of the unmasked nextn rows for a same-device MTP draft (llama_nextn_stage_*):
+    // batches of >= nextn_stage_min tokens go to nextn_stage instead of the host, which then
+    // receives only the last row of each ubatch
+    int32_t                 nextn_stage_min    = 0;
+    ggml_context_ptr        nextn_stage_ctx;
+    ggml_backend_buffer_ptr nextn_stage_buf;
+    ggml_tensor *           nextn_stage        = nullptr;
+    bool                    nextn_stage_active = false;
+    int64_t                 nextn_stage_rows   = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

@@ -1288,6 +1288,11 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_nextn_input_stage(ggml_tensor * stage, int32_t pos0) {
+    cparams.nextn_input_stage = stage;
+    cparams.nextn_input_pos0  = pos0;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1910,6 +1915,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    nextn_stage_active = false;
+    const bool use_nextn_stage = nextn_stage_min > 0 && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked &&
+        (int64_t) n_tokens_all >= nextn_stage_min;
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
@@ -2160,7 +2169,30 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (use_nextn_stage && !masked && ggml_is_contiguous(t_h_nextn)) {
+                    if (!nextn_stage) {
+                        ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+                        nextn_stage_ctx.reset(ggml_init(ip));
+                        nextn_stage = ggml_new_tensor_2d(nextn_stage_ctx.get(), GGML_TYPE_F32, n_embd, cparams.n_batch + 1);
+                        ggml_set_name(nextn_stage, "nextn_stage");
+                        nextn_stage_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(nextn_stage_ctx.get(),
+                                ggml_backend_get_default_buffer_type(backend_h)));
+                        GGML_ASSERT(nextn_stage_buf && "failed to allocate the nextn stage");
+                        LLAMA_LOG_INFO("%s: nextn stage %.1f MiB on %s\n", __func__,
+                                ggml_nbytes(nextn_stage) / 1048576.0, ggml_backend_name(backend_h));
+                    }
+                    // rows offset+1.. of the stage, laid out like t_h_nextn
+                    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+                    ggml_context_ptr vctx(ggml_init(ip));
+                    ggml_tensor * dst = ggml_view_4d(vctx.get(), nextn_stage,
+                            t_h_nextn->ne[0], t_h_nextn->ne[1], t_h_nextn->ne[2], t_h_nextn->ne[3],
+                            t_h_nextn->nb[1], t_h_nextn->nb[2], t_h_nextn->nb[3], (offset + 1)*n_embd*sizeof(float));
+                    ggml_backend_tensor_copy_async(backend_h, backend_h, t_h_nextn, dst);
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + (n_rows - 1)*n_embd,
+                            (n_rows - 1)*n_embd*sizeof(float), n_embd*sizeof(float));
+                } else {
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
             }
         }
 
@@ -2177,6 +2209,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (use_nextn_stage && nextn_stage) {
+        nextn_stage_active = true;
+        nextn_stage_rows   = n_tokens_all;
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -4511,6 +4548,18 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+void llama_nextn_stage_enable(llama_context * ctx, int32_t min_tokens) {
+    ctx->nextn_stage_enable(min_tokens);
+}
+
+ggml_tensor * llama_nextn_stage_get(llama_context * ctx, int64_t * n_rows) {
+    return ctx->nextn_stage_get(n_rows);
+}
+
+void llama_set_nextn_input_stage(llama_context * ctx, ggml_tensor * stage, int32_t pos0) {
+    ctx->set_nextn_input_stage(stage, pos0);
 }
 
 //

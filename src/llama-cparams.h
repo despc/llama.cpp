@@ -7,6 +7,8 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct ggml_tensor;
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -44,6 +46,11 @@ struct llama_cparams {
     bool auto_fgdn;
     bool fused_lid;          // use fused lightning indexer
     bool moe_sel_output;     // keep ffn_moe_topk as graph output (expert heatmap/hot store)
+
+    // MTP draft: take the h input rows from this device tensor of the target (llama_set_nextn_input_stage):
+    // row 0 = carry-over from the previous batch, row k+1 = target h of batch token k; pos0 = pos of token 0
+    struct ggml_tensor * nextn_input_stage = nullptr;
+    int32_t              nextn_input_pos0  = 0;
     bool auto_flid;
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;

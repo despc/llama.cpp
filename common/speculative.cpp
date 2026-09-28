@@ -1361,6 +1361,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    int32_t       stage_min = 0;
+    ggml_tensor * stage     = nullptr; // set per process() call
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1417,6 +1420,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        // LLAMA_MTP_STAGE=<n>: prompt batches of >= n tokens hand the target's h rows to the draft on
+        // the device (both must sit on the same GPU) instead of a round trip through host memory
+        if (const char * e = getenv("LLAMA_MTP_STAGE")) {
+            stage_min = atoi(e);
+            if (stage_min > 0) {
+                llama_nextn_stage_enable(ctx_tgt, stage_min);
+            }
+        }
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -1537,7 +1549,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 sp_lap(sp.sync);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                int64_t stage_rows = 0;
+                stage = stage_min > 0 && n_seq == 1 && n_mtp_layers == 1 ? llama_nextn_stage_get(ctx_tgt, &stage_rows) : nullptr;
+                if (stage && stage_rows != n_tokens) {
+                    stage = nullptr;
+                }
+                if (!stage) {
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                }
                 sp_lap(sp.copy);
                 if (sp_on) { sp.n++; sp.toks += n_tokens; }
             }
@@ -1552,7 +1571,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                if (stage) {
+                    // stage row 0 is the carry-over row, rows 1.. were written by the target
+                    ggml_backend_tensor_set(stage, pending_h[seq_id].data(), 0, row_bytes);
+                    llama_set_nextn_input_stage(ctx_dft, stage, batch_in.pos[0]);
+                } else {
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1582,6 +1607,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
+            if (stage) {
+                // the next target batch overwrites the stage
+                llama_synchronize(ctx_dft);
+                llama_set_nextn_input_stage(ctx_dft, nullptr, 0);
+            }
             sp_lap(sp.decode);
             if (!ok) {
                 return false;
@@ -1593,12 +1623,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            // with the stage only the last row reached the host; a prompt batch needs no more
+            const int32_t i_first = stage ? i_batch_end[seq_id] : i_batch_beg[seq_id];
+            const int32_t n_rows  = i_batch_end[seq_id] - i_first + 1;
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_first + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 

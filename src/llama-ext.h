@@ -107,6 +107,14 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Same-device MTP handoff. On the target: batches of >= min_tokens keep their unmasked nextn rows
+// in a device tensor (row k+1 = token k) and copy only each ubatch's last row to the host.
+LLAMA_API void llama_nextn_stage_enable(struct llama_context * ctx, int32_t min_tokens);
+// The stage tensor if the last decode filled it (n_rows = its token count), else NULL.
+LLAMA_API struct ggml_tensor * llama_nextn_stage_get(struct llama_context * ctx, int64_t * n_rows);
+// On the draft: read the h input from the stage (row = pos - pos0), or NULL to use batch.embd.
+LLAMA_API void llama_set_nextn_input_stage(struct llama_context * ctx, struct ggml_tensor * stage, int32_t pos0);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
