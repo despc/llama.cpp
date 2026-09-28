@@ -1526,8 +1526,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // LLAMA_SPEC_PROFILE: host time of the MTP catch-up phases, printed at exit
-        struct spec_prof { double sync = 0, copy = 0, decode = 0; int64_t n = 0, toks = 0;
-            ~spec_prof() { if (n) fprintf(stderr, "spec_profile calls=%lld tokens=%lld tgt_sync=%.1f copy=%.1f dft_decode=%.1f ms\n", (long long) n, (long long) toks, sync/1e3, copy/1e3, decode/1e3); } };
+        struct spec_prof { double sync = 0, copy = 0, decode = 0, dsync = 0; int64_t n = 0, toks = 0;
+            ~spec_prof() { if (n) fprintf(stderr, "spec_profile calls=%lld tokens=%lld tgt_sync=%.1f copy=%.1f dft_decode=%.1f dft_sync=%.1f ms\n", (long long) n, (long long) toks, sync/1e3, copy/1e3, decode/1e3, dsync/1e3); } };
         static spec_prof sp;
         static const bool sp_on = getenv("LLAMA_SPEC_PROFILE") != nullptr;
         int64_t sp_t = sp_on ? ggml_time_us() : 0;
@@ -1595,7 +1595,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                // with the stage the h rows come from the device: do not hand over batch.embd,
+                // the batch conversion would copy all of it (165 MB per 4k batch) for nothing
+                llama_batch batch_dec = batch;
+                if (stage) {
+                    batch_dec.embd = nullptr;
+                }
+                const int32_t rc = llama_decode(ctx_dft, batch_dec);
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1609,7 +1615,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             if (stage) {
                 // the next target batch overwrites the stage
+                sp_lap(sp.decode);
                 llama_synchronize(ctx_dft);
+                sp_lap(sp.dsync);
                 llama_set_nextn_input_stage(ctx_dft, nullptr, 0);
             }
             sp_lap(sp.decode);

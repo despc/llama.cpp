@@ -1264,6 +1264,12 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
         pos_next[s] = llama_memory_seq_pos_max(batch_ext->mem, s) + 1; // assume next pos
     }
 
+    // one allocation instead of repeated growth: an MTP prompt batch carries 4k x 40 KB rows
+    if (has_embd) {
+        batch_ext->embd.reserve(batch_ext->embd.size() + (size_t) batch_inp.n_tokens * n_embd_row);
+    }
+    batch_ext->tokens.reserve(batch_ext->tokens.size() + batch_inp.n_tokens);
+
     for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
         const int32_t      n_sid = batch_inp.n_seq_id ? batch_inp.n_seq_id[i]    : default_n_seq_id;
         const llama_seq_id * sids = batch_inp.seq_id  ? batch_inp.seq_id[i]      : &default_seq_id;
