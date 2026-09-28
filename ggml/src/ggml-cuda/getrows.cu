@@ -101,6 +101,32 @@ static __global__ void k_get_rows_float(
     }
 }
 
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_narrow(
+        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    // one thread per gathered row: the block-per-row kernel wastes a whole block on rows of a few elements
+    ggml_cuda_pdl_sync();
+    const int64_t i10 = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i10 >= ne10) {
+        return;
+    }
+    for (int64_t z = blockIdx.y; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.y) {
+        const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        const src0_t * src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        for (int64_t i00 = 0; i00 < ne00; i00++) {
+            dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+        }
+    }
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -277,6 +303,14 @@ static void get_rows_cuda_float(
                 s10, s11, s12);
             return;
         }
+    }
+
+    if (ne00 <= 4 && ne10 >= 1024) {
+        const dim3 nblocks((ne10 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, MIN(ne11*ne12, UINT16_MAX), 1);
+        k_get_rows_float_narrow<src0_t, dst_t><<<nblocks, block_dims, 0, stream>>>(
+            src0_d, src1_d, dst_d, ne00, ne10, ne11, ne12_fdv,
+            s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+        return;
     }
 
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
