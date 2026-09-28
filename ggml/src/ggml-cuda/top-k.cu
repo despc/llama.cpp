@@ -210,6 +210,109 @@ static void top_k_radix_cuda(
 
 #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
+// Small-k top-k for long rows (the samplers' top-k over the vocabulary): two passes of
+// "per-thread top-k list, then k block-wide rounds picking the best head". Ordered by
+// value descending, lower index first on ties - the same result as the stable descending
+// argsort it replaces, without sorting 248k keys to keep 10.
+#define TOPK_SMALL_MAX 16
+
+static __device__ __forceinline__ bool topk_better(float a, int ia, float b, int ib) {
+    return a > b || (a == b && ia < ib);
+}
+
+// one block per (row, chunk); src_idx == nullptr means the index is the column
+template <int block_size>
+static __global__ void k_top_k_small(const float * __restrict__ src, const int * __restrict__ src_idx,
+        float * __restrict__ dst_val, int * __restrict__ dst_idx,
+        const int ncols, const int k, const int chunk) {
+    const int row = blockIdx.y;
+    const int c0  = blockIdx.x * chunk;
+    const int c1  = min(ncols, c0 + chunk);
+    const float * s  = src + (int64_t) row * ncols;
+    const int *   si = src_idx ? src_idx + (int64_t) row * ncols : nullptr;
+
+    float lv[TOPK_SMALL_MAX];
+    int   li[TOPK_SMALL_MAX];
+    int   n = 0;
+    for (int c = c0 + threadIdx.x; c < c1; c += block_size) {
+        const float v  = s[c];
+        const int   iv = si ? si[c] : c;
+        if (n == k && !topk_better(v, iv, lv[k - 1], li[k - 1])) {
+            continue;
+        }
+        int j = n < k ? n++ : k - 1;
+        while (j > 0 && topk_better(v, iv, lv[j - 1], li[j - 1])) {
+            lv[j] = lv[j - 1];
+            li[j] = li[j - 1];
+            j--;
+        }
+        lv[j] = v;
+        li[j] = iv;
+    }
+
+    __shared__ float sv[block_size / 32];
+    __shared__ int   si_[block_size / 32];
+    __shared__ int   st[block_size / 32];
+    int head = 0;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int out  = (row * gridDim.x + blockIdx.x) * k;
+
+    for (int r = 0; r < k; ++r) {
+        float bv = head < n ? lv[head] : -INFINITY;
+        int   bi = head < n ? li[head] : INT_MAX;
+        int   bt = head < n ? (int) threadIdx.x : -1;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, bv, off);
+            const int   oi = __shfl_xor_sync(0xffffffff, bi, off);
+            const int   ot = __shfl_xor_sync(0xffffffff, bt, off);
+            if (ot >= 0 && (bt < 0 || topk_better(ov, oi, bv, bi))) {
+                bv = ov; bi = oi; bt = ot;
+            }
+        }
+        if (lane == 0) {
+            sv[warp] = bv; si_[warp] = bi; st[warp] = bt;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            bv = lane < block_size / 32 ? sv[lane] : -INFINITY;
+            bi = lane < block_size / 32 ? si_[lane] : INT_MAX;
+            bt = lane < block_size / 32 ? st[lane] : -1;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffff, bv, off);
+                const int   oi = __shfl_xor_sync(0xffffffff, bi, off);
+                const int   ot = __shfl_xor_sync(0xffffffff, bt, off);
+                if (ot >= 0 && (bt < 0 || topk_better(ov, oi, bv, bi))) {
+                    bv = ov; bi = oi; bt = ot;
+                }
+            }
+            if (lane == 0) {
+                st[0] = bt;
+                dst_val[out + r] = bv;
+                dst_idx[out + r] = bt >= 0 ? bi : -1;
+            }
+        }
+        __syncthreads();
+        if ((int) threadIdx.x == st[0]) {
+            head++;
+        }
+        __syncthreads();
+    }
+}
+
+static void top_k_small_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
+        const int ncols, const int nrows, const int k, cudaStream_t stream) {
+    constexpr int bs = 256;
+    const int nchunks = std::min(32, (ncols + 4095) / 4096);
+    const int chunk   = (ncols + nchunks - 1) / nchunks;
+    ggml_cuda_pool_alloc<float> tv(pool, (size_t) nrows * nchunks * k);
+    ggml_cuda_pool_alloc<int>   ti(pool, (size_t) nrows * nchunks * k);
+    k_top_k_small<bs><<<dim3(nchunks, nrows), bs, 0, stream>>>(src, nullptr, tv.get(), ti.get(), ncols, k, chunk);
+    ggml_cuda_pool_alloc<float> ov(pool, (size_t) nrows * k);
+    k_top_k_small<bs><<<dim3(1, nrows), bs, 0, stream>>>(tv.get(), ti.get(), ov.get(), dst, nchunks * k, k, nchunks * k);
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -233,6 +336,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    // GGML_CUDA_TOPK_FAST=0 keeps the full argsort
+    static const bool fast = !getenv("GGML_CUDA_TOPK_FAST") || atoi(getenv("GGML_CUDA_TOPK_FAST")) != 0;
+    if (fast && k <= TOPK_SMALL_MAX && ncols >= 2048) {
+        top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);
