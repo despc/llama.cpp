@@ -785,6 +785,10 @@ struct ggml_backend_sched_split {
 };
 
 struct ggml_backend_sched {
+    // GGML_SCHED_LAZY_REALLOC_SYNC: after a re-plan that grows no buffer, each backend is synchronized
+    // right before its first split instead of all of them up front (keeps the pipeline full)
+    bool lazy_sync[GGML_SCHED_MAX_BACKENDS] = { false };
+
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
@@ -1615,6 +1619,12 @@ struct ggml_sched_timing {
     }
 };
 static ggml_sched_timing g_sched_timing;
+
+static thread_local ggml_backend_event_t g_copy_slot_event = nullptr;
+
+ggml_backend_event_t ggml_backend_sched_copy_slot_event(void) {
+    return g_copy_slot_event;
+}
 #define SCHED_T0() const int64_t _st0 = g_sched_timing.enabled ? ggml_time_us() : 0
 #define SCHED_ACC(field) do { if (g_sched_timing.enabled) { g_sched_timing.rows[ggml_backend_name(split_backend)].field += ggml_time_us() - _st0; } } while (0)
 
@@ -1658,8 +1668,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
         const int64_t rs_t0 = g_sched_timing.enabled ? ggml_time_us() : 0;
+        static const bool lazy_realloc_sync = getenv("GGML_SCHED_LAZY_REALLOC_SYNC") != nullptr;
+        // the buffers stay in place when nothing grows: work already queued on a backend is ordered
+        // before anything the new graph queues there, so only host-side writes need the wait
+        const bool lazy = lazy_realloc_sync &&
+            !ggml_gallocr_reserve_n_would_grow(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+            if (lazy) {
+                sched->lazy_sync[i] = true;
+            } else {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
         }
         const int64_t rs_t1 = g_sched_timing.enabled ? ggml_time_us() : 0;
 
@@ -1699,6 +1718,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (g_sched_timing.enabled) { g_sched_timing.rows[ggml_backend_name(split_backend)].splits++; }
+        if (sched->lazy_sync[split_backend_id]) {
+            // deferred re-plan wait: the previous graph's work on this backend must finish before
+            // this graph writes into its re-laid-out buffer
+            SCHED_T0();
+            ggml_backend_synchronize(split_backend);
+            sched->lazy_sync[split_backend_id] = false;
+            SCHED_ACC(prev_sync);
+        }
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             SCHED_T0();
             if (sched->events[prev_backend_id][sched_slot(prev_backend_id)] != NULL) {
@@ -1841,7 +1868,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     bool copied_async;
                     {
                         SCHED_T0();
+                        g_copy_slot_event = sched->events[split_backend_id][sched_slot(split_backend_id)];
                         copied_async = split_backend->iface.cpy_tensor_async && split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy);
+                        g_copy_slot_event = nullptr;
                         SCHED_ACC(act_copy);
                     }
                     if (g_sched_timing.enabled) { (copied_async ? g_sched_timing.rows[ggml_backend_name(split_backend)].act_async_copies : g_sched_timing.rows[ggml_backend_name(split_backend)].act_sync_copies)++; }

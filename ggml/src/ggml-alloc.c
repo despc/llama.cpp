@@ -823,7 +823,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 }
 
 static bool ggml_gallocr_reserve_n_impl(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc,
+        bool * would_grow) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -922,6 +923,11 @@ static bool ggml_gallocr_reserve_n_impl(
                 realloc = true;
             }
         }
+        if (would_grow) {
+            // check only: report, touch nothing
+            *would_grow = *would_grow || realloc;
+            continue;
+        }
         if (realloc) {
 #ifndef NDEBUG
             {
@@ -950,7 +956,7 @@ static bool ggml_gallocr_reserve_n_impl(
 
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
-    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
+    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true, NULL));
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
@@ -960,7 +966,13 @@ void ggml_gallocr_reserve_n_size(
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
-    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false, NULL);
+}
+
+bool ggml_gallocr_reserve_n_would_grow(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    bool grow = false;
+    ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false, &grow);
+    return grow;
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {

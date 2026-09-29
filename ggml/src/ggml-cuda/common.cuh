@@ -1465,6 +1465,34 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // GGML_CUDA_COPY_OVERLAP: outgoing peer copies are first staged into this ring on our own device
+    // (a fast D2D), then leave on the side stream, so our next graph is not queued behind the transfer
+    static const int PEER_SLOTS = 3;
+    void *      peer_buf   [PEER_SLOTS] = { nullptr };
+    size_t      peer_size  [PEER_SLOTS] = { 0 };
+    cudaEvent_t peer_staged[PEER_SLOTS] = { nullptr };
+    cudaEvent_t peer_done  [PEER_SLOTS] = { nullptr };
+    int         peer_next = 0;
+
+    // side streams for split-input copies (GGML_CUDA_COPY_OVERLAP): incoming uploads and outgoing peer copies
+    // must not queue behind each other
+    cudaStream_t copy_stream_     = nullptr;
+    cudaStream_t copy_out_stream_ = nullptr;
+    cudaStream_t copy_stream() {
+        if (copy_stream_ == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
+        }
+        return copy_stream_;
+    }
+    cudaStream_t copy_out_stream() {
+        if (copy_out_stream_ == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&copy_out_stream_, cudaStreamNonBlocking));
+        }
+        return copy_out_stream_;
+    }
+
 #ifdef USE_CUDA_GRAPH
     // Map from graph key to cuda_graph - allows multiple graphs per context when the
     // computation is split across CPU/GPU (e.g., with --n-cpu-moe), and when the same

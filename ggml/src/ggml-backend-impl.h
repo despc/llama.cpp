@@ -286,6 +286,11 @@ extern "C" {
 #    define GGML_BACKEND_DL_SCORE_IMPL(score_fn)
 #endif
 
+// Set by the scheduler while it asks a backend to copy a split input asynchronously: the event after which
+// the destination copy slot is free (NULL if unknown). A backend may use it to run the copy on a side stream
+// instead of behind all work queued on the destination (GGML_CUDA_COPY_OVERLAP).
+GGML_API ggml_backend_event_t ggml_backend_sched_copy_slot_event(void);
+
 #ifdef  __cplusplus
 }
 #endif

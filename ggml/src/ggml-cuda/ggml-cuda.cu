@@ -697,6 +697,26 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    if (copy_stream_ != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+        CUDA_CHECK(cudaStreamDestroy(copy_stream_));
+    }
+    if (copy_out_stream_ != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(copy_out_stream_));
+        CUDA_CHECK(cudaStreamDestroy(copy_out_stream_));
+    }
+    for (int i = 0; i < PEER_SLOTS; ++i) {
+        if (peer_buf[i] != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(peer_buf[i]));
+        }
+        if (peer_staged[i] != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(peer_staged[i]));
+            CUDA_CHECK(cudaEventDestroy(peer_done[i]));
+        }
+    }
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2894,9 +2914,20 @@ static bool ggml_backend_cuda_cpy_tensor_foreign(ggml_backend_t backend_src, ggm
     ggml_backend_tensor_get(src, cuda_ctx_dst->stage_buf[slot], 0, nbytes);
     lap(g_foreign_profile.get);
 
+    // GGML_CUDA_COPY_OVERLAP: upload on a side stream that waits only until the scheduler's copy slot is
+    // free, so the H2D overlaps the compute still queued on this device instead of following it
+    static const bool overlap = ggml_env_flag_enabled("GGML_CUDA_COPY_OVERLAP");
+    ggml_backend_event_t slot_ev = overlap ? ggml_backend_sched_copy_slot_event() : nullptr;
+    cudaStream_t h2d_stream = slot_ev ? cuda_ctx_dst->copy_stream() : cuda_ctx_dst->stream();
+    if (slot_ev) {
+        CUDA_CHECK(cudaStreamWaitEvent(h2d_stream, (cudaEvent_t) slot_ev->context, 0));
+    }
     CUDA_CHECK(cudaMemcpyAsync(dst->data, cuda_ctx_dst->stage_buf[slot], nbytes,
-                               cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
-    CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->stage_event[slot], cuda_ctx_dst->stream()));
+                               cudaMemcpyHostToDevice, h2d_stream));
+    CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->stage_event[slot], h2d_stream));
+    if (slot_ev) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_dst->stage_event[slot], 0));
+    }
     lap(g_foreign_profile.h2d);
     if (fprof) { g_foreign_profile.n++; g_foreign_profile.bytes += nbytes; }
 
@@ -2951,6 +2982,38 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            static const bool overlap = ggml_env_flag_enabled("GGML_CUDA_COPY_OVERLAP");
+            ggml_backend_event_t slot_ev = overlap ? ggml_backend_sched_copy_slot_event() : nullptr;
+            if (slot_ev) {
+                const size_t nbytes = ggml_nbytes(dst);
+                const int ps = cuda_ctx_src->peer_next;
+                cuda_ctx_src->peer_next = (ps + 1) % ggml_backend_cuda_context::PEER_SLOTS;
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                if (cuda_ctx_src->peer_staged[ps] == nullptr) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->peer_staged[ps], cudaEventDisableTiming));
+                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->peer_done[ps],   cudaEventDisableTiming));
+                    CUDA_CHECK(cudaEventRecord(cuda_ctx_src->peer_done[ps], cuda_ctx_src->stream()));
+                }
+                if (cuda_ctx_src->peer_size[ps] < nbytes) {
+                    CUDA_CHECK(cudaEventSynchronize(cuda_ctx_src->peer_done[ps]));
+                    if (cuda_ctx_src->peer_buf[ps] != nullptr) {
+                        CUDA_CHECK(cudaFree(cuda_ctx_src->peer_buf[ps]));
+                    }
+                    CUDA_CHECK(cudaMalloc(&cuda_ctx_src->peer_buf[ps], nbytes));
+                    cuda_ctx_src->peer_size[ps] = nbytes;
+                }
+                cudaStream_t cs = cuda_ctx_src->copy_out_stream();
+                // the slot's previous transfer must have left before we overwrite it
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_src->peer_done[ps], 0));
+                CUDA_CHECK(cudaMemcpyAsync(cuda_ctx_src->peer_buf[ps], src->data, nbytes, cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+                CUDA_CHECK(cudaEventRecord(cuda_ctx_src->peer_staged[ps], cuda_ctx_src->stream()));
+                CUDA_CHECK(cudaStreamWaitEvent(cs, cuda_ctx_src->peer_staged[ps], 0));
+                CUDA_CHECK(cudaStreamWaitEvent(cs, (cudaEvent_t) slot_ev->context, 0));
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, cuda_ctx_src->peer_buf[ps], src_physical, nbytes, cs));
+                CUDA_CHECK(cudaEventRecord(cuda_ctx_src->peer_done[ps], cs));
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->peer_done[ps], 0));
+                return true;
+            }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
 #endif // GGML_CUDA_NO_PEER_COPY
         }
@@ -5055,8 +5118,52 @@ static void CUDART_CB ggml_cuda_timeline_cb(void * data) {
     delete r;
 }
 
+// GGML_CUDA_TIMELINE_EVENTS=1: time the marks with CUDA events instead of host callbacks (callbacks run on one
+// driver thread and delay the streams); each device's events are converted against a reference event whose host
+// time is known, as soon as they complete
+struct ggml_cuda_timeline_ev { cudaEvent_t ev; int device; int n_nodes; int start; };
+static std::vector<ggml_cuda_timeline_ev> g_tl_pending;
+static cudaEvent_t g_tl_ref[GGML_CUDA_MAX_DEVICES] = { nullptr };
+static int64_t     g_tl_ref_us[GGML_CUDA_MAX_DEVICES] = { 0 };
+
+static void ggml_cuda_timeline_drain() {
+    size_t keep = 0;
+    for (size_t i = 0; i < g_tl_pending.size(); ++i) {
+        auto & p = g_tl_pending[i];
+        ggml_cuda_set_device(p.device);
+        if (cudaEventQuery(p.ev) == cudaSuccess) {
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, g_tl_ref[p.device], p.ev));
+            std::lock_guard<std::mutex> lk(g_cuda_timeline.mtx);
+            g_cuda_timeline.recs.push_back({ g_tl_ref_us[p.device] + (int64_t) (ms * 1000.0f), p.device, p.n_nodes, p.start });
+            CUDA_CHECK(cudaEventDestroy(p.ev));
+        } else {
+            (void) cudaGetLastError();
+            g_tl_pending[keep++] = p;
+        }
+    }
+    g_tl_pending.resize(keep);
+}
+
 static void ggml_cuda_timeline_mark(ggml_backend_cuda_context * ctx, int n_nodes, int start) {
     if (!g_cuda_timeline.path) return;
+    static const bool use_events = ggml_env_flag_enabled("GGML_CUDA_TIMELINE_EVENTS");
+    if (use_events) {
+        const int dev = ctx->device;
+        if (g_tl_ref[dev] == nullptr) {
+            CUDA_CHECK(cudaEventCreate(&g_tl_ref[dev]));
+            CUDA_CHECK(cudaEventRecord(g_tl_ref[dev], ctx->stream()));
+            CUDA_CHECK(cudaEventSynchronize(g_tl_ref[dev]));
+            g_tl_ref_us[dev] = ggml_time_us();
+        }
+        cudaEvent_t ev;
+        CUDA_CHECK(cudaEventCreate(&ev));
+        CUDA_CHECK(cudaEventRecord(ev, ctx->stream()));
+        g_tl_pending.push_back({ ev, dev, n_nodes, start });
+        ggml_cuda_timeline_drain();
+        ggml_cuda_set_device(dev);
+        return;
+    }
     auto * r = new ggml_cuda_timeline_rec{0, ctx->device, n_nodes, start};
     CUDA_CHECK(cudaLaunchHostFunc(ctx->stream(), ggml_cuda_timeline_cb, r));
 }
