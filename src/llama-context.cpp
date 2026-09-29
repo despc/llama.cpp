@@ -521,6 +521,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    for (auto & ev : nextn_stage_ev) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1915,9 +1921,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
-    nextn_stage_active = false;
+    const bool    nextn_stage_prev      = nextn_stage_active;
+    const int32_t nextn_stage_prev_half = nextn_stage_half;
+    const int64_t nextn_stage_prev_rows = nextn_stage_rows;
+    nextn_stage_active  = false;
+    nextn_stage_carried = false;
     const bool use_nextn_stage = nextn_stage_min > 0 && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked &&
         (int64_t) n_tokens_all >= nextn_stage_min;
+    if (use_nextn_stage) {
+        nextn_stage_half ^= 1;
+    }
+    const int64_t nextn_stage_base = (int64_t) nextn_stage_half * (cparams.n_batch + 1);
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
@@ -2173,20 +2187,33 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (!nextn_stage) {
                         ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
                         nextn_stage_ctx.reset(ggml_init(ip));
-                        nextn_stage = ggml_new_tensor_2d(nextn_stage_ctx.get(), GGML_TYPE_F32, n_embd, cparams.n_batch + 1);
+                        nextn_stage = ggml_new_tensor_2d(nextn_stage_ctx.get(), GGML_TYPE_F32, n_embd, 2*(cparams.n_batch + 1));
                         ggml_set_name(nextn_stage, "nextn_stage");
                         nextn_stage_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(nextn_stage_ctx.get(),
                                 ggml_backend_get_default_buffer_type(backend_h)));
                         GGML_ASSERT(nextn_stage_buf && "failed to allocate the nextn stage");
+                        for (auto & ev : nextn_stage_ev) {
+                            ev = ggml_backend_event_new(ggml_backend_get_device(backend_h));
+                        }
+                        nextn_stage_backend = backend_h;
                         LLAMA_LOG_INFO("%s: nextn stage %.1f MiB on %s\n", __func__,
                                 ggml_nbytes(nextn_stage) / 1048576.0, ggml_backend_name(backend_h));
                     }
-                    // rows offset+1.. of the stage, laid out like t_h_nextn
-                    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+                    ggml_init_params ip = { 4*ggml_tensor_overhead(), nullptr, true };
                     ggml_context_ptr vctx(ggml_init(ip));
+                    const size_t row_b = n_embd*sizeof(float);
+                    if (n_tokens_prev == 0 && nextn_stage_prev && nextn_stage_prev_half != nextn_stage_half) {
+                        // row 0 = last row of the previous stage batch, in stream order after it
+                        const int64_t src_row = (int64_t) nextn_stage_prev_half*(cparams.n_batch + 1) + nextn_stage_prev_rows;
+                        ggml_tensor * src = ggml_view_1d(vctx.get(), nextn_stage, n_embd, src_row*row_b);
+                        ggml_tensor * dst = ggml_view_1d(vctx.get(), nextn_stage, n_embd, nextn_stage_base*row_b);
+                        ggml_backend_tensor_copy_async(backend_h, backend_h, src, dst);
+                        nextn_stage_carried = true;
+                    }
+                    // rows base+offset+1.. of the stage, laid out like t_h_nextn
                     ggml_tensor * dst = ggml_view_4d(vctx.get(), nextn_stage,
                             t_h_nextn->ne[0], t_h_nextn->ne[1], t_h_nextn->ne[2], t_h_nextn->ne[3],
-                            t_h_nextn->nb[1], t_h_nextn->nb[2], t_h_nextn->nb[3], (offset + 1)*n_embd*sizeof(float));
+                            t_h_nextn->nb[1], t_h_nextn->nb[2], t_h_nextn->nb[3], (nextn_stage_base + offset + 1)*row_b);
                     ggml_backend_tensor_copy_async(backend_h, backend_h, t_h_nextn, dst);
                     ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + (n_rows - 1)*n_embd,
                             (n_rows - 1)*n_embd*sizeof(float), n_embd*sizeof(float));
@@ -2213,6 +2240,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (use_nextn_stage && nextn_stage) {
         nextn_stage_active = true;
         nextn_stage_rows   = n_tokens_all;
+        ggml_backend_event_record(nextn_stage_ev[nextn_stage_half], nextn_stage_backend);
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -4554,8 +4582,12 @@ void llama_nextn_stage_enable(llama_context * ctx, int32_t min_tokens) {
     ctx->nextn_stage_enable(min_tokens);
 }
 
-ggml_tensor * llama_nextn_stage_get(llama_context * ctx, int64_t * n_rows) {
-    return ctx->nextn_stage_get(n_rows);
+ggml_tensor * llama_nextn_stage_get(llama_context * ctx, int64_t * n_rows, int32_t * row0, bool * carried) {
+    return ctx->nextn_stage_get(n_rows, row0, carried);
+}
+
+void llama_nextn_stage_wait(llama_context * ctx, int32_t row0) {
+    ctx->nextn_stage_wait(row0);
 }
 
 void llama_set_nextn_input_stage(llama_context * ctx, ggml_tensor * stage, int32_t pos0) {

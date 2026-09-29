@@ -171,6 +171,11 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // finish any work deferred past process() (MTP prompt catch-up)
+    virtual bool flush() { return true; }
+    // flush only if the deferred work reaches position p0 or beyond
+    virtual bool flush_from(llama_pos /*p0*/) { return flush(); }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -1361,8 +1366,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    int32_t       stage_min = 0;
-    ggml_tensor * stage     = nullptr; // set per process() call
+    int32_t       stage_min     = 0;
+    ggml_tensor * stage         = nullptr; // set per process() call
+    int32_t       stage_row0    = 0;
+    bool          stage_carried = false;
+
+    // LLAMA_MTP_DEFER=1: a prompt batch without outputs is caught up by the draft only once the
+    // target runs the next batch, so the target's pipeline does not drain at every batch
+    bool defer_on = false;
+    struct deferred_t {
+        ggml_tensor *            stage = nullptr;
+        int32_t                  row0  = 0;
+        std::vector<llama_token> tokens;
+        std::vector<llama_pos>   pos;
+    } deferred;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1429,6 +1446,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_nextn_stage_enable(ctx_tgt, stage_min);
             }
         }
+        defer_on = stage_min > 0 && getenv("LLAMA_MTP_DEFER") != nullptr && atoi(getenv("LLAMA_MTP_DEFER")) != 0;
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -1473,7 +1491,63 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
+    // draft catch-up of a prompt batch whose h rows the target left in the stage at row0+1..
+    bool catch_up_stage(ggml_tensor * st, int32_t row0, const llama_token * tokens, const llama_pos * pos, int32_t n) {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // LLAMA_SPEC_PROFILE: host time of the deferred catch-up phases
+        struct cu_prof { double wait = 0, dec = 0, sync = 0; int64_t n = 0;
+            ~cu_prof() { if (n) fprintf(stderr, "catchup_profile calls=%lld wait=%.1f decode=%.1f sync=%.1f ms\n", (long long) n, wait/1e3, dec/1e3, sync/1e3); } };
+        static cu_prof cp;
+        static const bool cp_on = getenv("LLAMA_SPEC_PROFILE") != nullptr;
+        int64_t cp_t = cp_on ? ggml_time_us() : 0;
+        auto cp_lap = [&](double & acc) { if (cp_on) { const int64_t t = ggml_time_us(); acc += t - cp_t; cp_t = t; } };
+        if (cp_on) { cp.n++; }
+
+        llama_nextn_stage_wait(ctx_tgt, row0);
+        cp_lap(cp.wait);
+        common_batch_clear(batch);
+        for (int32_t k = 0; k < n; ++k) {
+            common_batch_add(batch, tokens[k], pos[k], { 0 }, 0);
+        }
+        llama_set_nextn_input_stage(ctx_dft, st, pos[0] - row0);
+        llama_batch b = batch;
+        b.embd = nullptr;
+        const int32_t rc = llama_decode(ctx_dft, b);
+        cp_lap(cp.dec);
+        // the target overwrites this half two batches later
+        llama_synchronize(ctx_dft);
+        cp_lap(cp.sync);
+        llama_set_nextn_input_stage(ctx_dft, nullptr, 0);
+        if (rc != 0) {
+            SPC_ERR("deferred llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", (int) rc, (int) pos[0]);
+            return false;
+        }
+        // carry-over row for whatever the draft processes next
+        ggml_backend_tensor_get(st, pending_h[0].data(), (size_t) (row0 + n) * row_bytes, row_bytes);
+        return true;
+    }
+
+    bool flush_from(llama_pos p0) override {
+        if (deferred.stage && !deferred.pos.empty() && deferred.pos.back() < p0) {
+            return true;
+        }
+        return flush();
+    }
+
+    bool flush() override {
+        if (!deferred.stage) {
+            return true;
+        }
+        ggml_tensor * st = deferred.stage;
+        deferred.stage = nullptr;
+        return catch_up_stage(st, deferred.row0, deferred.tokens.data(), deferred.pos.data(), (int32_t) deferred.tokens.size());
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        flush();
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1525,6 +1599,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        bool has_out = batch_in.logits == nullptr;
+        for (int k = 0; k < n_tokens && !has_out; ++k) {
+            has_out = batch_in.logits[k] != 0;
+        }
+        if (defer_on && n_seq == 1 && n_mtp_layers == 1 && !is_mem_shared && n_tokens >= stage_min && !has_out) {
+            int64_t srows = 0;
+            int32_t srow0 = 0;
+            bool    scarried = false;
+            ggml_tensor * st = llama_nextn_stage_get(ctx_tgt, &srows, &srow0, &scarried);
+            if (st && srows == n_tokens) {
+                // the batch before is complete on the device by now: catch it up
+                if (!flush()) {
+                    return false;
+                }
+                if (!scarried) {
+                    ggml_backend_tensor_set(st, pending_h[0].data(), (size_t) srow0 * row_bytes, row_bytes);
+                }
+                deferred.stage = st;
+                deferred.row0  = srow0;
+                deferred.tokens.assign(batch_in.token, batch_in.token + n_tokens);
+                deferred.pos.assign(batch_in.pos, batch_in.pos + n_tokens);
+                verify_h_rows[0] = 0;
+                return true;
+            }
+        }
+        if (!flush()) {
+            return false;
+        }
+
         // LLAMA_SPEC_PROFILE: host time of the MTP catch-up phases, printed at exit
         struct spec_prof { double sync = 0, copy = 0, decode = 0, dsync = 0; int64_t n = 0, toks = 0;
             ~spec_prof() { if (n) fprintf(stderr, "spec_profile calls=%lld tokens=%lld tgt_sync=%.1f copy=%.1f dft_decode=%.1f dft_sync=%.1f ms\n", (long long) n, (long long) toks, sync/1e3, copy/1e3, decode/1e3, dsync/1e3); } };
@@ -1550,7 +1653,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
                 sp_lap(sp.sync);
                 int64_t stage_rows = 0;
-                stage = stage_min > 0 && n_seq == 1 && n_mtp_layers == 1 ? llama_nextn_stage_get(ctx_tgt, &stage_rows) : nullptr;
+                stage = stage_min > 0 && n_seq == 1 && n_mtp_layers == 1 ?
+                    llama_nextn_stage_get(ctx_tgt, &stage_rows, &stage_row0, &stage_carried) : nullptr;
                 if (stage && stage_rows != n_tokens) {
                     stage = nullptr;
                 }
@@ -1572,9 +1676,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 if (stage) {
-                    // stage row 0 is the carry-over row, rows 1.. were written by the target
-                    ggml_backend_tensor_set(stage, pending_h[seq_id].data(), 0, row_bytes);
-                    llama_set_nextn_input_stage(ctx_dft, stage, batch_in.pos[0]);
+                    // row0 is the carry-over row (unless the target already copied it), then the target's rows
+                    if (!stage_carried) {
+                        ggml_backend_tensor_set(stage, pending_h[seq_id].data(), (size_t) stage_row0 * row_bytes, row_bytes);
+                    }
+                    llama_set_nextn_input_stage(ctx_dft, stage, batch_in.pos[0] - stage_row0);
                 } else {
                     set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
                 }
@@ -1651,6 +1757,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        flush();
 
         common_batch_clear(batch);
 
@@ -2946,6 +3054,28 @@ void common_speculative_draft(common_speculative * spec) {
             dp.drafting = false;
         }
     }
+}
+
+bool common_speculative_flush_from(common_speculative * spec, llama_pos p0) {
+    if (spec == nullptr) {
+        return true;
+    }
+    bool ok = true;
+    for (auto & impl : spec->impls) {
+        ok = impl->flush_from(p0) && ok;
+    }
+    return ok;
+}
+
+bool common_speculative_flush(common_speculative * spec) {
+    if (spec == nullptr) {
+        return true;
+    }
+    bool ok = true;
+    for (auto & impl : spec->impls) {
+        ok = impl->flush() && ok;
+    }
+    return ok;
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {

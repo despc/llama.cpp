@@ -302,6 +302,9 @@ struct server_slot {
             return false;
         }
 
+        // the draft may still owe a deferred prompt catch-up
+        common_speculative_flush(spec);
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -324,6 +327,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        common_speculative_flush(spec);
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -2362,6 +2366,7 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        common_speculative_flush(spec.get());
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -2949,6 +2954,7 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                common_speculative_flush(spec.get());
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
@@ -3267,6 +3273,7 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
+                                            common_speculative_flush(spec.get());
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
@@ -3368,6 +3375,7 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        common_speculative_flush(spec.get());
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
@@ -3442,6 +3450,8 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    // a deferred draft catch-up below p0 is not touched by this truncation
+                    common_speculative_flush_from(spec.get(), p0);
                     slot.mem.seq_rm(slot.id, p0, -1);
 
                     // If using an alora, there may be uncached tokens that come
@@ -3962,6 +3972,7 @@ private:
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
+                            common_speculative_flush(slot.spec);
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 

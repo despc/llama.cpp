@@ -121,14 +121,26 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_nextn_input_stage(ggml_tensor * stage, int32_t pos0);
     void          nextn_stage_enable(int32_t min_tokens) { nextn_stage_min = min_tokens; }
-    ggml_tensor * nextn_stage_get(int64_t * n_rows) const {
+    ggml_tensor * nextn_stage_get(int64_t * n_rows, int32_t * row0, bool * carried) const {
         if (!nextn_stage_active) {
             return nullptr;
         }
         if (n_rows) {
             *n_rows = nextn_stage_rows;
         }
+        if (row0) {
+            *row0 = nextn_stage_half * (int32_t) (cparams.n_batch + 1);
+        }
+        if (carried) {
+            *carried = nextn_stage_carried;
+        }
         return nextn_stage;
+    }
+    void nextn_stage_wait(int32_t row0) const {
+        const int half = row0 / (int32_t) (cparams.n_batch + 1);
+        if (nextn_stage_ev[half]) {
+            ggml_backend_event_synchronize(nextn_stage_ev[half]);
+        }
     }
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -323,12 +335,18 @@ private:
     // device copy of the unmasked nextn rows for a same-device MTP draft (llama_nextn_stage_*):
     // batches of >= nextn_stage_min tokens go to nextn_stage instead of the host, which then
     // receives only the last row of each ubatch
-    int32_t                 nextn_stage_min    = 0;
+    // two halves of n_batch+1 rows alternate between batches, so the draft can still read batch i
+    // while the target writes batch i+1; row 0 of a half is the carry-over from the previous batch
+    int32_t                 nextn_stage_min     = 0;
     ggml_context_ptr        nextn_stage_ctx;
     ggml_backend_buffer_ptr nextn_stage_buf;
-    ggml_tensor *           nextn_stage        = nullptr;
-    bool                    nextn_stage_active = false;
-    int64_t                 nextn_stage_rows   = 0;
+    ggml_tensor *           nextn_stage         = nullptr;
+    ggml_backend_event_t    nextn_stage_ev[2]   = { nullptr, nullptr };
+    ggml_backend_t          nextn_stage_backend = nullptr;
+    int32_t                 nextn_stage_half    = 1;     // half of the last stage batch
+    bool                    nextn_stage_active  = false; // the last decode filled the stage
+    bool                    nextn_stage_carried = false; // ... and copied its row 0 from the batch before
+    int64_t                 nextn_stage_rows    = 0;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

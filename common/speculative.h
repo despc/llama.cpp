@@ -94,6 +94,11 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
+// finish work an implementation deferred past common_speculative_process (call before touching the draft context)
+bool common_speculative_flush(common_speculative * spec);
+// same, but only when the deferred work reaches position p0 (before removing [p0, end) from the draft)
+bool common_speculative_flush_from(common_speculative * spec, llama_pos p0);
+
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
 // (optional) get/set internal state
