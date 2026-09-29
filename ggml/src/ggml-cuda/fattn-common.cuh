@@ -972,11 +972,59 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Converts to f16 only the K/V cells of the tile-wide groups that some query row can see (and the tail group).
+// The arithmetic is dequantize_block_q8_0_f16's, so a converted value is bit-identical to the full conversion.
+static __device__ __forceinline__ void flash_attn_live_f16_q8_0_rows(
+        const char * __restrict__ x, half * __restrict__ y, const int ne0, const int nhead,
+        const size_t nb1, const size_t nb2, const size_t nb3, const int64_t c0, const int nc, const int64_t s) {
+    // one warp per (cell, head) row, lanes over its value pairs; a row is ne0/QK8_0 whole blocks
+    const int lane   = threadIdx.x % WARP_SIZE;
+    const int nwarp  = blockDim.x / WARP_SIZE;
+    const int npair  = ne0/2;
+    for (int r = threadIdx.x / WARP_SIZE; r < nc*nhead; r += nwarp) {
+        const int64_t c    = c0 + r / nhead;
+        const int     h    = r % nhead;
+        const size_t  offs = c*nb1 + h*nb2 + s*nb3;
+        const block_q8_0 * b = (const block_q8_0 *) (x + offs);
+        half2 * y2 = (half2 *) y + (offs / sizeof(block_q8_0)) * (QK8_0/2);
+        for (int k = lane; k < npair; k += WARP_SIZE) {
+            const block_q8_0 & bk = b[k / (QK8_0/2)];
+            const char2 qs = ((const char2 *) bk.qs)[k % (QK8_0/2)];
+            y2[k] = __hmul2(make_half2(qs.x, qs.y), __half2half2(bk.d));
+        }
+    }
+}
+
+static __global__ void flash_attn_live_f16_q8_0(
+        const char * __restrict__ K, const char * __restrict__ V, half * __restrict__ K_f16, half * __restrict__ V_f16,
+        const half * __restrict__ mask,
+        const int64_t neK0, const int64_t n_kv, const int64_t neK2, const int64_t neV0, const int64_t neV2,
+        const size_t nbK1, const size_t nbK2, const size_t nbK3, const size_t nbV1, const size_t nbV2, const size_t nbV3,
+        const size_t nbm1, const size_t nbm3, const int n_q, const int tile) {
+    const int64_t c0 = int64_t(blockIdx.x)*tile;
+    const int64_t s  = blockIdx.y;
+    const int64_t nc = min(int64_t(tile), n_kv - c0);
+
+    // the tail tile is read unmasked past n_kv; the sparse gather reads cell 0 for its padding
+    bool live = c0 + tile > n_kv || c0 == 0;
+    const char * m = (const char *) mask + s*nbm3;
+    for (int idx = threadIdx.x; !live && idx < n_q*tile; idx += blockDim.x) {
+        const int r = idx / tile;
+        const int i = idx % tile;
+        live = __half2float(((const half *) (m + r*nbm1))[c0 + i]) != -INFINITY;
+    }
+    if (!__syncthreads_or(live)) {
+        return;
+    }
+    flash_attn_live_f16_q8_0_rows(K, K_f16, int(neK0), int(neK2), nbK1, nbK2, nbK3, c0, int(nc), s);
+    flash_attn_live_f16_q8_0_rows(V, V_f16, int(neV0), int(neV2), nbV1, nbV2, nbV3, c0, int(nc), s);
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const bool f16_live_only = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1023,7 +1071,41 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    // f16_live_only: the kernel reads no K/V cell outside the tiles some query can see (tile kernel: it skips closed
+    // tiles; sparse gather: visible cells and cell 0), so with few queries convert only those tiles, with the same
+    // values as the full conversion. GGML_CUDA_FATTN_LIVE_F16=0 disables.
+    static const bool live_f16_env = !getenv("GGML_CUDA_FATTN_LIVE_F16") || atoi(getenv("GGML_CUDA_FATTN_LIVE_F16")) != 0;
+    bool live_f16_done = false;
+    if (f16_live_only && live_f16_env && need_f16_K && need_f16_V && !V_is_K_view && mask &&
+            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && fp16_available(cc) &&
+            ggml_is_contiguously_allocated(K) && ggml_is_contiguously_allocated(V) &&
+            Q->ne[1] <= 32 && V->ne[1] == K->ne[1] && V->ne[3] == K->ne[3] &&
+            (mask->ne[3] == 1 || mask->ne[3] == K->ne[3]) && mask->ne[0] >= K->ne[1] &&
+            K->ne[0] % QK8_0 == 0 && V->ne[0] % QK8_0 == 0 && nbatch_fa > 0) {
+        half * K_f16 = (half *) f16_extra.K;
+        half * V_f16 = (half *) f16_extra.V;
+        GGML_ASSERT(K_f16 && V_f16);
+
+        const dim3 grid((K->ne[1] + nbatch_fa - 1) / nbatch_fa, K->ne[3], 1);
+        flash_attn_live_f16_q8_0<<<grid, 256, 0, main_stream>>>(
+            K_data, V_data, K_f16, V_f16, (const half *) mask->data,
+            K->ne[0], K->ne[1], K->ne[2], V->ne[0], V->ne[2],
+            K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3],
+            mask->nb[1], mask->ne[3] == 1 ? 0 : mask->nb[3], int(Q->ne[1]), nbatch_fa);
+        CUDA_CHECK(cudaGetLastError());
+
+        const size_t bs = QK8_0;
+        const size_t ts = sizeof(block_q8_0);
+        nb11 = nb11*bs*sizeof(half)/ts;
+        nb12 = nb12*bs*sizeof(half)/ts;
+        nb13 = nb13*bs*sizeof(half)/ts;
+        nb21 = nb21*bs*sizeof(half)/ts;
+        nb22 = nb22*bs*sizeof(half)/ts;
+        nb23 = nb23*bs*sizeof(half)/ts;
+        K_data = (const char *) K_f16;
+        V_data = (const char *) V_f16;
+        live_f16_done = true;
+    } else if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1051,7 +1133,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (!live_f16_done && need_f16_V && V->type != GGML_TYPE_F16) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
