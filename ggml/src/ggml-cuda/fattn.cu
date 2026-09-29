@@ -144,7 +144,12 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+    // Volta has the gather too, but only at a full tile width (its fragments need 32+ columns).
+    // GGML_CUDA_FATTN_VOLTA_SPARSE=0 keeps Volta on the dense kernel.
+    static const bool volta_sparse = !getenv("GGML_CUDA_FATTN_VOLTA_SPARSE") || atoi(getenv("GGML_CUDA_FATTN_VOLTA_SPARSE")) != 0;
+    const bool arch_ok = turing_mma_available(cc) || (volta_sparse && volta_mma_available(cc) && ncols1*ncols2 >= 32);
+
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && arch_ok &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
@@ -222,6 +227,16 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        // a QSA batch: gather each 8-query tile's visible cells instead of reading the dense cache
+        if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 8, 8)) {
+            if (use_gqa_opt && gqa_ratio % 4 == 0 && Q->ne[1] > 32 &&
+                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8)) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8>(ctx, dst);
+                return;
+            }
+        }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;

@@ -3,6 +3,8 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 
+#include <map>
+
 using namespace ggml_cuda_mma;
 
 // Config options for the MMA kernel.
@@ -2032,6 +2034,20 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
+// Remembers per kernel pointer and device, not in a function-local static: the RTX and V100 builds of this
+// file share such statics through the dynamic linker, and their kernels are different functions.
+template <typename kernel_ptr_t>
+static void ggml_cuda_fattn_mma_raise_smem(kernel_ptr_t kernel, const int id, const size_t nbytes) {
+    static std::mutex mtx;
+    static std::map<std::pair<const void *, int>, size_t> raised;
+    std::lock_guard<std::mutex> lock(mtx);
+    size_t & cur = raised[{(const void *) kernel, id}];
+    if (cur < nbytes) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes));
+        cur = nbytes;
+    }
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -2089,20 +2105,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
                 use_sparse = true;
 
-                static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-                if (!shared_memory_limit_raised[id]) {
-                    CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-                    shared_memory_limit_raised[id] = true;
-                }
+                ggml_cuda_fattn_mma_raise_smem(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), id, nbytes_shared_total);
             } else {
                 constexpr bool use_sparse_kernel = false;
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
 
-                static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-                if (!shared_memory_limit_raised[id]) {
-                    CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-                    shared_memory_limit_raised[id] = true;
-                }
+                ggml_cuda_fattn_mma_raise_smem(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), id, nbytes_shared_total);
             }
         } else
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -2110,22 +2118,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             constexpr bool use_sparse_kernel = false;
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
 
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-            if (!shared_memory_limit_raised[id]) {
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-                shared_memory_limit_raised[id] = true;
-            }
+            ggml_cuda_fattn_mma_raise_smem(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), id, nbytes_shared_total);
         }
     } else {
         constexpr bool use_logit_softcap = true;
         constexpr bool use_sparse_kernel = false;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
 
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
-        }
+        ggml_cuda_fattn_mma_raise_smem(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), id, nbytes_shared_total);
     }
 
     launch_fattn<DV, ncols1, ncols2>
