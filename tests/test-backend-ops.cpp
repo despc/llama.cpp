@@ -11022,6 +11022,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 4096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   768));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2304));
+    // prompt-batch expert matmuls at Qwen3.8-Flash-Next shapes (gate/up: k 2560 -> 640, broadcast input; down: 640 -> 2560)
+    for (int n_mats : {64, 512}) {
+        for (int n : {64, 200}) {
+            for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, n_mats, 10, true, 640, n, 2560));
+            }
+            for (ggml_type t : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, n_mats, 10, false, 2560, n, 640));
+            }
+        }
+    }
+
     // wide sparse gather (8 queries per tile) at a QSA prompt batch: gqa 12, 2048 visible cells per query
     for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         for (int nb : {64, 200}) {
@@ -11535,6 +11547,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // prompt-batch expert matmuls at Qwen3.8-Flash-Next shapes: gate/up k 2560 -> 640 (broadcast input), down 640 -> 2560
+    for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, true, 640, 512, 2560));
+    }
+    for (ggml_type t : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 512, 10, false, 2560, 512, 640));
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

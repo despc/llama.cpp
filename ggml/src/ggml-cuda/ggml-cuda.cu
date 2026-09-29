@@ -30,6 +30,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid-tc.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2269,6 +2270,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
+    if (ggml_cuda_mmid_tc_supported(src0, src1, dst->src[2], dst, cc)) {
+        return false;
+    }
+
     if (ggml_cuda_mmid_prefill_mmq(src0, cc, src1->ne[2])) {
         return false;
     }
@@ -2312,6 +2317,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        if (ggml_cuda_mmid_tc_supported(src0, src1, ids, dst, cc)) {
+            ggml_cuda_mul_mat_id_tc(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_mmid_prefill_mmq(src0, cc, ne12) ||
