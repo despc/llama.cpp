@@ -280,6 +280,15 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
+    // narrow rows first: the vectorized path would also take them, one block per row
+    if (ne00 <= 4 && ne10 >= 1024) {
+        const dim3 nblocks((ne10 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, MIN(ne11*ne12, UINT16_MAX), 1);
+        k_get_rows_float_narrow<src0_t, dst_t><<<nblocks, block_dims, 0, stream>>>(
+            src0_d, src1_d, dst_d, ne00, ne10, ne11, ne12_fdv,
+            s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+        return;
+    }
+
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
         const int64_t ne00v = ne00 / VEC;
@@ -303,14 +312,6 @@ static void get_rows_cuda_float(
                 s10, s11, s12);
             return;
         }
-    }
-
-    if (ne00 <= 4 && ne10 >= 1024) {
-        const dim3 nblocks((ne10 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, MIN(ne11*ne12, UINT16_MAX), 1);
-        k_get_rows_float_narrow<src0_t, dst_t><<<nblocks, block_dims, 0, stream>>>(
-            src0_d, src1_d, dst_d, ne00, ne10, ne11, ne12_fdv,
-            s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
-        return;
     }
 
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
