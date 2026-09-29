@@ -313,6 +313,359 @@ static void top_k_small_cuda(ggml_cuda_pool & pool, const float * src, int * dst
     k_top_k_small<bs><<<dim3(1, nrows), bs, 0, stream>>>(tv.get(), ti.get(), ov.get(), dst, nchunks * k, k, nchunks * k);
 }
 
+// Large-k top-k (the QSA indexer keeps ~2k of up to 160k cells per token): radix-select the k-th largest key,
+// take every larger element plus the lowest-index ties, then bitonic-sort those k. Keys are the float bits
+// twiddled as cub does, and the result is the first k of the stable descending sort it replaces.
+#define TOPK_RADIX_MAX 4096
+
+static __device__ __forceinline__ uint32_t topk_key(float x) {
+    const uint32_t u = __float_as_uint(x);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+template <int block_size>
+static __global__ void k_top_k_radix(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    const int row = blockIdx.x;
+    const float * s = src + (int64_t) row * ncols;
+
+    __shared__ uint32_t hist[256];
+    __shared__ uint32_t sh_prefix, sh_mask;
+    __shared__ int      sh_kk;
+    __shared__ uint32_t skey[TOPK_RADIX_MAX];
+    __shared__ int      sidx[TOPK_RADIX_MAX];
+    __shared__ int      scan[block_size];
+    __shared__ int      n_gt_pos;
+
+    if (threadIdx.x == 0) {
+        sh_prefix = 0;
+        sh_mask   = 0;
+        sh_kk     = k;
+    }
+    __syncthreads();
+
+    // radix select, most significant byte first
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8*pass;
+        for (int i = threadIdx.x; i < 256; i += block_size) {
+            hist[i] = 0;
+        }
+        __syncthreads();
+        const uint32_t prefix = sh_prefix, mask = sh_mask;
+        // uniform trip count per warp: the ballot/match below need every lane
+        for (int base = 0; base < ncols; base += block_size) {
+            const int      c   = base + threadIdx.x;
+            const uint32_t key = c < ncols ? topk_key(s[c]) : 0;
+            const bool     in  = c < ncols && (key & mask) == prefix;
+            const uint32_t d   = (key >> shift) & 0xFF;
+            const uint32_t act = __ballot_sync(0xffffffff, in);
+            if (in) {
+                // one atomic per distinct digit in the warp: ties would otherwise serialize
+                const uint32_t peers  = __match_any_sync(act, d);
+                const int      leader = __ffs(peers) - 1;
+                if ((int) (threadIdx.x % 32) == leader) {
+                    atomicAdd(&hist[d], __popc(peers));
+                }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int cum = 0;
+            const int kk = sh_kk;
+            for (int d = 255; d >= 0; --d) {
+                if (cum + (int) hist[d] >= kk) {
+                    sh_kk     = kk - cum;
+                    sh_prefix = prefix | ((uint32_t) d << shift);
+                    sh_mask   = mask | (0xFFu << shift);
+                    break;
+                }
+                cum += hist[d];
+            }
+        }
+        __syncthreads();
+    }
+
+    const uint32_t T  = sh_prefix; // key of the k-th largest element
+    const int      kk = sh_kk;     // how many elements equal to T are taken (the lowest indices)
+
+    // contiguous chunk per thread so that ties are ranked by index
+    const int chunk = (ncols + block_size - 1) / block_size;
+    const int c0 = min(ncols, (int) threadIdx.x * chunk);
+    const int c1 = min(ncols, c0 + chunk);
+    int n_eq = 0;
+    for (int c = c0; c < c1; ++c) {
+        n_eq += topk_key(s[c]) == T;
+    }
+    scan[threadIdx.x] = n_eq;
+    if (threadIdx.x == 0) {
+        n_gt_pos = 0;
+    }
+    __syncthreads();
+    // exclusive scan of n_eq (simple Hillis-Steele over the block)
+    for (int off = 1; off < block_size; off <<= 1) {
+        const int v = (int) threadIdx.x >= off ? scan[threadIdx.x - off] : 0;
+        __syncthreads();
+        scan[threadIdx.x] += v;
+        __syncthreads();
+    }
+    int eq_rank = scan[threadIdx.x] - n_eq;
+    const int n_gt = k - kk;
+    for (int c = c0; c < c1; ++c) {
+        const uint32_t key = topk_key(s[c]);
+        if (key > T) {
+            const int pos = atomicAdd(&n_gt_pos, 1);
+            skey[pos] = key;
+            sidx[pos] = c;
+        } else if (key == T) {
+            if (eq_rank < kk) {
+                skey[n_gt + eq_rank] = key;
+                sidx[n_gt + eq_rank] = c;
+            }
+            eq_rank++;
+        }
+    }
+    int P = 1;
+    while (P < k) {
+        P <<= 1;
+    }
+    for (int i = k + threadIdx.x; i < P; i += block_size) {
+        skey[i] = 0;
+        sidx[i] = INT_MAX;
+    }
+    __syncthreads();
+
+    // bitonic sort, value descending then index ascending
+    for (int size = 2; size <= P; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = threadIdx.x; i < P; i += block_size) {
+                const int j = i ^ stride;
+                if (j > i) {
+                    const bool desc = (i & size) == 0;
+                    const uint32_t ki = skey[i], kj = skey[j];
+                    const int      ii = sidx[i], ij = sidx[j];
+                    // i before j in the final order?
+                    const bool i_first = ki > kj || (ki == kj && ii < ij);
+                    if (i_first != desc) {
+                        skey[i] = kj; skey[j] = ki;
+                        sidx[i] = ij; sidx[j] = ii;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int i = threadIdx.x; i < k; i += block_size) {
+        dst[(int64_t) row * k + i] = sidx[i];
+    }
+}
+
+// Same selection spread over many blocks per row, for the few long rows of a decode step (one block per row
+// would leave the device idle). Row state lives in global memory between the passes.
+struct topk_mb_state { uint32_t prefix; uint32_t mask; int kk; int n_gt_pos; };
+
+static __global__ void k_topk_mb_init(topk_mb_state * st, uint32_t * ghist, const int nrows, const int k) {
+    const int row = blockIdx.x;
+    if (threadIdx.x == 0) {
+        st[row] = { 0u, 0u, k, 0 };
+    }
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        ghist[row*256 + i] = 0;
+    }
+    GGML_UNUSED(nrows);
+}
+
+template <int block_size>
+static __global__ void k_topk_mb_hist(const float * __restrict__ src, const topk_mb_state * __restrict__ st,
+        uint32_t * __restrict__ ghist, const int ncols, const int shift) {
+    const int row = blockIdx.y;
+    const float * s = src + (int64_t) row * ncols;
+    __shared__ uint32_t hist[256];
+    for (int i = threadIdx.x; i < 256; i += block_size) {
+        hist[i] = 0;
+    }
+    __syncthreads();
+    const uint32_t prefix = st[row].prefix, mask = st[row].mask;
+    for (int base = blockIdx.x * block_size; base < ncols; base += gridDim.x * block_size) {
+        const int      c   = base + threadIdx.x;
+        const uint32_t key = c < ncols ? topk_key(s[c]) : 0;
+        const bool     in  = c < ncols && (key & mask) == prefix;
+        const uint32_t d   = (key >> shift) & 0xFF;
+        const uint32_t act = __ballot_sync(0xffffffff, in);
+        if (in) {
+            const uint32_t peers  = __match_any_sync(act, d);
+            const int      leader = __ffs(peers) - 1;
+            if ((int) (threadIdx.x % 32) == leader) {
+                atomicAdd(&hist[d], __popc(peers));
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 256; i += block_size) {
+        if (hist[i]) {
+            atomicAdd(&ghist[row*256 + i], hist[i]);
+        }
+    }
+}
+
+static __global__ void k_topk_mb_pick(topk_mb_state * st, uint32_t * ghist, const int shift) {
+    const int row = blockIdx.x;
+    uint32_t * h = ghist + row*256;
+    if (threadIdx.x == 0) {
+        int cum = 0;
+        const int kk = st[row].kk;
+        for (int d = 255; d >= 0; --d) {
+            if (cum + (int) h[d] >= kk) {
+                st[row].kk     = kk - cum;
+                st[row].prefix = st[row].prefix | ((uint32_t) d << shift);
+                st[row].mask   = st[row].mask | (0xFFu << shift);
+                break;
+            }
+            cum += h[d];
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        h[i] = 0;
+    }
+}
+
+// per block: how many elements of its contiguous chunk equal the threshold
+template <int block_size>
+static __global__ void k_topk_mb_count(const float * __restrict__ src, const topk_mb_state * __restrict__ st,
+        int * __restrict__ cnt, const int ncols, const int chunk) {
+    const int row = blockIdx.y;
+    const float * s = src + (int64_t) row * ncols;
+    const uint32_t T = st[row].prefix;
+    const int c0 = min(ncols, (int) blockIdx.x * chunk);
+    const int c1 = min(ncols, c0 + chunk);
+    int n = 0;
+    for (int c = c0 + threadIdx.x; c < c1; c += block_size) {
+        n += topk_key(s[c]) == T;
+    }
+    __shared__ int red[block_size];
+    red[threadIdx.x] = n;
+    __syncthreads();
+    for (int off = block_size/2; off > 0; off >>= 1) {
+        if ((int) threadIdx.x < off) {
+            red[threadIdx.x] += red[threadIdx.x + off];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        cnt[row*gridDim.x + blockIdx.x] = red[0];
+    }
+}
+
+// candidates: all keys above the threshold (any order), then the ties in index order
+template <int block_size>
+static __global__ void k_topk_mb_emit(const float * __restrict__ src, topk_mb_state * __restrict__ st,
+        const int * __restrict__ cnt, uint32_t * __restrict__ ckey, int * __restrict__ cidx,
+        const int ncols, const int chunk, const int k) {
+    const int row = blockIdx.y;
+    const float * s = src + (int64_t) row * ncols;
+    const uint32_t T  = st[row].prefix;
+    const int      kk = st[row].kk;
+    const int      n_gt = k - kk;
+    int before = 0;
+    for (int b = 0; b < (int) blockIdx.x; ++b) {
+        before += cnt[row*gridDim.x + b];
+    }
+    const int b0 = min(ncols, (int) blockIdx.x * chunk);
+    const int b1 = min(ncols, b0 + chunk);
+    const int sub = (b1 - b0 + block_size - 1) / block_size;
+    const int c0 = min(b1, b0 + (int) threadIdx.x * sub);
+    const int c1 = min(b1, c0 + sub);
+    int n_eq = 0;
+    for (int c = c0; c < c1; ++c) {
+        n_eq += topk_key(s[c]) == T;
+    }
+    __shared__ int scan[block_size];
+    scan[threadIdx.x] = n_eq;
+    __syncthreads();
+    for (int off = 1; off < block_size; off <<= 1) {
+        const int v = (int) threadIdx.x >= off ? scan[threadIdx.x - off] : 0;
+        __syncthreads();
+        scan[threadIdx.x] += v;
+        __syncthreads();
+    }
+    int rank = before + scan[threadIdx.x] - n_eq;
+    uint32_t * rk = ckey + (int64_t) row * k;
+    int      * ri = cidx + (int64_t) row * k;
+    for (int c = c0; c < c1; ++c) {
+        const uint32_t key = topk_key(s[c]);
+        if (key > T) {
+            const int pos = atomicAdd(&st[row].n_gt_pos, 1);
+            rk[pos] = key;
+            ri[pos] = c;
+        } else if (key == T) {
+            if (rank < kk) {
+                rk[n_gt + rank] = key;
+                ri[n_gt + rank] = c;
+            }
+            rank++;
+        }
+    }
+}
+
+template <int block_size>
+static __global__ void k_topk_mb_sort(const uint32_t * __restrict__ ckey, const int * __restrict__ cidx,
+        int * __restrict__ dst, const int k) {
+    const int row = blockIdx.x;
+    __shared__ uint32_t skey[TOPK_RADIX_MAX];
+    __shared__ int      sidx[TOPK_RADIX_MAX];
+    int P = 1;
+    while (P < k) {
+        P <<= 1;
+    }
+    for (int i = threadIdx.x; i < P; i += block_size) {
+        skey[i] = i < k ? ckey[(int64_t) row*k + i] : 0;
+        sidx[i] = i < k ? cidx[(int64_t) row*k + i] : INT_MAX;
+    }
+    __syncthreads();
+    for (int size = 2; size <= P; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int i = threadIdx.x; i < P; i += block_size) {
+                const int j = i ^ stride;
+                if (j > i) {
+                    const bool desc = (i & size) == 0;
+                    const uint32_t ki = skey[i], kj = skey[j];
+                    const int      ii = sidx[i], ij = sidx[j];
+                    const bool i_first = ki > kj || (ki == kj && ii < ij);
+                    if (i_first != desc) {
+                        skey[i] = kj; skey[j] = ki;
+                        sidx[i] = ij; sidx[j] = ii;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int i = threadIdx.x; i < k; i += block_size) {
+        dst[(int64_t) row * k + i] = sidx[i];
+    }
+}
+
+static void top_k_radix_mb_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
+        const int ncols, const int nrows, const int k, cudaStream_t stream) {
+    constexpr int bs = 256;
+    const int nb    = std::max(1, std::min(64, ncols / 4096));
+    const int chunk = (ncols + nb - 1) / nb;
+    ggml_cuda_pool_alloc<topk_mb_state> st(pool, nrows);
+    ggml_cuda_pool_alloc<uint32_t>      ghist(pool, (size_t) nrows * 256);
+    ggml_cuda_pool_alloc<int>           cnt(pool, (size_t) nrows * nb);
+    ggml_cuda_pool_alloc<uint32_t>      ckey(pool, (size_t) nrows * k);
+    ggml_cuda_pool_alloc<int>           cidx(pool, (size_t) nrows * k);
+    k_topk_mb_init<<<nrows, 256, 0, stream>>>(st.get(), ghist.get(), nrows, k);
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8*pass;
+        k_topk_mb_hist<bs><<<dim3(nb, nrows), bs, 0, stream>>>(src, st.get(), ghist.get(), ncols, shift);
+        k_topk_mb_pick<<<nrows, 256, 0, stream>>>(st.get(), ghist.get(), shift);
+    }
+    k_topk_mb_count<bs><<<dim3(nb, nrows), bs, 0, stream>>>(src, st.get(), cnt.get(), ncols, chunk);
+    k_topk_mb_emit<bs><<<dim3(nb, nrows), bs, 0, stream>>>(src, st.get(), cnt.get(), ckey.get(), cidx.get(), ncols, chunk, k);
+    k_topk_mb_sort<1024><<<nrows, 1024, 0, stream>>>(ckey.get(), cidx.get(), dst, k);
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -340,6 +693,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static const bool fast = !getenv("GGML_CUDA_TOPK_FAST") || atoi(getenv("GGML_CUDA_TOPK_FAST")) != 0;
     if (fast && k <= TOPK_SMALL_MAX && ncols >= 2048) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
+    if (fast && k > TOPK_SMALL_MAX && k <= TOPK_RADIX_MAX && ncols >= 4096 && nrows <= INT_MAX) {
+        // few rows (a decode step): spread each row over many blocks; many rows (prefill): one block per row
+        static const bool mb = !getenv("GGML_CUDA_TOPK_MB") || atoi(getenv("GGML_CUDA_TOPK_MB")) != 0;
+        if (mb && nrows < 32 && ncols >= 16384) {
+            top_k_radix_mb_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+        } else {
+            k_top_k_radix<1024><<<(int) nrows, 1024, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+        }
         return;
     }
     // Fall back to argsort + copy
