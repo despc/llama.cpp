@@ -650,6 +650,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01, indices);
         }
+        // A K/V tile that every query of this block masks out (QSA keeps ~2k of the cells) only adds exact
+        // zeros: the row max stays, its scale is expf(0) == 1 and the probabilities are 0. Skip loading and
+        // computing it; the result is unchanged. Synchronous mask loads only (no cp.async pipeline).
+        if constexpr (!use_cp_async && !use_sparse) {
+            if (mask_h) {
+                __syncthreads();
+                bool live = false;
+                for (int idx = threadIdx.y*warp_size + threadIdx.x; idx < ncols1*nbatch_fa; idx += nwarps*warp_size) {
+                    live = live || __half2float(tile_mask[(idx / nbatch_fa)*(nbatch_fa + 8) + idx % nbatch_fa]) != -INFINITY;
+                }
+                if (!__syncthreads_or(live)) {
+                    return;
+                }
+            }
+        }
     }
 
     // For MLA K and V have the same data.

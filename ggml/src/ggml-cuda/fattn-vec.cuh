@@ -255,6 +255,22 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        // A tile that every query masks out entirely (the QSA indexer keeps ~2k of the cells) only adds exact
+        // zeros: the running max stays, its scale is expf(0) == 1 and each term is expf(-inf) == 0. Skip it
+        // without reading K/V; the result is unchanged.
+        if (mask) {
+            bool live = false;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    live = live || __half2float(maskh[j*ne11 + tid]) != -INFINITY;
+                }
+            }
+            if (!__syncthreads_or(live)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 

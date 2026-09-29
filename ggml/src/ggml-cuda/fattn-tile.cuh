@@ -595,6 +595,24 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
     const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
 
+    // A tile that every query of this block masks out (QSA keeps ~2k of the cells) only adds exact zeros:
+    // the running max stays, its scale is expf(0) == 1 and each probability is 0. Skip it; same result.
+    if (mask) {
+        bool live = false;
+        for (int idx = threadIdx.y*warp_size + threadIdx.x; idx < ncols1*nbatch_fa; idx += nwarps*warp_size) {
+            const int i = idx % nbatch_fa;
+            if (oob_check && i >= k_VKQ_sup) {
+                live = true;
+                continue;
+            }
+            const int j = fastmodulo(col_Q_0 + idx / nbatch_fa, ne01);
+            live = live || __half2float(mask[j*stride_mask + k_VKQ_0 + i]) != -INFINITY;
+        }
+        if (!__syncthreads_or(live)) {
+            return;
+        }
+    }
+
     float KQ_max_new[cpw];
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
