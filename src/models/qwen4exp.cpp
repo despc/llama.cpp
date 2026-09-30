@@ -1084,7 +1084,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    // only the set is used (it opens mask cells), so backends may return it unsorted (op_params[0] = 1)
+    ggml_tensor * top_k = ggml_top_k(ctx0, expanded, width);
+    ((int32_t *) top_k->op_params)[0] = 1;
+    top_k = ggml_cont(ctx0, top_k);
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);

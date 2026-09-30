@@ -323,7 +323,8 @@ static __device__ __forceinline__ uint32_t topk_key(float x) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-template <int block_size>
+// sorted = false: the k indices in any order (op_params[0] == 1, set by callers that only use the set)
+template <int block_size, bool sorted>
 static __global__ void k_top_k_radix(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
     const int row = blockIdx.x;
     const float * s = src + (int64_t) row * ncols;
@@ -422,6 +423,13 @@ static __global__ void k_top_k_radix(const float * __restrict__ src, int * __res
             }
             eq_rank++;
         }
+    }
+    if constexpr (!sorted) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < k; i += block_size) {
+            dst[(int64_t) row * k + i] = sidx[i];
+        }
+        return;
     }
     int P = 1;
     while (P < k) {
@@ -646,7 +654,7 @@ static __global__ void k_topk_mb_sort(const uint32_t * __restrict__ ckey, const 
 }
 
 static void top_k_radix_mb_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
-        const int ncols, const int nrows, const int k, cudaStream_t stream) {
+        const int ncols, const int nrows, const int k, const bool sorted, cudaStream_t stream) {
     constexpr int bs = 256;
     const int nb    = std::max(1, std::min(64, ncols / 4096));
     const int chunk = (ncols + nb - 1) / nb;
@@ -662,8 +670,11 @@ static void top_k_radix_mb_cuda(ggml_cuda_pool & pool, const float * src, int * 
         k_topk_mb_pick<<<nrows, 256, 0, stream>>>(st.get(), ghist.get(), shift);
     }
     k_topk_mb_count<bs><<<dim3(nb, nrows), bs, 0, stream>>>(src, st.get(), cnt.get(), ncols, chunk);
-    k_topk_mb_emit<bs><<<dim3(nb, nrows), bs, 0, stream>>>(src, st.get(), cnt.get(), ckey.get(), cidx.get(), ncols, chunk, k);
-    k_topk_mb_sort<1024><<<nrows, 1024, 0, stream>>>(ckey.get(), cidx.get(), dst, k);
+    // unsorted: the candidates are the result
+    k_topk_mb_emit<bs><<<dim3(nb, nrows), bs, 0, stream>>>(src, st.get(), cnt.get(), ckey.get(), sorted ? cidx.get() : dst, ncols, chunk, k);
+    if (sorted) {
+        k_topk_mb_sort<1024><<<nrows, 1024, 0, stream>>>(ckey.get(), cidx.get(), dst, k);
+    }
 }
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -698,10 +709,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (fast && k > TOPK_SMALL_MAX && k <= TOPK_RADIX_MAX && ncols >= 4096 && nrows <= INT_MAX) {
         // few rows (a decode step): spread each row over many blocks; many rows (prefill): one block per row
         static const bool mb = !getenv("GGML_CUDA_TOPK_MB") || atoi(getenv("GGML_CUDA_TOPK_MB")) != 0;
+        const bool sorted = ggml_get_op_params_i32(dst, 0) == 0;
         if (mb && nrows < 32 && ncols >= 16384) {
-            top_k_radix_mb_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, stream);
+            top_k_radix_mb_cuda(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, sorted, stream);
+        } else if (sorted) {
+            k_top_k_radix<1024, true><<<(int) nrows, 1024, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
         } else {
-            k_top_k_radix<1024><<<(int) nrows, 1024, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+            k_top_k_radix<1024, false><<<(int) nrows, 1024, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
         }
         return;
     }
