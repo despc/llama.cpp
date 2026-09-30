@@ -2,6 +2,8 @@
 
 #include "llama-memory-hybrid.h"
 
+class llama_kv_cells;
+
 #include <memory>
 #include <vector>
 
@@ -88,6 +90,12 @@ public:
                        bool blk_bias) const;
 
 private:
+    // one-sequence fast path of set_input_qsa for one stream; false: use the general path
+    bool set_input_qsa_fast(const llama_kv_cells & cells, int32_t * cur_cell_blk, int32_t * cur_blk_cells,
+                            int32_t * dst_blk_pos, float * dst_bias, const llama_ubatch * ubatch, int64_t s,
+                            int64_t n_ns, int64_t n_kv, int64_t n_blocks, int64_t n_tps, int64_t n_tokens,
+                            int64_t r, uint64_t slots_full, bool blk_bias) const;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);

@@ -270,6 +270,117 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+bool llama_memory_hybrid_idx::set_input_qsa_fast(
+        const llama_kv_cells & cells, int32_t * cur_cell_blk, int32_t * cur_blk_cells, int32_t * dst_blk_pos,
+        float * dst_bias, const llama_ubatch * ubatch, int64_t s, int64_t n_ns, int64_t n_kv, int64_t n_blocks,
+        int64_t n_tps, int64_t n_tokens, int64_t r, uint64_t slots_full, bool blk_bias) const {
+    if (!blk_bias) {
+        return false;
+    }
+
+    std::vector<uint64_t> slots(n_blocks, 0);
+    std::vector<int32_t>  first(n_blocks, -1);
+    std::vector<int32_t>  slot0(n_blocks, -1);
+
+    bool dup = false;
+    bool oor = false;
+
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (cells.is_empty(j)) {
+            continue;
+        }
+        const int64_t idx = cells.pos_get(j);
+        const int64_t pb  = idx/r;
+        if (pb >= n_blocks) {
+            oor = true;
+            continue;
+        }
+        const uint64_t bit = uint64_t(1) << (idx%r);
+        dup |= (slots[pb] & bit) != 0;
+        slots[pb] |= bit;
+        if (first[pb] < 0) {
+            first[pb] = (int32_t) j;
+        }
+        if (idx%r == 0) {
+            slot0[pb] = (int32_t) j;
+        }
+    }
+
+    if (dup && ubatch->is_pos_2d()) {
+        return false;   // ranked mrope positions: general path
+    }
+
+    GGML_ASSERT(!oor && "qsa: cell position runs past the cell window");
+
+    std::vector<int32_t> bid_of(n_blocks, -1);
+    std::vector<int32_t> bid_idx;
+    std::vector<int32_t> bid_cell;
+    bid_idx .reserve(n_blocks);
+    bid_cell.reserve(n_blocks);
+
+    int32_t n_bid = 0;
+    for (int64_t pb = 0; pb < n_blocks; ++pb) {
+        if (first[pb] >= 0 && slots[pb] == slots_full) {
+            bid_of[pb] = n_bid++;
+            bid_idx .push_back((int32_t) (pb*r));
+            bid_cell.push_back(first[pb]);
+        }
+    }
+
+    for (int32_t b = 0; b < n_bid; ++b) {
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = bid_idx[b];
+        }
+    }
+
+    const bool    have_dead = n_bid < n_blocks;
+    const int32_t dead_bid  = have_dead ? n_bid : (int32_t) n_blocks - 1;
+
+    for (int64_t j = 0; j < n_kv; ++j) {
+        int32_t bo = -1;
+        if (!cells.is_empty(j)) {
+            const int64_t idx = cells.pos_get(j);
+            const int64_t pb  = idx/r;
+            bo = bid_of[pb];
+            if (bo >= 0) {
+                cur_blk_cells[bo*r + (idx%r)] = (int32_t) j;
+            }
+        }
+        cur_cell_blk[j] = bo < 0 ? dead_bid : bo;
+    }
+
+    // whether each block's cells belong to a token's sequence: the same for every token of that sequence
+    std::vector<uint8_t> has(n_bid);
+    llama_seq_id has_seq = -1;
+
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const int64_t      i      = s*n_tps + ii;
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        if (seq_id != has_seq) {
+            for (int32_t b = 0; b < n_bid; ++b) {
+                has[b] = cells.seq_has((uint32_t) bid_cell[b], seq_id);
+            }
+            has_seq = seq_id;
+        }
+
+        const int64_t q          = ubatch->pos[i];
+        const int64_t tail_start = (q + 1)/r*r;
+
+        float * cur_blk_bias = dst_bias + i*n_blocks;
+        for (int32_t b = 0; b < n_bid; ++b) {
+            cur_blk_bias[b] = !has[b] ? -INFINITY : (bid_idx[b] >= tail_start ? 1e9f : 0.0f);
+        }
+        for (int64_t b = n_bid; b < n_blocks; ++b) {
+            cur_blk_bias[b] = -INFINITY;
+        }
+        if (have_dead) {
+            cur_blk_bias[dead_bid] = 1e9f;
+        }
+    }
+    GGML_UNUSED(n_tokens);
+    return true;
+}
+
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -302,8 +413,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(r <= 64);
     const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
 
-    // TODO: this runs per ubatch and is O(n_kv) per stream, about 865 us at 33k context. the cost
-    //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
+    // runs per ubatch and is O(n_kv) per stream; the one-sequence case takes set_input_qsa_fast
     std::vector<int32_t>  blk_of(n_kv);
     std::vector<int32_t>  cell_grp(n_kv);
     std::vector<int32_t>  grp_head(n_blocks);
@@ -344,6 +454,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
 
         const bool one_seq = n_seq_present <= 1;
+
+        // one sequence: a block is keyed on its index bucket alone, so the groups are plain per-bucket arrays and
+        // every full block belongs to the stream's sequence. Same arrays as the general path below, several times
+        // faster (it runs every generation step, O(n_kv)). mrope duplicates fall back to the general path.
+        if (one_seq && set_input_qsa_fast(cells, cur_cell_blk, cur_blk_cells, dst_blk_pos, dst_bias, ubatch,
+                                          s, n_ns, n_kv, n_blocks, n_tps, n_tokens, r, slots_full, blk_bias)) {
+            continue;
+        }
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
