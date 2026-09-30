@@ -125,6 +125,13 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
+// Volta takes the gather once n_kv >= ratio * the cells a query tile can gather. Its dense kernel has no cheaper
+// path, so the break-even is lower than the 2x Turing+ use: 0.8 measured best (prefill 10-30k +7%, 30-50k +4%).
+static float volta_sparse_ratio() {
+    static const float r = getenv("GGML_CUDA_FATTN_VOLTA_SPARSE_RATIO") ? atof(getenv("GGML_CUDA_FATTN_VOLTA_SPARSE_RATIO")) : 0.8f;
+    return r;
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
@@ -152,7 +159,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     return GGML_CUDA_CC_IS_NVIDIA(cc) && arch_ok &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
+        K->ne[1] >= std::max<int64_t>(4096, (volta_mma_available(cc) && !turing_mma_available(cc) ? volta_sparse_ratio() : 2.0f)*n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
