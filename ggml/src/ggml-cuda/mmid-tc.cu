@@ -1,5 +1,6 @@
 #include "mmid-tc.cuh"
 #include "mmid.cuh"
+#include "unary.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <mma.h>
@@ -168,30 +169,36 @@ template <> struct mmid_tc_chunk<GGML_TYPE_Q5_K> { static constexpr int rk = 256
 template <> struct mmid_tc_chunk<GGML_TYPE_Q5_1> { static constexpr int rk = 128; static constexpr int rb =  96; };
 template <> struct mmid_tc_chunk<GGML_TYPE_Q8_0> { static constexpr int rk = 128; static constexpr int rb = 136; };
 
-template <ggml_type type, int nwarps>
-__launch_bounds__(nwarps*WARP_SIZE, 4)
+// GLU: a second group of nwarps warps multiplies the gate weights (x_gate) for the same rows and tokens, and the
+// block writes silu(gate)*up, the fused MUL_MAT_ID + MUL_MAT_ID + GLU(swiglu). Activations are loaded once for both.
+template <ggml_type type, int nwarps, bool GLU>
+__launch_bounds__(nwarps*WARP_SIZE*(GLU ? 2 : 1), GLU ? 2 : (type == GGML_TYPE_Q5_1 ? 5 : 4))   // measured per type
 static __global__ void mul_mat_id_tc(
-        const char * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const char * __restrict__ x, const char * __restrict__ x_gate, const float * __restrict__ y, float * __restrict__ dst,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds,
         const int K, const size_t nb01, const size_t nb02, const int64_t s11, const int64_t s1, const int64_t s2,
         const int n_expert_used) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMPERE_MMA_AVAILABLE)
     using namespace nvcuda;
-    constexpr int NT   = nwarps*WARP_SIZE;
+    constexpr int NG   = GLU ? 2 : 1;                // weight groups
+    constexpr int NTG  = nwarps*WARP_SIZE;           // threads per group
+    constexpr int NT   = NG*NTG;
     constexpr int BM   = 16*nwarps;
     constexpr int LDA  = MMID_TC_BK + MMID_TC_PAD;
     constexpr int NCOL = MMID_TC_NC*MMID_TC_BN;
     constexpr int RK   = mmid_tc_chunk<type>::rk;
     constexpr int RB   = mmid_tc_chunk<type>::rb;
-    constexpr int RU   = RB/8;                       // uint2 per row chunk
-    constexpr int NU   = (BM*RU + NT - 1)/NT;        // uint2 per thread per chunk
+    using ru_t = typename std::conditional<RB % 16 == 0, uint4, uint2>::type;   // widest load the chunk allows
+    constexpr int RS   = sizeof(ru_t);
+    constexpr int RU   = RB/RS;                      // loads per row chunk
+    constexpr int NU   = (BM*RU + NTG - 1)/NTG;      // loads per thread per chunk
     constexpr int NBT  = (NCOL*(MMID_TC_BK/4) + NT - 1)/NT;
-    static_assert(BM*MMID_TC_BK/32 == NT, "one 32-value run per thread");
+    static_assert(BM*MMID_TC_BK/32 == NTG, "one 32-value run per thread");
     static_assert(RK % MMID_TC_BK == 0 && RB % 8 == 0, "chunk layout");
-    static_assert(nwarps*MMID_TC_BN*MMID_TC_BN*sizeof(float) <= BM*LDA*sizeof(half), "Cs aliases As");
+    static_assert(NG*nwarps*MMID_TC_BN*MMID_TC_BN*sizeof(float) <= NG*BM*LDA*sizeof(half), "Cs aliases As");
 
-    __shared__ __align__(16) char  raw[BM*RB];
-    __shared__ __align__(32) half  As[BM*LDA];
+    __shared__ __align__(16) char  raw[NG*BM*RB];
+    __shared__ __align__(32) half  As[NG*BM*LDA];
     __shared__ __align__(32) half  Bs[NCOL*LDA];
     __shared__ int src_row[NCOL];
     float * Cs = (float *) As;   // output staging, after the K loop
@@ -205,35 +212,44 @@ static __global__ void mul_mat_id_tc(
     }
 
     const int tid  = threadIdx.x;
-    const int warp = tid / WARP_SIZE;
+    const int grp  = tid / NTG;                      // 0: x (up), 1: x_gate
+    const int lt   = tid % NTG;
+    const int warp = tid / WARP_SIZE;                // block-wide warp index
+    const int wg   = warp % nwarps;                  // warp within its group
     const int lane = tid % WARP_SIZE;
 
-    const char * xe = x + expert*nb02 + row0*nb01;
-    const char * rrow = raw + (tid/2)*RB;
-    half2 * arun = (half2 *) (As + (tid/2)*LDA + (tid % 2)*32);
+    const char * xe   = (GLU && grp == 1 ? x_gate : x) + expert*nb02 + row0*nb01;
+    char       * rawg = raw + grp*BM*RB;
+    half       * Asg  = As  + grp*BM*LDA;
+    const char * rrow = rawg + (lt/2)*RB;
+    half2 * arun = (half2 *) (Asg + (lt/2)*LDA + (lt % 2)*32);
 
-    uint2 ru[NU];
+    ru_t ru[NU];
     auto load_chunk = [&](const int kc) {
         const size_t coff = size_t(kc/RK)*RB;
 #pragma unroll
         for (int i = 0; i < NU; ++i) {
-            const int u = tid + i*NT;
+            const int u = lt + i*NTG;
             if (u < BM*RU) {
-                ru[i] = *(const uint2 *) (xe + (u/RU)*nb01 + coff + 8*(u % RU));
+                ru[i] = *(const ru_t *) (xe + (u/RU)*nb01 + coff + RS*(u % RU));
             }
         }
     };
     auto store_chunk = [&]() {
 #pragma unroll
         for (int i = 0; i < NU; ++i) {
-            const int u = tid + i*NT;
+            const int u = lt + i*NTG;
             if (u < BM*RU) {
-                *(uint2 *) (raw + (u/RU)*RB + 8*(u % RU)) = ru[i];
+                *(ru_t *) (rawg + (u/RU)*RB + RS*(u % RU)) = ru[i];
             }
         }
     };
 
-    for (int c0 = 0; c0 < cnt; c0 += NCOL) {
+    // a busy expert's column passes are spread over gridDim.z blocks, so one hot expert is not a serial tail
+    if ((int) blockIdx.z*NCOL >= cnt) {
+        return;
+    }
+    for (int c0 = blockIdx.z*NCOL; c0 < cnt; c0 += gridDim.z*NCOL) {
         const int ncol  = min(NCOL, cnt - c0);
         const int ntile = (ncol + MMID_TC_BN - 1)/MMID_TC_BN;
         __syncthreads();   // previous pass done with src_row, raw and Cs
@@ -250,6 +266,19 @@ static __global__ void mul_mat_id_tc(
         }
         __syncthreads();   // src_row and the first chunk visible
 
+        // activations of the next step are loaded during the current step's MMA
+        float4 br[NBT];
+        auto load_b = [&](const int k0) {
+#pragma unroll
+            for (int i = 0; i < NBT; ++i) {
+                const int idx = tid + i*NT;
+                const int c   = idx / (MMID_TC_BK/4);
+                const int kk  = 4*(idx % (MMID_TC_BK/4));
+                br[i] = idx < NCOL*(MMID_TC_BK/4) && c < ncol ? *(const float4 *) (y + src_row[c]*s11 + k0 + kk) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        };
+        load_b(0);
+
         for (int kc = 0; kc < K; kc += RK) {
             const bool more = kc + RK < K;
             if (more) {
@@ -258,17 +287,9 @@ static __global__ void mul_mat_id_tc(
 #pragma unroll 1
             for (int ks = 0; ks < RK; ks += MMID_TC_BK) {
                 const int k0 = kc + ks;
-                float4 br[NBT];
-#pragma unroll
-                for (int i = 0; i < NBT; ++i) {
-                    const int idx = tid + i*NT;
-                    const int c   = idx / (MMID_TC_BK/4);
-                    const int kk  = 4*(idx % (MMID_TC_BK/4));
-                    br[i] = c < ncol ? *(const float4 *) (y + src_row[c]*s11 + k0 + kk) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                }
                 {
                     mmid_tc_w<type> wr;
-                    wr.load(rrow, ks + (tid % 2)*32);
+                    wr.load(rrow, ks + (lt % 2)*32);
                     wr.store(arun);
                 }
 #pragma unroll
@@ -276,7 +297,7 @@ static __global__ void mul_mat_id_tc(
                     const int idx = tid + i*NT;
                     const int c   = idx / (MMID_TC_BK/4);
                     const int kk  = 4*(idx % (MMID_TC_BK/4));
-                    if (c < ntile*MMID_TC_BN) {
+                    if (idx < NCOL*(MMID_TC_BK/4) && c < ntile*MMID_TC_BN) {
                         half2 * bp = (half2 *) (Bs + c*LDA + kk);
                         bp[0] = __floats2half2_rn(br[i].x, br[i].y);
                         bp[1] = __floats2half2_rn(br[i].z, br[i].w);
@@ -284,10 +305,14 @@ static __global__ void mul_mat_id_tc(
                 }
                 __syncthreads();
 
+                if (k0 + MMID_TC_BK < K) {
+                    load_b(k0 + MMID_TC_BK);
+                }
+
 #pragma unroll
                 for (int kk = 0; kk < MMID_TC_BK; kk += 16) {
                     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
-                    wmma::load_matrix_sync(a, As + warp*16*LDA + kk, LDA);
+                    wmma::load_matrix_sync(a, Asg + wg*16*LDA + kk, LDA);
 #pragma unroll
                     for (int ct = 0; ct < MMID_TC_NC; ++ct) {
                         if (ct < ntile) {
@@ -312,23 +337,35 @@ static __global__ void mul_mat_id_tc(
             }
             float * cw = Cs + warp*MMID_TC_BN*MMID_TC_BN;
             wmma::store_matrix_sync(cw, acc[ct], MMID_TC_BN, wmma::mem_row_major);
-            __syncwarp();
-            for (int idx = lane; idx < 16*MMID_TC_BN; idx += WARP_SIZE) {
-                const int i = idx % 16;
-                const int j = idx / 16;
-                const int c = ct*MMID_TC_BN + j;
-                if (c < ncol) {
-                    const int d  = ids_dst[beg + c0 + c];
-                    const int it = d / n_expert_used;
-                    const int ie = d % n_expert_used;
-                    dst[it*s2 + ie*s1 + row0 + warp*16 + i] = cw[i*MMID_TC_BN + j];
+            if constexpr (GLU) {
+                __syncthreads();   // the gate warps' tiles are read by the up warps
+            } else {
+                __syncwarp();
+            }
+            if (!GLU || grp == 0) {
+                const float * cg = Cs + (warp + nwarps)*MMID_TC_BN*MMID_TC_BN;
+                for (int idx = lane; idx < 16*MMID_TC_BN; idx += WARP_SIZE) {
+                    const int i = idx % 16;
+                    const int j = idx / 16;
+                    const int c = ct*MMID_TC_BN + j;
+                    if (c < ncol) {
+                        const int d  = ids_dst[beg + c0 + c];
+                        const int it = d / n_expert_used;
+                        const int ie = d % n_expert_used;
+                        const float v = cw[i*MMID_TC_BN + j];
+                        dst[it*s2 + ie*s1 + row0 + wg*16 + i] = GLU ? ggml_cuda_op_silu_single(cg[i*MMID_TC_BN + j]) * v : v;
+                    }
                 }
             }
-            __syncwarp();
+            if constexpr (GLU) {
+                __syncthreads();
+            } else {
+                __syncwarp();
+            }
         }
     }
 #else
-    GGML_UNUSED_VARS(x, y, dst, ids_src1, ids_dst, expert_bounds, K, nb01, nb02, s11, s1, s2, n_expert_used);
+    GGML_UNUSED_VARS(x, x_gate, y, dst, ids_src1, ids_dst, expert_bounds, K, nb01, nb02, s11, s1, s2, n_expert_used);
     NO_DEVICE_CODE;
 #endif
 }
@@ -366,12 +403,9 @@ bool ggml_cuda_mmid_tc_supported(const ggml_tensor * src0, const ggml_tensor * s
 #endif
 }
 
-void ggml_cuda_mul_mat_id_tc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                             const ggml_tensor * ids, ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, src0, src1, ids, dst);
-    GGML_ABORT("not supported");
-#else
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void ggml_cuda_mul_mat_id_tc_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * gate,
+                                         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_experts     = src0->ne[2];
@@ -390,16 +424,24 @@ void ggml_cuda_mul_mat_id_tc(ggml_backend_cuda_context & ctx, const ggml_tensor 
     CUDA_CHECK(cudaGetLastError());
 
     constexpr int nwarps = 4;
-    const dim3 grid(src0->ne[1] / (16*nwarps), n_experts, 1);
-    const dim3 block(nwarps*WARP_SIZE, 1, 1);
+    constexpr int zsplit = 4;   // blocks sharing a busy expert's column passes (measured: 1 < 8 < 4)
+    const dim3 grid(src0->ne[1] / (16*nwarps), n_experts, zsplit);
+    const dim3 block(nwarps*WARP_SIZE*(gate ? 2 : 1), 1, 1);
 
     const int64_t s11 = src1->nb[1] / sizeof(float);
     const int64_t s1  = dst->nb[1]  / sizeof(float);
     const int64_t s2  = dst->nb[2]  / sizeof(float);
 
 #define MMID_TC_LAUNCH(T) \
-    mul_mat_id_tc<T, nwarps><<<grid, block, 0, stream>>>((const char *) src0->data, (const float *) src1->data, (float *) dst->data, \
-        ids_src1.get(), ids_dst.get(), expert_bounds.get(), int(src0->ne[0]), src0->nb[1], src0->nb[2], s11, s1, s2, int(n_expert_used))
+    if (gate) { \
+        mul_mat_id_tc<T, nwarps, true><<<grid, block, 0, stream>>>((const char *) src0->data, (const char *) gate->data, \
+            (const float *) src1->data, (float *) dst->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(), \
+            int(src0->ne[0]), src0->nb[1], src0->nb[2], s11, s1, s2, int(n_expert_used)); \
+    } else { \
+        mul_mat_id_tc<T, nwarps, false><<<grid, block, 0, stream>>>((const char *) src0->data, nullptr, \
+            (const float *) src1->data, (float *) dst->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(), \
+            int(src0->ne[0]), src0->nb[1], src0->nb[2], s11, s1, s2, int(n_expert_used)); \
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q8_0: MMID_TC_LAUNCH(GGML_TYPE_Q8_0); break;
@@ -410,5 +452,25 @@ void ggml_cuda_mul_mat_id_tc(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
 #undef MMID_TC_LAUNCH
     CUDA_CHECK(cudaGetLastError());
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void ggml_cuda_mul_mat_id_tc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                             const ggml_tensor * ids, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, src0, src1, ids, dst);
+    GGML_ABORT("not supported");
+#else
+    ggml_cuda_mul_mat_id_tc_impl(ctx, src0, nullptr, src1, ids, dst);
+#endif
+}
+
+void ggml_cuda_mul_mat_id_tc_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
+                                 const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu_dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, up, gate, src1, ids, glu_dst);
+    GGML_ABORT("not supported");
+#else
+    ggml_cuda_mul_mat_id_tc_impl(ctx, up, gate, src1, ids, glu_dst);
 #endif
 }

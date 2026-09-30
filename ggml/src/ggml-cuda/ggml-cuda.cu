@@ -2012,6 +2012,12 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
+// GGML_CUDA_MMID_TC_GLU=0 keeps gate, up and swiglu as three kernels on the tensor-core path
+static bool mmid_tc_glu_enabled() {
+    static const bool enabled = !getenv("GGML_CUDA_MMID_TC_GLU") || atoi(getenv("GGML_CUDA_MMID_TC_GLU")) != 0;
+    return enabled;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -4490,6 +4496,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            // prompt-batch experts on Volta tensor cores: gate and up in one kernel, swiglu on the way out
+            if (up->op == GGML_OP_MUL_MAT_ID && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                    ggml_cuda_should_fuse_mul_mat(up, gate, glu) &&
+                    ggml_cuda_mmid_tc_supported(src0, src1, ids, up, ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                    ggml_is_contiguous(glu) && ggml_are_same_shape(glu, up) && ggml_is_contiguous(up) &&
+                    mmid_tc_glu_enabled()) {
+                ggml_cuda_mul_mat_id_tc_glu(*cuda_ctx, src0, gate->src[0], src1, ids, glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
@@ -4767,7 +4785,13 @@ struct ggml_cuda_op_profile_table {
 
     void add(int device, const ggml_tensor * node, double gpu_ms, double cpu_ms) {
         std::lock_guard<std::mutex> lock(mutex);
-        ggml_cuda_op_profile_stat & stat = stats[{ device, node->op, ggml_profile_tag_get(), node->name }];
+        // unnamed nodes are keyed by their first source's name (a weight), layer numbers folded
+        std::string nm = node->name;
+        if (nm.rfind("node_", 0) == 0 && node->src[0] && node->src[0]->name[0]) {
+            nm = std::string("w:") + node->src[0]->name;
+            for (char & ch : nm) { if (ch >= '0' && ch <= '9') ch = '#'; }
+        }
+        ggml_cuda_op_profile_stat & stat = stats[{ device, node->op, ggml_profile_tag_get(), nm }];
         stat.calls  += 1;
         stat.gpu_ms += gpu_ms;
         stat.cpu_ms += cpu_ms;

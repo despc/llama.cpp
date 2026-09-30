@@ -11022,6 +11022,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 4096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   768));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2304));
+    // fused gate/up/swiglu for prompt batches at Qwen3.8-Flash-Next shapes
+    for (int n_mats : {64, 512}) {
+        for (int n : {64, 200}) {
+            for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(t, GGML_GLU_OP_SWIGLU, 640, n, 2560, true, n_mats, 10, true));
+            }
+        }
+    }
+
     // prompt-batch expert matmuls at Qwen3.8-Flash-Next shapes (gate/up: k 2560 -> 640, broadcast input; down: 640 -> 2560)
     for (int n_mats : {64, 512}) {
         for (int n : {64, 200}) {
@@ -11547,6 +11556,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // hyper-connection matmuls at Flash-Next shapes for a 4-token verify step
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   320, 4, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 4,   320, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,     4, 4, 10240, {1, 1}, {1, 1}));
+
+    // gated delta net at Flash-Next shapes: 48 heads of 128, a prompt ubatch and a verify batch
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 512, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 4, 1));
+
+    // QSA indexer top-k at Flash-Next shapes: verify (4 rows) and a prompt ubatch (512 rows), 2051 of n_kv cells
+    for (int64_t n_kv : {30000, 100000}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_kv, 4, 1, 1}, 2051));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n_kv, 512, 1, 1}, 2051));
+    }
 
     // prompt-batch expert matmuls at Qwen3.8-Flash-Next shapes: gate/up k 2560 -> 640 (broadcast input), down 640 -> 2560
     for (ggml_type t : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {

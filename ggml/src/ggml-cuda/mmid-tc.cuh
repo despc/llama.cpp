@@ -10,3 +10,7 @@ bool ggml_cuda_mmid_tc_supported(const ggml_tensor * src0, const ggml_tensor * s
 
 void ggml_cuda_mul_mat_id_tc(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                              const ggml_tensor * ids, ggml_tensor * dst);
+
+// Fused MUL_MAT_ID (up) + MUL_MAT_ID (gate) + GLU(swiglu): writes silu(gate x) * (up x) to glu_dst.
+void ggml_cuda_mul_mat_id_tc_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
+                                 const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu_dst);
