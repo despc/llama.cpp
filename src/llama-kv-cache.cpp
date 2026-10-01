@@ -1715,6 +1715,77 @@ skip:
     }
 }
 
+// fast path: every used cell of the stream belongs to the batch's only sequence (causal, no SWA/ALiBi),
+// so a cell is visible iff 0 <= pos <= p1 (M-RoPE: plus the 2D check at pos == p1) and the seq bitsets
+// need not be read
+template<typename T>
+static bool set_input_kq_mask_one_seq(const args_set_input_kq_mask & args, T * data) {
+    const auto & ubatch = args.ubatch;
+
+    if (args.n_stream != 1 || args.swa_type != LLAMA_SWA_TYPE_NONE || args.hparams.use_alibi) {
+        return false;
+    }
+
+    const llama_seq_id seq_id = ubatch->seq_id[0][0];
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->n_seq_id[i] != 1 || ubatch->seq_id[i][0] != seq_id || ubatch->pos[i] < 0) {
+            return false;
+        }
+    }
+
+    const auto & cells = args.v_cells.at(args.seq_to_stream[seq_id]);
+    if (cells.seq_n_cells(seq_id) != cells.get_used()) {
+        return false;
+    }
+
+    const int64_t n_kv  = args.n_kv;
+    const bool    is_2d = ubatch->is_pos_2d();
+
+    llama_pos p_min = INT32_MAX;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch->pos[i]);
+    }
+
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+
+    // row 0 gets the part common to all tokens (cells before p_min are visible to every token); cells at or
+    // after p_min are few and are set per token below
+    std::vector<std::pair<uint32_t, llama_pos>> tail;
+    tail.reserve(ubatch->n_tokens + 32);
+
+    const uint32_t pm = (uint32_t) p_min;
+    for (int64_t j = 0; j < n_kv; ++j) {
+        // empty cells have pos -1, which wraps above any position
+        const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
+        data[j] = (uint32_t) p0 < pm ? mask_keep : mask_drop;
+        if (p0 >= p_min) {
+            tail.emplace_back((uint32_t) j, p0);
+        }
+    }
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        T * row = data + n_kv*i;
+        if (i > 0) {
+            std::copy(data, data + n_kv, row);
+        }
+
+        const llama_pos p1   = ubatch->pos[i];
+        const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+        const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+
+        for (const auto & [j, p0] : tail) {
+            bool keep = p0 <= p1;
+            if (is_2d && p0 == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                keep = false;
+            }
+            row[j] = keep ? mask_keep : mask_drop;
+        }
+    }
+
+    return true;
+}
+
 template<typename T, bool causal, bool swa, bool is_2d>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
     const bool alibi = args.hparams.use_alibi;
@@ -1747,6 +1818,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
 template<typename T>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data, bool causal_attn) {
+    if (causal_attn && set_input_kq_mask_one_seq<T>(args, data)) {
+        return;
+    }
     if (causal_attn) {
         set_input_kq_mask_impl<T, true> (args, data);
     } else {

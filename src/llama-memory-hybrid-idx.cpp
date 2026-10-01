@@ -285,23 +285,30 @@ bool llama_memory_hybrid_idx::set_input_qsa_fast(
     bool dup = false;
     bool oor = false;
 
+    // r is a power of two in practice (4): shift and mask instead of a 64-bit division per cell
+    const bool    r_pow2  = (r & (r - 1)) == 0;
+    const int     r_shift = r_pow2 ? __builtin_ctzll((unsigned long long) r) : 0;
+    const int32_t r_mask  = (int32_t) r - 1;
+    auto blk_of_pos  = [&](int32_t idx) -> int32_t { return r_pow2 ? idx >> r_shift : idx / (int32_t) r; };
+    auto slot_of_pos = [&](int32_t idx) -> int32_t { return r_pow2 ? idx & r_mask  : idx % (int32_t) r; };
+
     for (int64_t j = 0; j < n_kv; ++j) {
         if (cells.is_empty(j)) {
             continue;
         }
-        const int64_t idx = cells.pos_get(j);
-        const int64_t pb  = idx/r;
+        const int32_t idx = cells.pos_get(j);
+        const int32_t pb  = blk_of_pos(idx);
         if (pb >= n_blocks) {
             oor = true;
             continue;
         }
-        const uint64_t bit = uint64_t(1) << (idx%r);
+        const uint64_t bit = uint64_t(1) << slot_of_pos(idx);
         dup |= (slots[pb] & bit) != 0;
         slots[pb] |= bit;
         if (first[pb] < 0) {
             first[pb] = (int32_t) j;
         }
-        if (idx%r == 0) {
+        if (slot_of_pos(idx) == 0) {
             slot0[pb] = (int32_t) j;
         }
     }
@@ -339,18 +346,21 @@ bool llama_memory_hybrid_idx::set_input_qsa_fast(
     for (int64_t j = 0; j < n_kv; ++j) {
         int32_t bo = -1;
         if (!cells.is_empty(j)) {
-            const int64_t idx = cells.pos_get(j);
-            const int64_t pb  = idx/r;
-            bo = bid_of[pb];
+            const int32_t idx = cells.pos_get(j);
+            const int32_t pb  = blk_of_pos(idx);
+            bo = pb < n_blocks ? bid_of[pb] : -1;
             if (bo >= 0) {
-                cur_blk_cells[bo*r + (idx%r)] = (int32_t) j;
+                cur_blk_cells[bo*r + slot_of_pos(idx)] = (int32_t) j;
             }
         }
         cur_cell_blk[j] = bo < 0 ? dead_bid : bo;
     }
 
     // whether each block's cells belong to a token's sequence: the same for every token of that sequence
+    // a token's row is the sequence's base row (0 or -inf per block) with 1e9 on its tail blocks; bid_idx is
+    // increasing, so the tail is a suffix of the block list
     std::vector<uint8_t> has(n_bid);
+    std::vector<float>   base(n_blocks);
     llama_seq_id has_seq = -1;
 
     for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -358,7 +368,12 @@ bool llama_memory_hybrid_idx::set_input_qsa_fast(
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
         if (seq_id != has_seq) {
             for (int32_t b = 0; b < n_bid; ++b) {
-                has[b] = cells.seq_has((uint32_t) bid_cell[b], seq_id);
+                has[b]  = cells.seq_has((uint32_t) bid_cell[b], seq_id);
+                base[b] = has[b] ? 0.0f : -INFINITY;
+            }
+            std::fill(base.begin() + n_bid, base.end(), -INFINITY);
+            if (have_dead) {
+                base[dead_bid] = 1e9f;
             }
             has_seq = seq_id;
         }
@@ -367,14 +382,13 @@ bool llama_memory_hybrid_idx::set_input_qsa_fast(
         const int64_t tail_start = (q + 1)/r*r;
 
         float * cur_blk_bias = dst_bias + i*n_blocks;
-        for (int32_t b = 0; b < n_bid; ++b) {
-            cur_blk_bias[b] = !has[b] ? -INFINITY : (bid_idx[b] >= tail_start ? 1e9f : 0.0f);
-        }
-        for (int64_t b = n_bid; b < n_blocks; ++b) {
-            cur_blk_bias[b] = -INFINITY;
-        }
-        if (have_dead) {
-            cur_blk_bias[dead_bid] = 1e9f;
+        std::copy(base.begin(), base.end(), cur_blk_bias);
+
+        const int32_t b0 = std::lower_bound(bid_idx.begin(), bid_idx.begin() + n_bid, tail_start) - bid_idx.begin();
+        for (int32_t b = b0; b < n_bid; ++b) {
+            if (has[b]) {
+                cur_blk_bias[b] = 1e9f;
+            }
         }
     }
     GGML_UNUSED(n_tokens);
@@ -414,9 +428,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
     const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
 
     // runs per ubatch and is O(n_kv) per stream; the one-sequence case takes set_input_qsa_fast
-    std::vector<int32_t>  blk_of(n_kv);
-    std::vector<int32_t>  cell_grp(n_kv);
-    std::vector<int32_t>  grp_head(n_blocks);
+    // sized by group_cells: the fast path does not need them
+    std::vector<int32_t>  blk_of;
+    std::vector<int32_t>  cell_grp;
+    std::vector<int32_t>  grp_head;
     std::vector<int32_t>  grp_next;
     std::vector<int32_t>  grp_first;
     std::vector<int32_t>  grp_slot0;
@@ -473,9 +488,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
         auto group_cells = [&]() {
             // -1 means no usable block: an incomplete or short group cannot be pooled
-            std::fill(blk_of.begin(),   blk_of.end(),   -1);
-            std::fill(cell_grp.begin(), cell_grp.end(), -1);
-            std::fill(grp_head.begin(), grp_head.end(), -1);
+            blk_of  .assign(n_kv,     -1);
+            cell_grp.assign(n_kv,     -1);
+            grp_head.assign(n_blocks, -1);
 
             grp_next .clear();
             grp_first.clear();
