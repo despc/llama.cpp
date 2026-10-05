@@ -1085,6 +1085,83 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+
+// Q8_0, 2-8 columns, short K (hyper-connection "up": 10240 rows x K=320): mul_mat_vec_q gives every two rows a block of
+// nwarps warps, and with K=320 only 40 of its threads have a K block to work on - 5120 blocks that are mostly idle.
+// Here a warp owns RW rows (1 as launched). Lane x computes what threads x, 32+x, .. of the baseline block compute (each has at most
+// one K iteration, that is the launch condition) and adds them in warp order, then the same xor tree runs over the
+// lanes: per row the same partial sums in the same order, so the result is bit-identical.
+// GGML_CUDA_MMVQ_COMPACT=0 keeps the baseline kernel.
+template <int ncols_dst, int nwarps_base, int RW>
+__launch_bounds__(4*WARP_SIZE, 1)
+static __global__ void mul_mat_vec_q8_0_compact(
+        const void * vx, const void * vy, float * dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst) {
+    constexpr int qi  = QI8_0;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+
+    const int lane = threadIdx.x;
+    const uint32_t row0 = (blockIdx.x*blockDim.y + threadIdx.y)*RW;
+    const int blocks_per_row_x = ncols_x / QK8_0;
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float tmp[ncols_dst][RW];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < RW; ++i) {
+            tmp[j][i] = 0.0f;
+        }
+    }
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int w = 0; w < nwarps_base; ++w) {
+        const int tid = w*WARP_SIZE + lane;
+        const int kbx = tid / (qi/vdr);
+        const int kqs = vdr * (tid % (qi/vdr));
+        if (kbx < blocks_per_row_x) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+                for (int i = 0; i < RW; ++i) {
+                    if (row0 + i < nrows_x) {
+                        const float d = vec_dot_q8_0_q8_1(vx, &y[j*stride_col_y + kbx], (row0 + i)*stride_row_x + kbx, kqs);
+                        // the baseline thread's partial sum is 0.0f + d, the block then adds the warps in order
+                        tmp[j][i] = __fadd_rn(tmp[j][i], __fadd_rn(0.0f, d));
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int i = 0; i < RW; ++i) {
+            const float r = warp_reduce_sum<WARP_SIZE>(tmp[j][i]);
+            if (lane == 0 && row0 + i < nrows_x) {
+                dst[j*stride_col_dst + row0 + i] = r;
+            }
+        }
+    }
+}
+
+template <int ncols_dst, int nwarps_base>
+static void mul_mat_vec_q8_0_compact_launch(
+        const void * vx, const void * vy, float * dst, const int ncols_x, const int nrows_x,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    // one row per warp, 4 warps per block: measured best on sm_70 and sm_120 (2 or 4 rows per warp are slower than the baseline)
+    constexpr int nw = 4;
+    const dim3 block_dims(WARP_SIZE, nw, 1);
+    const dim3 block_nums((nrows_x + nw - 1)/nw, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q8_0_compact<ncols_dst, nwarps_base, 1>, launch_params,
+        vx, vy, dst, (uint32_t) ncols_x, (uint32_t) nrows_x, (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst);
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1115,6 +1192,29 @@ static void mul_mat_vec_q_switch_ncols_dst(
     constexpr int vdr                   = get_vdr_mmvq(type);
     const int     blocks_per_row_x      = ncols_x / qk;
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        static const bool compact = !getenv("GGML_CUDA_MMVQ_COMPACT") || atoi(getenv("GGML_CUDA_MMVQ_COMPACT")) != 0;
+        const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr;
+        const int  nwarps_base = ncols_dst >= 2 && ncols_dst <= 8 ? calc_nwarps(type, ncols_dst, table_id) : 0;
+        // the baseline must be the 2-rows-per-block kernel whose threads each see at most one K iteration
+        if (compact && !has_ids && !has_fusion && warp_size == WARP_SIZE && nrows_x >= 1024 &&
+                (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_TURING) &&
+                nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 && nsamples_x == 1 && nsamples_dst == 1 &&
+                (nwarps_base == 4 || nwarps_base == 2) && blocks_per_row_x <= nwarps_base * blocks_per_iter_1warp) {
+#define MMVQ_COMPACT_CASE(N) case N: \
+                if (nwarps_base == 4) { mul_mat_vec_q8_0_compact_launch<N, 4>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); } \
+                else                  { mul_mat_vec_q8_0_compact_launch<N, 2>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); } \
+                return;
+            switch (ncols_dst) {
+                MMVQ_COMPACT_CASE(2) MMVQ_COMPACT_CASE(3) MMVQ_COMPACT_CASE(4) MMVQ_COMPACT_CASE(5)
+                MMVQ_COMPACT_CASE(6) MMVQ_COMPACT_CASE(7) MMVQ_COMPACT_CASE(8)
+                default: break;
+            }
+#undef MMVQ_COMPACT_CASE
+        }
+    }
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
