@@ -84,6 +84,14 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
         hparams.indexer_kpool = r;
     }
+    // LLAMA_MTP_QSA: files from the older converter carry no ratio for the MTP block; it shares the trunk's
+    if (getenv("LLAMA_MTP_QSA") != nullptr) {
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            if (hparams.dsv4_compress_ratios[il] == 0) {
+                hparams.dsv4_compress_ratios[il] = hparams.indexer_kpool;
+            }
+        }
+    }
     if (hparams.indexer_kpool == 1 || (hparams.indexer_kpool > 0 && hparams.indexer_top_k % hparams.indexer_kpool != 0)) {
         throw std::runtime_error(format("QSA needs a compress ratio above 1 that divides the budget, got %u and %u",
                                         hparams.indexer_kpool, hparams.indexer_top_k));
@@ -326,6 +334,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        static const bool mtp_qsa = getenv("LLAMA_MTP_QSA") != nullptr;
+        if (mtp_qsa) {
+            return std::make_unique<graph_mtp_qsa>(*this, params);
+        }
         return std::make_unique<graph_mtp>(*this, params);
     }
     return std::make_unique<graph>(*this, params);
@@ -881,6 +893,98 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+// upstream's MTP block (#29761): QSA over a hybrid-idx draft memory. LLAMA_MTP_QSA=1 selects it, see create_memory
+llama_model_qwen4exp::graph_mtp_qsa::graph_mtp_qsa(const llama_model & model, const llm_graph_params & params) :
+    graph(model, params, no_build_t{}) {
+    GGML_ASSERT(hparams.n_layer_nextn == 1 && "qwen4exp MTP has a single block");
+    GGML_ASSERT(ubatch.token && "qwen4exp MTP requires token input");
+
+    const int64_t hc = hparams.dsv4_hc_mult;
+    GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "qwen4exp MTP hidden width mismatch");
+
+    const int il = hparams.n_layer();
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm && layer.nextn.hc_head_norm &&
+            "MTP block missing, load the model with MTP enabled");
+
+    int sections[4];
+    std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
+
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->tokens);
+
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+    ggml_set_input(inp->embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
+    ggml_set_input(inp->h);
+    ggml_set_name(inp->h, "mtp_h_input");
+
+    ggml_tensor * tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+    cb(tok_embd, "mtp_tok_embd", il);
+
+    ggml_tensor * h = inp->h;
+
+    res->add_input(std::move(inp));
+
+    auto * inp_hyb = build_inp_mem_hybrid();
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
+
+    // the draft memory has no recurrent layer, but its input still has to be allocated
+    ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
+
+    llm_graph_input_kpool * inp_kpool = nullptr;
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+        GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
+                "the indexer cache must track the attention cache cell for cell");
+        inp_kpool = build_inp_kpool(mctx_hyb);
+    }
+
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), ggml_reshape_2d(ctx0, layer.nextn.hnorm, n_embd, hc), nullptr, LLM_NORM_RMS, il);
+    cb(h_norm, "mtp_hnorm", il);
+
+    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
+    cb(e_norm, "mtp_enorm", il);
+
+    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    cb(res_hc, "mtp_eh_proj", il);
+
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
+    cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+    cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
+    cur    = build_layer_ffn(cur, il);
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+    // the next draft step reads this residual as its h
+    ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
+    ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+    res->t_h_nextn = cparams.embeddings_nextn_masked ? flat_out : flat;
+    cb(res->t_h_nextn, "h_nextn", il);
+    ggml_build_forward_expand(gf, res->t_h_nextn);
+
+    cur = build_hc_mix(ggml_reshape_3d(ctx0, flat_out, n_embd, hc, flat_out->ne[1]),
+            layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
+            nullptr, nullptr, il);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

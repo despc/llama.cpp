@@ -377,14 +377,15 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t n_pool_real = 0;
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
+    uint32_t pad         = 64; // pool count granularity, coarser for prompt ubatches (LLAMA_KV_PAD_PREFILL)
     bool     cache_safe  = true;
 };
 
 namespace {
 
 // The last padded pool is always unused.
-uint32_t kpool_pad(uint32_t n_pool) {
-    return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+uint32_t kpool_pad(uint32_t n_pool, uint32_t pad = 64) {
+    return std::max<uint32_t>(pad, GGML_PAD(n_pool + 1, pad));
 }
 
 // Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
@@ -441,17 +442,38 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
         size_t n_kept = 0;
+        bool   tail_rebuilt = false;
         if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
                 sq.pos_min == sp.begin()->first) {
             n_kept = sq.cells.size();
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
+        } else if (mem_idx_stale[s] != POS_CLEAN && mem_idx_stale[s] > 0 && !sq.shared && !sq.cells.empty() &&
+                !sp.empty() && sq.pos_min == sp.begin()->first) {
+            // an edit at p0 leaves the cells below p0 alone (see mem_idx_stale_set): keep them and the pools made
+            // of them, re-read only the tail. Speculative decoding edits the tail every step, and copying the
+            // whole position set is O(n_kv) pointer chasing (2.5 ms at 50k cells)
+            const auto key = std::make_pair(mem_idx_stale[s], (uint32_t) 0);
+            const size_t n_keep = std::lower_bound(sq.cells.begin(), sq.cells.end(), key) - sq.cells.begin();
+            auto it = sp.lower_bound(key);
+            if (n_keep > 0 && it != sp.begin() && *std::prev(it) == sq.cells[n_keep - 1]) {
+                sq.cells.resize(n_keep);
+                for (; it != sp.end(); ++it) {
+                    sq.cells.push_back(*it);
+                }
+                while (!sq.pools.empty() && sq.pools.back() + kpool > n_keep) {
+                    sq.pools.pop_back();
+                }
+                sq.j_next    = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+                n_kept       = n_keep;
+                tail_rebuilt = sq.cells.size() == sp.size();
+            }
         }
 
         // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
         // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        if (sq.cells.size() != sp.size() || (mem_idx_stale[s] != POS_CLEAN && !tail_rebuilt)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -684,6 +706,18 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     st.n_pool_real = lay.n_pool_real;
     st.cache_safe  = lay.cache_safe;
     st.n_new       = 0;
+
+    // LLAMA_KV_PAD_PREFILL: prompt ubatches (>= 64 tokens) pad the pool count as coarsely as the KV view, so
+    // consecutive ubatches keep one graph shape and the scheduler does not re-plan (and sync all backends) for each
+    static const uint32_t pad_prefill = [] {
+        const char * e = getenv("LLAMA_KV_PAD_PREFILL");
+        const uint32_t v = e ? (uint32_t) atoi(e) : 0;
+        return (v & (v - 1)) == 0 ? v : 0;
+    }();
+    st.pad = 64;
+    if (ubatch.n_tokens >= 64 && pad_prefill/mem->get_kpool() > st.pad) {
+        st.pad = pad_prefill/mem->get_kpool();
+    }
     if (++st.generation == 0) {
         std::fill(st.is_new.begin(), st.is_new.end(), 0);
         st.generation = 1;
@@ -766,7 +800,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const auto *   idx        = mem->get_mem_idx();
     const uint32_t n_pool_max = idx->get_size() / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real, st.pad) - 1, n_pool_max})});
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -776,7 +810,7 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real);
+    return kpool_pad(kpool_cur().n_pool_real, kpool_cur().pad);
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -806,7 +840,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const bool by_order = mem->get_kpool_by_order();
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real, st.pad));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);

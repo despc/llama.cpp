@@ -2598,6 +2598,11 @@ struct llama_model_qwen4exp : public llama_model_base {
         graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
+    // upstream's variant: the MTP block attends through QSA (LLAMA_MTP_QSA=1)
+    struct graph_mtp_qsa : public graph {
+        graph_mtp_qsa(const llama_model & model, const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
