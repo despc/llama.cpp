@@ -4034,6 +4034,45 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // scale -> sigmoid -> scale and scale -> silu (hyper-connection gates): one launch instead of three (two)
+    const bool sss = ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
+        && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID;
+    const bool ssl = ops.size() == 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY
+        && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU;
+    if (sss || ssl) {
+        const int last = node_idx + (int) ops.size() - 1;
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { last })) {
+            return false;
+        }
+        const ggml_tensor * scale = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0] || unary->src[0] != scale) {
+            return false;
+        }
+        if (scale->src[0]->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(scale->src[0]) || ggml_get_op_params_f32(scale, 1) != 0.0f) {
+            return false;
+        }
+        if (sss) {
+            const ggml_tensor * scale2 = cgraph->nodes[node_idx + 2];
+            if (scale2->src[0] != unary || scale2->type != GGML_TYPE_F32 || ggml_get_op_params_f32(scale2, 1) != 0.0f) {
+                return false;
+            }
+        }
+        // element i only reads element i, so the output may be the input buffer itself (the allocator runs these
+        // ops in place); any other overlap is refused
+        const ggml_tensor * src = scale->src[0];
+        const ggml_tensor * dst = cgraph->nodes[last];
+        if (dst->data != src->data) {
+            const char * s0 = (const char *) src->data;
+            const char * d0 = (const char *) dst->data;
+            if (s0 < d0 + ggml_nbytes(dst) && d0 < s0 + ggml_nbytes(src)) {
+                return false;
+            }
+        }
+        return ggml_nelements(dst) == ggml_nelements(src);
+    }
+
     return false;
 }
 
@@ -4824,6 +4863,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // GGML_CUDA_FUSE_SCALE_ACT=0 keeps the separate kernels
+    static const bool fuse_scale_act = !getenv("GGML_CUDA_FUSE_SCALE_ACT") || atoi(getenv("GGML_CUDA_FUSE_SCALE_ACT")) != 0;
+    if (fuse_scale_act && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
+        ggml_cuda_op_scale_act_scale(*cuda_ctx, cgraph->nodes[i + 2], node, cgraph->nodes[i + 2]);
+        return 2;
+    }
+    if (fuse_scale_act && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+        ggml_cuda_op_scale_act_scale(*cuda_ctx, cgraph->nodes[i + 1], node, nullptr);
+        return 1;
     }
 
     return 0;
