@@ -369,9 +369,105 @@ static __global__ void k_top_k_small(const float * __restrict__ src, const int *
     }
 }
 
+// Small k by k rounds of a block argmax over a chunk held in registers (EPT values per thread): no per-thread sorted
+// list, whose runtime-indexed insertion spills to local memory. The order is topk_better's (larger value, then lower
+// index), so the chunk's k picks and the merged result are the ones k_top_k_small produces.
+template <int block_size, int EPT>
+static __global__ void __launch_bounds__(block_size) k_top_k_small_reg(const float * __restrict__ src, const int * __restrict__ src_idx,
+        float * __restrict__ dst_val, int * __restrict__ dst_idx, const int ncols, const int k) {
+    constexpr int chunk = block_size*EPT;
+    const int row = blockIdx.y;
+    const int c0  = blockIdx.x*chunk;
+    const float * s  = src + (int64_t) row*ncols;
+    const int *   si = src_idx ? src_idx + (int64_t) row*ncols : nullptr;
+
+    float v[EPT];
+    int   id[EPT];
+#pragma unroll
+    for (int e = 0; e < EPT; ++e) {
+        const int c = c0 + e*block_size + threadIdx.x;   // coalesced
+        const bool ok = c < ncols;
+        v[e]  = ok ? s[c] : -INFINITY;
+        id[e] = ok ? (si ? si[c] : c) : INT_MAX;
+    }
+
+    __shared__ float wv[block_size/32];
+    __shared__ int   wi[block_size/32];
+    __shared__ int   win;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int out  = (row*gridDim.x + blockIdx.x)*k;
+
+    for (int r = 0; r < k; ++r) {
+        float bv = -INFINITY;
+        int   bi = INT_MAX;
+#pragma unroll
+        for (int e = 0; e < EPT; ++e) {
+            if (topk_better(v[e], id[e], bv, bi)) {
+                bv = v[e]; bi = id[e];
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, bv, off);
+            const int   oi = __shfl_xor_sync(0xffffffff, bi, off);
+            if (topk_better(ov, oi, bv, bi)) {
+                bv = ov; bi = oi;
+            }
+        }
+        if (lane == 0) {
+            wv[warp] = bv; wi[warp] = bi;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            bv = lane < block_size/32 ? wv[lane] : -INFINITY;
+            bi = lane < block_size/32 ? wi[lane] : INT_MAX;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffff, bv, off);
+                const int   oi = __shfl_xor_sync(0xffffffff, bi, off);
+                if (topk_better(ov, oi, bv, bi)) {
+                    bv = ov; bi = oi;
+                }
+            }
+            if (lane == 0) {
+                win = bi;
+                dst_val[out + r] = bv;
+                dst_idx[out + r] = bi == INT_MAX ? -1 : bi;
+            }
+        }
+        __syncthreads();
+        // the winner (index unique, padding never wins while a real value is left) leaves the race
+        const int w = win;
+#pragma unroll
+        for (int e = 0; e < EPT; ++e) {
+            if (id[e] == w && w != INT_MAX) {
+                v[e] = -INFINITY; id[e] = INT_MAX;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 static void top_k_small_cuda(ggml_cuda_pool & pool, const float * src, int * dst,
         const int ncols, const int nrows, const int k, cudaStream_t stream) {
     constexpr int bs = 256;
+    // GGML_CUDA_TOPK_REG=0 keeps the insertion-list kernel for the first pass
+    static const bool reg = !getenv("GGML_CUDA_TOPK_REG") || atoi(getenv("GGML_CUDA_TOPK_REG")) != 0;
+    if (reg) {
+        constexpr int ept = 8;
+        const int nchunks = (ncols + bs*ept - 1) / (bs*ept);
+        ggml_cuda_pool_alloc<float> tv(pool, (size_t) nrows * nchunks * k);
+        ggml_cuda_pool_alloc<int>   ti(pool, (size_t) nrows * nchunks * k);
+        k_top_k_small_reg<bs, ept><<<dim3(nchunks, nrows), bs, 0, stream>>>(src, nullptr, tv.get(), ti.get(), ncols, k);
+        ggml_cuda_pool_alloc<float> ov(pool, (size_t) nrows * k);
+        const int nc2 = nchunks * k;
+        if (nc2 <= bs*ept) {
+            k_top_k_small_reg<bs, ept><<<dim3(1, nrows), bs, 0, stream>>>(tv.get(), ti.get(), ov.get(), dst, nc2, k);
+        } else {
+            k_top_k_small<bs><<<dim3(1, nrows), bs, 0, stream>>>(tv.get(), ti.get(), ov.get(), dst, nc2, k, nc2);
+        }
+        return;
+    }
     const int nchunks = std::min(32, (ncols + 4095) / 4096);
     const int chunk   = (ncols + nchunks - 1) / nchunks;
     ggml_cuda_pool_alloc<float> tv(pool, (size_t) nrows * nchunks * k);
@@ -764,11 +860,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // fork: our small-k and radix kernels first (unsorted output when op_params[0] == 1)
     // GGML_CUDA_TOPK_FAST=0 keeps the full argsort
     static const bool fast = !getenv("GGML_CUDA_TOPK_FAST") || atoi(getenv("GGML_CUDA_TOPK_FAST")) != 0;
-    if (fast && k <= TOPK_SMALL_MAX && ncols >= 2048) {
+    // upstream's selection may take its radix select, whose atomic gather picks among ties at the threshold in thread
+    // order (not reproducible run to run: QSA scores hold many -inf ties early in a prompt); ours take the lowest-index
+    // ties. Small k above upstream's bitonic width (it sorts those deterministically), larger k at every width.
+    if (fast && k <= TOPK_SMALL_MAX && ncols > GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC) {
         top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
     }
-    if (fast && k > TOPK_SMALL_MAX && k <= TOPK_RADIX_MAX && ncols >= 4096 && nrows <= INT_MAX) {
+    if (fast && k > TOPK_SMALL_MAX && k <= TOPK_RADIX_MAX && k < ncols && nrows <= INT_MAX) {
         // few rows (a decode step): spread each row over many blocks; many rows (prefill): one block per row
         static const bool mb = !getenv("GGML_CUDA_TOPK_MB") || atoi(getenv("GGML_CUDA_TOPK_MB")) != 0;
         const bool sorted = ggml_get_op_params_i32(dst, 0) == 0;
