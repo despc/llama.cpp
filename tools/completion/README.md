@@ -152,6 +152,7 @@ llama-completion.exe -m models\gemma-1.1-7b-it.Q4_K_M.gguf --ignore-eos -n -1
 | `--expert-heat-log-period N` | expert heatmap log interval in updates (default: 0, 0 = off)<br/>(env: LLAMA_ARG_EXPERT_HEAT_LOG_PERIOD) |
 | `--expert-hyst N` | expert hot store hysteresis ratio (default: 1.3, 0 = off)<br/>(env: LLAMA_ARG_EXPERT_HYST) |
 | `--expert-dwell N` | expert hot store minimum dwell updates before swap (default: 0, 0 = off)<br/>(env: LLAMA_ARG_EXPERT_DWELL) |
+| `--moe-cache-mib N` | GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)<br/>(env: LLAMA_ARG_MOE_CACHE_MIB) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
 | `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |
 | `-sm, --split-mode {none,layer,row,tensor}` | how to split the model across multiple GPUs, one of:<br/>- none: use one GPU only<br/>- layer (default): split layers and KV across GPUs (pipelined)<br/>- row: split weight across GPUs by rows (parallelized)<br/>- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)<br/>(env: LLAMA_ARG_SPLIT_MODE) |
