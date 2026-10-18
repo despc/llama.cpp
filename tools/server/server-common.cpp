@@ -162,6 +162,8 @@ std::vector<std::string> server_model_output_modalities(common_decision_type dec
         case COMMON_DECISION_TYPE_LFM2_D1:
         case COMMON_DECISION_TYPE_LFM2_D1_OMNI:
             return {"decisions"};
+        case COMMON_DECISION_TYPE_GRANITE_SWITCH:
+            return {"text", "decisions"};
         default:
             // fallback when there is no decision type or the metadata is bad
             return {"text"};
@@ -1504,27 +1506,37 @@ json oaicompat_chat_params_parse(
     {
         // The instruction the template wrote into the prompt, as the model will see it.
         // Qwen3.8 writes "Reasoning effort is set to <level>."; harmony-format templates
-        // write "Reasoning: <level>".  The first occurrence is the template's own, since
-        // the system block comes before any message text.
-        const std::string & prompt = out_session.prompt();
+        // write "Reasoning: <level>".  Only template parts are searched, so user text
+        // quoting the marker cannot match.
         std::string to_model = "no reasoning-effort instruction in the prompt";
-        for (const char * marker : { "Reasoning effort is set to ", "\nReasoning: " }) {
-            size_t pos = prompt.find(marker);
-            if (pos == std::string::npos) {
+        bool found = false;
+        for (const auto & part : out_session.prompt().parts) {
+            if (part.is_input) {
                 continue;
             }
-            pos += strlen(marker);
-            size_t end = pos;
-            while (end < prompt.size() && (isalnum((unsigned char) prompt[end]) || prompt[end] == '-' || prompt[end] == '_')) {
-                ++end;
+            const std::string & prompt = part.text;
+            for (const char * marker : { "Reasoning effort is set to ", "\nReasoning: " }) {
+                size_t pos = prompt.find(marker);
+                if (pos == std::string::npos) {
+                    continue;
+                }
+                pos += strlen(marker);
+                size_t end = pos;
+                while (end < prompt.size() && (isalnum((unsigned char) prompt[end]) || prompt[end] == '-' || prompt[end] == '_')) {
+                    ++end;
+                }
+                to_model = prompt.substr(pos, end - pos);
+                found = true;
+                break;
             }
-            to_model = prompt.substr(pos, end - pos);
-            break;
+            if (found) {
+                break;
+            }
         }
         SRV_INF("reasoning_effort: in = %s -> model: %s\n", effort_in.c_str(), to_model.c_str());
     }
 
-    llama_params["prompt"] = out_session.prompt();
+    llama_params["prompt"] = out_session.prompt().str();
 
     // Reasoning budget: pass parameters through to sampling layer
     {
