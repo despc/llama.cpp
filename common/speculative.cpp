@@ -1697,7 +1697,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         for (int k = 0; k < n_tokens && !has_out; ++k) {
             has_out = batch_in.tokens[k].output;
         }
-        if (defer_on && n_seq == 1 && n_mtp_layers == 1 && !is_mem_shared && n_tokens >= stage_min && !has_out) {
+        if (defer_on && n_seq == 1 && n_mtp_layers == 1 && !is_mem_shared && n_tokens >= stage_min && !has_out &&
+            !batch_in.has_embd()) {
             int64_t srows = 0;
             int32_t srow0 = 0;
             bool    scarried = false;
