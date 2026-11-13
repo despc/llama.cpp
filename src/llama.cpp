@@ -343,7 +343,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->t_start_us = tm.t_start_us;
 
         model->hparams.vocab_only = params.vocab_only;
-        model->hparams.no_alloc   = params.no_alloc;
 
         // remember the on-disk path so the expert cache sidecar can derive a
         // .tier file next to the model. empty for metadata/file-pointer loads.
@@ -460,12 +459,6 @@ struct llama_model * llama_model_init_from_user(
     params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
-}
-// deprecated
-struct llama_model * llama_load_model_from_file(
-        const char * path_model,
-        struct llama_model_params params) {
-    return llama_model_load_from_file(path_model, params);
 }
 
 struct llama_model * llama_model_load_from_file(

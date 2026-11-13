@@ -26,6 +26,7 @@ import type { ModelPropsManager } from '$lib/stores/models/props.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
 // explicit type imports: the app.d.ts globals resolve to `any`, so import the real types
 import type {
+	ApiModelsSseDownloadFailedData,
 	ApiModelsSseDownloadProgressData,
 	ModelDownloadEntry,
 	ModelDownloadProgress
@@ -97,18 +98,17 @@ export class ModelStatusManager {
 	/** Sidecar kinds each in-flight or paused download pulls with its model. */
 	private downloadSidecars = new SvelteMap<string, ModelSidecar[]>();
 	/**
-	 * Draft sidecars the registered models pull with them, keyed by the repo of the model
-	 * that pulls them: the router records them in the model's `--model-draft` args.
+	 * Draft sidecars the registered models pull with them, keyed by the model that pulls
+	 * them: the router records them in the model's `--model-draft` args, and each quant
+	 * of a repo can pull a different draft.
 	 */
-	private draftSidecarsByRepo = $derived.by(() => {
+	private draftSidecarsByModel = $derived.by(() => {
 		const result = new SvelteMap<string, ModelSidecarBadge[]>();
 
 		for (const m of this.host.routerModels) {
 			const args = m.status?.args;
 
 			if (!args) continue;
-
-			const baseRepo = repoOf(m.id);
 
 			for (let i = 0; i < args.length - 1; i++) {
 				if (args[i] !== CLI_FLAGS.MODEL_DRAFT && args[i] !== CLI_FLAGS.MODEL_DRAFT_SHORT) {
@@ -128,7 +128,7 @@ export class ModelStatusManager {
 					quant: meta.quant,
 					repo: parsed.repo
 				};
-				const kinds = result.get(baseRepo);
+				const kinds = result.get(m.id);
 
 				if (kinds) {
 					if (
@@ -139,7 +139,7 @@ export class ModelStatusManager {
 						kinds.push(badge);
 					}
 				} else {
-					result.set(baseRepo, [badge]);
+					result.set(m.id, [badge]);
 				}
 			}
 		}
@@ -202,7 +202,7 @@ export class ModelStatusManager {
 
 	private statusWaiters = new SvelteMap<
 		string,
-		{ target: ServerModelStatus; resolve: () => void; reject: (e: Error) => void }
+		{ target: ServerModelStatus; resolve: () => void; reject: (e: Error) => void }[]
 	>();
 	/** Models the user asked to stop (pause or cancel); the download_failed the stop triggers is intentional, not a failure. */
 	private stopRequests = new SvelteMap<string, ModelDownloadStopRequest>();
@@ -370,10 +370,21 @@ export class ModelStatusManager {
 		}
 	}
 
+	/** Resolves once the model is loaded: waits on a load in progress, or starts one. */
 	async ensureLoaded(modelId: string): Promise<void> {
 		if (this.host.isModelLoaded(modelId)) return;
 
-		await this.load(modelId);
+		const status = this.host.routerModels.find((m) => m.id === modelId)?.status?.value;
+
+		if (!this.loadingStates.get(modelId) && status !== ServerModelStatus.LOADING) {
+			await this.load(modelId);
+
+			return;
+		}
+
+		this.subscribe();
+
+		await this.waitForStatus(modelId, ServerModelStatus.LOADED);
 	}
 
 	/**
@@ -404,17 +415,19 @@ export class ModelStatusManager {
 	}
 
 	/**
-	 * Draft sidecars a repo pulls with its model, e.g. `mtp` at `Q8_0`: the
-	 * router records loaded models' sidecars in their `--model-draft` args, and
-	 * lists the sidecars each cached model has on disk.
+	 * Draft sidecars a model pulls with it, e.g. `mtp` at `Q8_0`: the router
+	 * records each model's sidecars in its `--model-draft` args, and lists the
+	 * sidecars each cached repo has on disk.
 	 */
-	getDraftSidecars(repoId: string): ModelSidecarBadge[] {
-		// one badge per kind: the args know the quant, the listing carries kinds only,
-		// and a draft still coming down is pending rather than on disk
-		const merged = [...(this.draftSidecarsByRepo.get(repoId) ?? [])];
+	getDraftSidecars(modelId: string): ModelSidecarBadge[] {
+		const repo = repoOf(modelId);
+		// one badge per kind: the args know the quant of this model's draft, the
+		// listing carries repo-wide kinds only, and a draft still coming down is
+		// pending rather than on disk
+		const merged = [...(this.draftSidecarsByModel.get(modelId) ?? [])];
 
 		for (const source of [this.listedSidecarsByRepo, this.pendingSidecarsByRepo]) {
-			for (const badge of source.get(repoId) ?? []) {
+			for (const badge of source.get(repo) ?? []) {
 				if (!merged.some((b) => b.kind === badge.kind && b.repo === badge.repo)) {
 					merged.push(badge);
 				}
@@ -644,6 +657,12 @@ export class ModelStatusManager {
 		if (event.event === ServerModelsSseEventType.DOWNLOAD_FAILED) {
 			request = this.stopRequests.get(event.model);
 			this.stopRequests.delete(event.model);
+
+			// a stop another client asked for (e.g. the Llama app) reads as a pause: a
+			// cancel follows with model_remove, which drops the row
+			if (!request && (event.data as ApiModelsSseDownloadFailedData | undefined)?.stopped) {
+				request = ModelDownloadStopRequest.PAUSE;
+			}
 		}
 
 		const progress = this.downloadProgress.get(event.model) ?? null;
@@ -704,6 +723,20 @@ export class ModelStatusManager {
 		for (const file of Object.values(progress)) {
 			downloaded += file?.done ?? 0;
 			total += file?.total ?? 0;
+		}
+
+		// a download another client started (e.g. the Llama app) pulls the sidecars the
+		// list reports for it; the first event of one the list does not know refreshes it
+		if (!this.downloadSidecars.has(event.model)) {
+			const listed = this.host.routerModels.find(
+				(m) => downloadIdKey(m.id) === downloadIdKey(event.model)
+			);
+
+			if (listed) {
+				this.downloadSidecars.set(event.model, listed.sidecars ?? []);
+			} else if (!this.downloadProgress.has(event.model)) {
+				void this.host.fetchRouterModels();
+			}
 		}
 
 		this.downloadProgress.set(event.model, {
@@ -787,25 +820,27 @@ export class ModelStatusManager {
 	}
 
 	private rejectStatus(modelId: string, error: Error): void {
-		const waiter = this.statusWaiters.get(modelId);
+		const waiters = this.statusWaiters.get(modelId) ?? [];
 
-		if (waiter) {
-			this.statusWaiters.delete(modelId);
-			waiter.reject(error);
-		}
+		this.statusWaiters.delete(modelId);
+
+		for (const waiter of waiters) waiter.reject(error);
 	}
 
 	private removeRouterModel(modelId: string): void {
 		const idx = this.host.routerModels.findIndex((m) => m.id === modelId);
 
+		// download state goes even for a row the list does not carry yet, e.g. a
+		// download another client started and then cancelled
+		this.downloadProgress.delete(modelId);
+		this.failedDownloads.delete(modelId);
+		this.deletePausedDownload(modelId);
+		this.downloadSidecars.delete(modelId);
+		this.stopRequests.delete(modelId);
+
 		if (idx !== -1) {
 			this.host.routerModels = this.host.routerModels.filter((m) => m.id !== modelId);
 			this.loadProgress.delete(modelId);
-			this.downloadProgress.delete(modelId);
-			this.failedDownloads.delete(modelId);
-			this.deletePausedDownload(modelId);
-			this.downloadSidecars.delete(modelId);
-			this.stopRequests.delete(modelId);
 			this.rejectStatus(modelId, new Error(`Model removed: ${this.host.toDisplayName(modelId)}`));
 		}
 
@@ -839,18 +874,22 @@ export class ModelStatusManager {
 	}
 
 	private settleStatus(modelId: string, status: ServerModelStatus): void {
-		const waiter = this.statusWaiters.get(modelId);
+		const waiters = this.statusWaiters.get(modelId) ?? [];
+		const pending = waiters.filter((waiter) => waiter.target !== status);
 
-		if (waiter && waiter.target === status) {
-			this.statusWaiters.delete(modelId);
-			waiter.resolve();
-		}
+		if (pending.length) this.statusWaiters.set(modelId, pending);
+		else this.statusWaiters.delete(modelId);
+
+		for (const waiter of waiters) if (waiter.target === status) waiter.resolve();
 	}
 
-	// one operation runs per model at a time, so one waiter per model suffices
+	// a load and the requests that wait on it can each hold a waiter for the same model
 	private waitForStatus(modelId: string, target: ServerModelStatus): Promise<void> {
 		return new Promise((resolve, reject) => {
-			this.statusWaiters.set(modelId, { reject, resolve, target });
+			this.statusWaiters.set(modelId, [
+				...(this.statusWaiters.get(modelId) ?? []),
+				{ reject, resolve, target }
+			]);
 		});
 	}
 }
